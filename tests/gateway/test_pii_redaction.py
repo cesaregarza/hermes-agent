@@ -5,8 +5,10 @@ from gateway.session import (
     SessionSource,
     build_session_context_prompt,
     _hash_id,
+    _hash_message_id,
     _hash_sender_id,
     _hash_chat_id,
+    _hash_thread_id,
 )
 from gateway.config import Platform, HomeChannel
 
@@ -38,6 +40,15 @@ class TestHashHelpers:
         assert len(result) == 12
         assert "12345" not in result
 
+    def test_hash_thread_id_hashes_entire_identifier(self):
+        result = _hash_thread_id("+15551234567:topic")
+        assert result == f"thread_{_hash_id('+15551234567:topic')}"
+        assert "+15551234567" not in result
+
+    def test_hash_message_id_uses_message_namespace(self):
+        result = _hash_message_id("wamid.HBgLMTU1NTEyMzQ1NjcVAgASGBQ")
+        assert result.startswith("message_")
+
 
 # ---------------------------------------------------------------------------
 # Integration: build_session_context_prompt
@@ -47,13 +58,16 @@ def _make_context(
     user_id="user-123",
     user_name=None,
     chat_id="telegram:99999",
+    chat_name=None,
+    chat_type="dm",
     platform=Platform.TELEGRAM,
     home_channels=None,
 ):
     source = SessionSource(
         platform=platform,
         chat_id=chat_id,
-        chat_type="dm",
+        chat_name=chat_name,
+        chat_type=chat_type,
         user_id=user_id,
         user_name=user_name,
     )
@@ -134,10 +148,58 @@ class TestBuildSessionContextPromptRedaction:
         assert "+15551234567" not in prompt
         assert "user_" in prompt
 
-    def test_signal_ids_redacted(self):
-        ctx = _make_context(user_id="+15551234567", platform=Platform.SIGNAL)
+    def test_whatsapp_bridge_phone_fallback_name_is_redacted(self):
+        phone = "15551234567"
+        ctx = _make_context(
+            user_id=f"{phone}@s.whatsapp.net",
+            user_name=phone,
+            chat_id=f"{phone}@s.whatsapp.net",
+            chat_name=phone,
+            platform=Platform.WHATSAPP,
+        )
         prompt = build_session_context_prompt(ctx, redact_pii=True)
-        assert "+15551234567" not in prompt
+        assert phone not in prompt
+        assert "user_" in prompt
+
+    def test_whatsapp_cloud_no_profile_name_redacts_wa_id_fallbacks(self):
+        wa_id = "15551234567"
+        ctx = _make_context(
+            user_id=wa_id,
+            user_name=None,
+            chat_id=wa_id,
+            chat_name=wa_id,
+            platform=Platform.WHATSAPP_CLOUD,
+        )
+        prompt = build_session_context_prompt(ctx, redact_pii=True)
+        assert wa_id not in prompt
+        assert "user_" in prompt
+
+    def test_signal_ids_redacted(self):
+        phone = "+15551234567"
+        ctx = _make_context(
+            user_id=phone,
+            user_name=phone,
+            chat_id=phone,
+            chat_name=phone,
+            platform=Platform.SIGNAL,
+        )
+        prompt = build_session_context_prompt(ctx, redact_pii=True)
+        assert phone not in prompt
+        assert "user_" in prompt
+
+    def test_bluebubbles_sender_address_fallback_is_redacted(self):
+        phone = "+15551234567"
+        chat_identifier = f"iMessage;-;{phone}"
+        ctx = _make_context(
+            user_id=phone,
+            user_name=phone,
+            chat_id=chat_identifier,
+            chat_name=chat_identifier,
+            platform=Platform.BLUEBUBBLES,
+        )
+        prompt = build_session_context_prompt(ctx, redact_pii=True)
+        assert phone not in prompt
+        assert chat_identifier not in prompt
         assert "user_" in prompt
 
     def test_slack_ids_not_redacted(self):

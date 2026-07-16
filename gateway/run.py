@@ -100,6 +100,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
 _GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
     {"local", "api_server", "webhook", "msgraph_webhook"}
 )
+_PRIVACY_POLICY_UNRESOLVED = object()
 
 
 def _gateway_surface_passes_raw_text(platform: Any) -> bool:
@@ -1833,6 +1834,8 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    _is_pii_redaction_eligible,
+    _pii_safe_user_label,
 )
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.authz_mixin import GatewayAuthorizationMixin
@@ -2448,6 +2451,72 @@ def _load_gateway_config() -> dict:
     except Exception:
         pass
     return raw
+
+
+def _read_yaml_mapping_strict(path: Path) -> dict:
+    """Read a YAML mapping while preserving I/O and parse failures.
+
+    A missing file is a valid empty config. Every other failure is surfaced so
+    security-sensitive callers can distinguish "disabled" from "unknown".
+    """
+    import yaml
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = yaml.safe_load(handle)
+    except FileNotFoundError:
+        return {}
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a YAML mapping in {path}")
+    return value
+
+
+def _load_gateway_redact_pii_policy_strict() -> bool:
+    """Load ``privacy.redact_pii`` without swallowing policy failures.
+
+    The normal gateway config loader is intentionally fail-open for general
+    runtime settings. MCP session metadata needs a tri-state decision instead:
+    a successful missing/false value is ``False``, while unreadable or
+    malformed policy data must raise so the caller can bind "unavailable" and
+    omit metadata.
+    """
+    raw = _read_yaml_mapping_strict(_gateway_config_home() / "config.yaml")
+    from hermes_cli.config import _deep_merge, _expand_env_vars
+
+    raw = _expand_env_vars(raw)
+    if not isinstance(raw, dict):
+        raise ValueError("Gateway config did not expand to a mapping")
+
+    # Honor administrator-managed policy too, but do not use the managed
+    # helper's intentional fail-open parser for this security decision.
+    from hermes_cli import managed_scope
+
+    managed_dir = managed_scope.get_managed_dir()
+    if managed_dir is not None:
+        managed = _read_yaml_mapping_strict(Path(managed_dir) / "config.yaml")
+        if managed:
+            managed = _expand_env_vars(managed)
+            if not isinstance(managed, dict):
+                raise ValueError("Managed gateway config did not expand to a mapping")
+            raw = _deep_merge(raw, managed)
+
+    privacy = raw.get("privacy", {})
+    if privacy is None:
+        privacy = {}
+    if not isinstance(privacy, dict):
+        raise ValueError("privacy must be a YAML mapping")
+    value = privacy.get("redact_pii", False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise ValueError("privacy.redact_pii must be true or false")
 
 
 def _load_gateway_runtime_config() -> dict:
@@ -9162,6 +9231,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    @staticmethod
+    def _source_with_trigger_message_id(event: MessageEvent) -> SessionSource:
+        """Copy the event's triggering ID onto its routing source.
+
+        Some adapters, including WhatsApp Cloud, put the triggering ID on
+        ``MessageEvent.message_id`` but omit it from ``SessionSource``. When
+        present, the event value is canonical for this delivery; source-only
+        IDs remain valid for adapters that already bind them. Session binding
+        consumes the source, so normalize the two shapes once at ingress.
+        """
+        source = event.source
+        message_id = str(getattr(event, "message_id", None) or "").strip()
+        if message_id and message_id != source.message_id:
+            source = dataclasses.replace(source, message_id=message_id)
+            event.source = source
+        return source
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -9175,7 +9261,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         6. Run agent conversation
         7. Return response
         """
-        source = event.source
+        source = self._source_with_trigger_message_id(event)
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -10690,6 +10776,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         history: List[Dict[str, Any]],
         session_key: Optional[str] = None,
+        redact_pii_policy: Optional[bool] = False,
     ) -> Optional[str]:
         """Prepare inbound event text for the agent.
 
@@ -10729,8 +10816,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # a hostile name can masquerade as a fake markdown section
             # (mirrors the same field's treatment in
             # build_session_context_prompt via _format_untrusted_prompt_value).
-            _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
-            message_text = f"[{_safe_user_name}] {message_text}"
+            _sender_label: Optional[str] = str(source.user_name)
+            if redact_pii_policy is not False:
+                try:
+                    if _is_pii_redaction_eligible(source.platform):
+                        _sender_label = _pii_safe_user_label(source)
+                except Exception as exc:
+                    # An active or unavailable policy must not turn a registry
+                    # failure into raw metadata exposure. Omit attribution for
+                    # this turn; the message body is still delivered.
+                    logger.warning(
+                        "Unable to evaluate sender-label privacy policy; "
+                        "omitting shared-session attribution: %s",
+                        exc,
+                    )
+                    _sender_label = None
+            if _sender_label:
+                _safe_user_name = neutralize_untrusted_inline_text(_sender_label)
+                message_text = f"[{_safe_user_name}] {message_text}"
 
         # Prepend channel context from history backfill (if any).  This
         # happens after sender-prefix so the prefix only applies to the
@@ -11047,8 +11150,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         history: List[Dict[str, Any]],
         session_key: Optional[str] = None,
+        redact_pii_policy: Any = _PRIVACY_POLICY_UNRESOLVED,
     ) -> Optional[str]:
         """Run inbound preprocessing under the routed profile when multiplexed."""
+        if redact_pii_policy is _PRIVACY_POLICY_UNRESOLVED:
+            redact_pii_policy = self._resolve_redact_pii_policy_for_source(source)
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
                 return await self._prepare_inbound_message_text(
@@ -11056,12 +11162,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     history=history,
                     session_key=session_key,
+                    redact_pii_policy=redact_pii_policy,
                 )
         return await self._prepare_inbound_message_text(
             event=event,
             source=source,
             history=history,
             session_key=session_key,
+            redact_pii_policy=redact_pii_policy,
         )
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
@@ -11293,26 +11401,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Build session context
         context = build_session_context(source, self.config, session_entry)
 
-        # Read privacy.redact_pii from config (re-read per message)
-        _redact_pii = False
         persist_user_message = None
         persist_user_timestamp = None
-        try:
-            _pcfg = _load_gateway_config()
-            _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
-        except Exception:
-            pass
 
         # Set session context variables for tools (task-local, concurrency-safe).
-        # Snapshot the privacy policy with the raw routing identity so worker
-        # threads cannot observe a later turn's configuration.
-        _session_env_tokens = self._set_session_env(
-            context,
-            redact_pii=_redact_pii,
+        # Resolve privacy inside the routed profile and snapshot its tri-state
+        # result with the raw identity so worker threads cannot observe a later
+        # turn's configuration. ``None`` makes MCP forwarding fail closed.
+        _session_env_tokens, _redact_pii = self._bind_session_context_for_turn(
+            context
         )
 
-        # Build the context prompt to inject
-        context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        # Prompt construction keeps its historical fail-soft behavior when the
+        # policy is unavailable; only a confirmed True enables pseudonyms.
+        context_prompt = build_session_context_prompt(
+            context,
+            redact_pii=_redact_pii is True,
+        )
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -11953,6 +12058,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source=source,
             history=history,
             session_key=session_key,
+            redact_pii_policy=_redact_pii,
         )
         if message_text is None:
             return
@@ -13288,7 +13394,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 cont_event = MessageEvent(
                     text=prompt,
                     message_type=MessageType.TEXT,
-                    source=source,
+                    # Synthetic continuations have no triggering platform
+                    # message. Never reuse the prior event's reply/WAMID
+                    # identity when this queued turn later rebinds ContextVars.
+                    source=dataclasses.replace(source, message_id=None),
                     message_id=None,
                     channel_prompt=None,
                 )
@@ -15444,11 +15553,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
+    def _resolve_redact_pii_policy_for_source(
+        self,
+        source: SessionSource,
+    ) -> Optional[bool]:
+        """Return the routed profile's privacy policy, or ``None`` on failure."""
+        try:
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_home = self._resolve_profile_home_for_source(
+                    source,
+                    strict=True,
+                )
+                with _profile_runtime_scope(profile_home):
+                    return _load_gateway_redact_pii_policy_strict()
+            return _load_gateway_redact_pii_policy_strict()
+        except Exception as exc:
+            logger.warning(
+                "Unable to load privacy.redact_pii for %s/%s; external session "
+                "metadata will be omitted: %s",
+                source.platform.value,
+                source.chat_id,
+                exc,
+            )
+            return None
+
+    def _bind_session_context_for_turn(
+        self,
+        context: SessionContext,
+    ) -> tuple[list, Optional[bool]]:
+        """Bind raw routing context plus its profile-scoped privacy snapshot."""
+        redact_pii = self._resolve_redact_pii_policy_for_source(context.source)
+        tokens = self._set_session_env(context, redact_pii=redact_pii)
+        return tokens, redact_pii
+
+    def _bind_followup_event_context(
+        self,
+        event: MessageEvent,
+        *,
+        session_key: str,
+        session_id: str,
+    ) -> tuple[SessionSource, Optional[bool]]:
+        """Rebind identity and policy for an in-band queued event.
+
+        Queued turns recurse inside the original handler task, so ContextVars
+        would otherwise retain the first event's sender, message ID, and
+        privacy snapshot. The outer handler remains responsible for clearing
+        the final binding when the entire recursive chain unwinds.
+        """
+        source = self._source_with_trigger_message_id(event)
+        context = SessionContext(
+            source=source,
+            connected_platforms=[],
+            home_channels={},
+            session_key=session_key,
+            session_id=session_id,
+        )
+        _tokens, redact_pii = self._bind_session_context_for_turn(context)
+        return source, redact_pii
+
     def _set_session_env(
         self,
         context: SessionContext,
         *,
-        redact_pii: bool = False,
+        redact_pii: Optional[bool] = False,
     ) -> list:
         """Set session context variables for the current async task.
 
@@ -17613,7 +17780,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return None
 
-    def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
+    def _resolve_profile_home_for_source(
+        self,
+        source: SessionSource,
+        *,
+        strict: bool = False,
+    ) -> "Path":
         """Resolve which profile's HERMES_HOME should serve this inbound source.
 
         Resolution order:
@@ -17646,6 +17818,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_dir = get_profile_dir(name)
             # Warn if an explicit profile doesn't exist on disk
             if explicit_profile and not profile_exists(name):
+                if strict:
+                    raise LookupError(
+                        f"Profile {explicit_profile!r} does not exist for "
+                        f"source {source.platform.value}/{source.chat_id}"
+                    )
                 logger.warning(
                     "Profile %r does not exist for source %s/%s (guild_id=%s), "
                     "falling back to global HERMES_HOME",
@@ -17658,6 +17835,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return profile_dir
         except Exception:
             # Catch normalization errors, path errors, etc.
+            if strict:
+                raise
             logger.warning(
                 "Failed to resolve profile directory for source %s/%s (guild_id=%s), "
                 "falling back to global HERMES_HOME: %s",
@@ -20648,7 +20827,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_channel_prompt = None
                 next_session_key = session_key
                 if pending_event is not None:
-                    next_source = getattr(pending_event, "source", None) or source
+                    if getattr(pending_event, "source", None) is None:
+                        pending_event.source = source
+                    next_source = self._source_with_trigger_message_id(pending_event)
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
@@ -20668,11 +20849,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
+                    next_source, next_redact_pii = self._bind_followup_event_context(
+                        pending_event,
+                        session_key=next_session_key,
+                        session_id=session_id,
+                    )
                     next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
                         history=updated_history,
                         session_key=next_session_key,
+                        redact_pii_policy=next_redact_pii,
                     )
                     if next_message is None:
                         return result

@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import json
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -82,6 +83,16 @@ def _hash_chat_id(value: str) -> str:
         prefix = value[:colon]
         return f"{prefix}:{_hash_id(value[colon + 1:])}"
     return _hash_id(value)
+
+
+def _hash_thread_id(value: str) -> str:
+    """Hash an entire thread ID to ``thread_<12hex>``."""
+    return f"thread_{_hash_id(value)}"
+
+
+def _hash_message_id(value: str) -> str:
+    """Hash an entire message ID to ``message_<12hex>``."""
+    return f"message_{_hash_id(value)}"
 
 
 from .config import (
@@ -332,6 +343,7 @@ class SessionContext:
 
 _PII_SAFE_PLATFORMS = frozenset({
     Platform.WHATSAPP,
+    Platform.WHATSAPP_CLOUD,
     Platform.SIGNAL,
     Platform.TELEGRAM,
     Platform.BLUEBUBBLES,
@@ -357,6 +369,97 @@ def _is_pii_redaction_eligible(platform: Any) -> bool:
 
     entry = platform_registry.get(platform_name)
     return bool(entry and entry.pii_safe)
+
+
+_PHONE_ID_PLATFORMS = frozenset({
+    Platform.WHATSAPP,
+    Platform.WHATSAPP_CLOUD,
+    Platform.SIGNAL,
+    Platform.BLUEBUBBLES,
+})
+_PHONEISH_LABEL_RE = re.compile(r"(?<!\d)\+?(?:\d[\s().-]?){7,}\d(?!\d)")
+
+
+def _identifier_comparison_tokens(value: Any) -> set[str]:
+    """Return conservative comparison forms for a routing identifier.
+
+    Phone adapters do not all expose the same spelling: the WhatsApp bridge,
+    for example, can pair ``15551234567`` with
+    ``15551234567@s.whatsapp.net``. These tokens let display-name fallbacks be
+    recognized without treating unrelated, genuine display names as IDs.
+    """
+    if value in (None, ""):
+        return set()
+    text = str(value).strip().casefold()
+    if not text:
+        return set()
+    tokens = {text}
+    if "@" in text:
+        tokens.add(text.split("@", 1)[0])
+    if ":" in text:
+        tokens.add(text.split(":", 1)[1])
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 7:
+        tokens.add(f"digits:{digits}")
+    return tokens
+
+
+def _display_name_is_identifier_derived(
+    display_name: Any,
+    *,
+    platform: Platform,
+    identifiers: List[Any],
+) -> bool:
+    """Whether a display label is an adapter fallback derived from an ID.
+
+    Genuine names remain useful context and are preserved. Exact, JID-local,
+    and normalized-phone matches are pseudonymized. On phone transports, a
+    phone-looking label is treated as an identifier even when the adapter did
+    not also provide a comparable ID; that is the fail-closed case.
+    """
+    if display_name in (None, ""):
+        return False
+    label = str(display_name).strip()
+    label_tokens = _identifier_comparison_tokens(label)
+    for identifier in identifiers:
+        if label_tokens & _identifier_comparison_tokens(identifier):
+            return True
+    return platform in _PHONE_ID_PLATFORMS and bool(_PHONEISH_LABEL_RE.search(label))
+
+
+def _pii_safe_user_label(source: SessionSource) -> str:
+    """Return a genuine display name or a deterministic sender pseudonym."""
+    basis = source.user_id or source.user_id_alt or source.user_name
+    fallback = _hash_sender_id(str(basis)) if basis else "user"
+    if not source.user_name:
+        return fallback
+    if _display_name_is_identifier_derived(
+        source.user_name,
+        platform=source.platform,
+        identifiers=[source.user_id, source.user_id_alt, source.chat_id, source.chat_id_alt],
+    ):
+        return fallback
+    return str(source.user_name)
+
+
+def _pii_safe_chat_label(source: SessionSource) -> str:
+    """Return a genuine chat name or a deterministic chat pseudonym."""
+    basis = source.chat_id or source.chat_id_alt or source.chat_name
+    fallback = _hash_chat_id(str(basis)) if basis else "chat"
+    if not source.chat_name:
+        return fallback
+    if _display_name_is_identifier_derived(
+        source.chat_name,
+        platform=source.platform,
+        identifiers=[
+            source.chat_id,
+            source.chat_id_alt,
+            source.user_id,
+            source.user_id_alt,
+        ],
+    ):
+        return fallback
+    return str(source.chat_name)
 
 
 def _discord_tools_loaded() -> bool:
@@ -466,10 +569,8 @@ def build_session_context_prompt(
         src = context.source
         if redact_pii:
             # Build a safe description without raw IDs
-            _uname = src.user_name or (
-                _hash_sender_id(src.user_id) if src.user_id else "user"
-            )
-            _cname = src.chat_name or _hash_chat_id(src.chat_id)
+            _uname = _pii_safe_user_label(src)
+            _cname = _pii_safe_chat_label(src)
             if src.chat_type == "dm":
                 desc = f"DM with {_uname}"
             elif src.chat_type == "group":
@@ -498,7 +599,7 @@ def build_session_context_prompt(
         lines.append(f"**Matrix Room:** {_format_untrusted_prompt_value(room_name)}")
         lines.append(f"**Matrix Room ID:** {room_id}")
         if src.thread_id:
-            thread_id = _hash_chat_id(src.thread_id) if redact_pii else src.thread_id
+            thread_id = _hash_thread_id(src.thread_id) if redact_pii else src.thread_id
             lines.append(f"**Matrix Thread:** {thread_id}")
         lines.append(
             "**Matrix room boundary:** Treat this turn as scoped to the current "
@@ -520,9 +621,12 @@ def build_session_context_prompt(
             "with [sender name]. Multiple users may participate."
         )
     elif context.source.user_name:
-        lines.append(
-            f"**User:** {_format_untrusted_prompt_value(context.source.user_name)}"
+        user_label = (
+            _pii_safe_user_label(context.source)
+            if redact_pii
+            else context.source.user_name
         )
+        lines.append(f"**User:** {_format_untrusted_prompt_value(user_label)}")
     elif context.source.user_id:
         uid = context.source.user_id
         if redact_pii:
@@ -628,9 +732,10 @@ def build_session_context_prompt(
     if context.source.platform == Platform.LOCAL:
         lines.append("- `\"origin\"` → Local output (saved to files)")
     else:
-        _origin_label = context.source.chat_name or (
-            _hash_chat_id(context.source.chat_id) if redact_pii else context.source.chat_id
-        )
+        if redact_pii:
+            _origin_label = _pii_safe_chat_label(context.source)
+        else:
+            _origin_label = context.source.chat_name or context.source.chat_id
         _origin_label = _format_untrusted_prompt_value(_origin_label)
         lines.append(f"- `\"origin\"` → Back to this chat ({_origin_label})")
 
