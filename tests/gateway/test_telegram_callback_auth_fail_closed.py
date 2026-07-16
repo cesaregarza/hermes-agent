@@ -62,6 +62,7 @@ def _make_adapter():
     adapter.config = config
     adapter._config = config
     adapter._platform = Platform.TELEGRAM
+    adapter.platform = Platform.TELEGRAM
     adapter._connected = True
     return adapter
 
@@ -106,3 +107,58 @@ class TestCallbackAuthFailClosed:
         adapter = _make_adapter()
         adapter._message_handler = None
         assert adapter._is_callback_user_authorized("12345") is True
+
+    def test_secondary_uses_registered_profile_auth_not_primary_env(self, monkeypatch):
+        """A closure-bound secondary honors its own allowlist/pairing callback."""
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "primary-user")
+        monkeypatch.setenv("TELEGRAM_ALLOW_ALL_USERS", "true")
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter()
+
+        async def secondary_handler(_event):
+            return None
+
+        adapter._message_handler = secondary_handler
+        adapter._profile_routes_enabled = False
+        calls = []
+
+        def profile_auth(user_id, chat_type, chat_id):
+            calls.append((user_id, chat_type, chat_id))
+            # The profile callback is the same runner path that honors both
+            # the secondary allowlist and secondary PairingStore approvals.
+            return user_id in {"secondary-user", "paired-user"}
+
+        adapter._authorization_check = profile_auth
+
+        assert adapter._is_callback_user_authorized(
+            "secondary-user",
+            chat_id="-1001",
+            chat_type="supergroup",
+            thread_id="42",
+        ) is True
+        assert adapter._is_callback_user_authorized(
+            "paired-user",
+            chat_id="-1001",
+            chat_type="supergroup",
+            thread_id="42",
+        ) is True
+        assert adapter._is_callback_user_authorized("primary-user") is False
+        assert adapter._is_callback_user_authorized("intruder") is False
+        assert calls[0] == ("secondary-user", "forum", "-1001")
+
+    def test_secondary_missing_or_failing_profile_auth_denies(self, monkeypatch):
+        """Primary allow-all cannot rescue missing/broken secondary auth wiring."""
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "*")
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        adapter = _make_adapter()
+        adapter._message_handler = lambda _event: None
+        adapter._profile_routes_enabled = False
+
+        adapter._authorization_check = None
+        assert adapter._is_callback_user_authorized("intruder") is False
+
+        def broken_auth(*_args):
+            raise RuntimeError("secondary auth unavailable")
+
+        adapter._authorization_check = broken_auth
+        assert adapter._is_callback_user_authorized("intruder") is False

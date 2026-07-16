@@ -121,6 +121,9 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
+    _cancel_pending_batch_task,
+    _message_events_same_sender,
+    _pending_batch_lock,
     _prefix_within_utf16_limit,
     utf16_len,
     validate_inbound_media_size,
@@ -6670,7 +6673,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the Discord client.
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
-            self._enqueue_text_event(event)
+            await self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
 
@@ -6688,14 +6691,15 @@ class DiscordAdapter(BasePlatformAdapter):
         routed profile differs.
         """
         from gateway.session import build_session_key
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=event.source.profile,
         )
+        return session_key
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    async def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
         When Discord splits a long user message at 2000 chars, the chunks
@@ -6703,8 +6707,21 @@ class DiscordAdapter(BasePlatformAdapter):
         a single event before dispatching.
         """
         key = self._text_batch_key(event)
+        async with _pending_batch_lock(
+            self, key, store_attr="_pending_text_batch_locks",
+        ):
+            await self._enqueue_text_event_for_key(key, event)
+
+    async def _enqueue_text_event_for_key(
+        self, key: str, event: MessageEvent,
+    ) -> None:
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
+        if existing is not None:
+            await _cancel_pending_batch_task(self._pending_text_batch_tasks, key)
+            if not _message_events_same_sender(existing, event):
+                await self._flush_text_batch_now(key)
+                existing = None
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
@@ -6716,9 +6733,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
 
-        prior_task = self._pending_text_batch_tasks.get(key)
-        if prior_task and not prior_task.done():
-            prior_task.cancel()
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
@@ -6738,30 +6752,27 @@ class DiscordAdapter(BasePlatformAdapter):
             else:
                 delay = self._text_batch_delay_seconds
             await asyncio.sleep(delay)
-            event = self._pending_text_batches.pop(key, None)
-            if not event:
+            if self._pending_text_batch_tasks.get(key) is not current_task:
                 return
-            logger.info(
-                "[Discord] Flushing text batch %s (%d chars)",
-                key, len(event.text or ""),
-            )
-            # Shield the downstream dispatch so that a subsequent chunk
-            # arriving while handle_message is mid-flight cannot cancel
-            # the running agent turn.  _enqueue_text_event always cancels
-            # the prior flush task when a new chunk lands; without this
-            # shield, CancelledError would propagate from our task down
-            # into handle_message → the agent's streaming request,
-            # aborting the response the user was waiting on.  The new
-            # chunk is handled by the fresh flush task regardless.
-            await asyncio.shield(self.handle_message(event))
+            await self._flush_text_batch_now(key)
         except asyncio.CancelledError:
-            # Only reached if cancel landed before the pop — the shielded
-            # handle_message is unaffected either way.  Let the task exit
-            # cleanly so the finally block cleans up.
             pass
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
+
+    async def _flush_text_batch_now(self, key: str) -> None:
+        """Dispatch the oldest contiguous sender burst immediately."""
+        event = self._pending_text_batches.pop(key, None)
+        if not event:
+            return
+        logger.info(
+            "[Discord] Flushing text batch %s (%d chars)",
+            key, len(event.text or ""),
+        )
+        # Shield the downstream dispatch so a later enqueue cannot cancel a
+        # running agent turn while replacing only the debounce timer.
+        await asyncio.shield(self.handle_message(event))
 
 
 # ---------------------------------------------------------------------------

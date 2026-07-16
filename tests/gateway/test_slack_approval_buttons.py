@@ -326,6 +326,12 @@ class TestSlackInteractiveAuth:
     def test_passes_workspace_scope_to_gateway_runner_auth(self):
         adapter = _make_adapter()
         runner = _attach_auth_runner(adapter)
+        # Real startup also installs this three-argument callback. The bound
+        # primary runner must remain authoritative so Slack's team_id is not
+        # discarded before authorization.
+        adapter.set_authorization_check(
+            lambda *_args: pytest.fail("bound primary runner should be used")
+        )
 
         assert adapter._is_interactive_user_authorized(
             "U_OK",
@@ -334,6 +340,62 @@ class TestSlackInteractiveAuth:
             team_id="T1",
         ) is True
         assert runner.seen_sources[0].scope_id == "T1"
+
+    def test_secondary_uses_registered_profile_auth_not_primary_env(self, monkeypatch):
+        """A closure-bound secondary cannot inherit the primary allow-all env."""
+        adapter = _make_adapter()
+
+        async def secondary_handler(_event):
+            return None
+
+        adapter.set_message_handler(secondary_handler)
+        adapter._profile_routes_enabled = False
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_PRIMARY")
+        monkeypatch.setenv("SLACK_ALLOW_ALL_USERS", "true")
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        seen = []
+
+        def secondary_auth(user_id, chat_type, chat_id):
+            seen.append((user_id, chat_type, chat_id))
+            # This runner callback includes the secondary PairingStore union.
+            return user_id in {"U_SECONDARY", "U_PAIRED"}
+
+        adapter.set_authorization_check(secondary_auth)
+
+        assert adapter._is_interactive_user_authorized(
+            "U_SECONDARY",
+            channel_id="C1",
+            team_id="T1",
+        ) is True
+        assert adapter._is_interactive_user_authorized(
+            "U_PAIRED",
+            channel_id="D1",
+            team_id="T1",
+        ) is True
+        assert adapter._is_interactive_user_authorized("U_PRIMARY", channel_id="C1") is False
+        assert adapter._is_interactive_user_authorized("U_INTRUDER", channel_id="C1") is False
+        assert seen[:2] == [
+            ("U_SECONDARY", "group", "C1"),
+            ("U_PAIRED", "dm", "D1"),
+        ]
+
+    def test_secondary_missing_or_failing_profile_auth_denies(self, monkeypatch):
+        """Missing/broken secondary auth never falls back to process env."""
+        adapter = _make_adapter()
+        adapter.set_message_handler(lambda _event: None)
+        adapter._profile_routes_enabled = False
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "*")
+        monkeypatch.setenv("SLACK_ALLOW_ALL_USERS", "true")
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+
+        adapter.set_authorization_check(None)
+        assert adapter._is_interactive_user_authorized("U_INTRUDER", channel_id="C1") is False
+
+        def broken_auth(*_args):
+            raise RuntimeError("secondary auth unavailable")
+
+        adapter.set_authorization_check(broken_auth)
+        assert adapter._is_interactive_user_authorized("U_INTRUDER", channel_id="C1") is False
 
 
 class TestSlackSlashConfirmAction:

@@ -58,12 +58,38 @@ def _make_discord_adapter():
 
 
 class TestDiscordTextBatching:
+    def test_shared_thread_batch_key_is_session_scoped(self):
+        adapter = _make_discord_adapter()
+        adapter.config.extra["group_sessions_per_user"] = False
+
+        def event_for(user_id: str) -> MessageEvent:
+            return MessageEvent(
+                text="chunk",
+                message_type=MessageType.TEXT,
+                source=SessionSource(
+                    platform=Platform.DISCORD,
+                    chat_id="shared-thread",
+                    chat_type="thread",
+                    thread_id="shared-thread",
+                    user_id=user_id,
+                ),
+            )
+
+        alice_first = event_for("alice")
+        alice_second = event_for("alice")
+        bob = event_for("bob")
+
+        assert adapter._text_batch_key(alice_first) == adapter._text_batch_key(
+            alice_second
+        )
+        assert adapter._text_batch_key(alice_first) == adapter._text_batch_key(bob)
+
     @pytest.mark.asyncio
     async def test_single_message_dispatched_after_delay(self):
         adapter = _make_discord_adapter()
         event = _make_event("hello world", Platform.DISCORD)
 
-        adapter._enqueue_text_event(event)
+        await adapter._enqueue_text_event(event)
 
         # Not dispatched yet
         adapter.handle_message.assert_not_called()
@@ -80,9 +106,9 @@ class TestDiscordTextBatching:
         """Two rapid messages from the same chat should be merged."""
         adapter = _make_discord_adapter()
 
-        adapter._enqueue_text_event(_make_event("Part one of a long", Platform.DISCORD))
+        await adapter._enqueue_text_event(_make_event("Part one of a long", Platform.DISCORD))
         await asyncio.sleep(0.02)
-        adapter._enqueue_text_event(_make_event("message that was split.", Platform.DISCORD))
+        await adapter._enqueue_text_event(_make_event("message that was split.", Platform.DISCORD))
 
         adapter.handle_message.assert_not_called()
 
@@ -97,11 +123,11 @@ class TestDiscordTextBatching:
     async def test_three_way_split_aggregated(self):
         adapter = _make_discord_adapter()
 
-        adapter._enqueue_text_event(_make_event("chunk 1", Platform.DISCORD))
+        await adapter._enqueue_text_event(_make_event("chunk 1", Platform.DISCORD))
         await asyncio.sleep(0.02)
-        adapter._enqueue_text_event(_make_event("chunk 2", Platform.DISCORD))
+        await adapter._enqueue_text_event(_make_event("chunk 2", Platform.DISCORD))
         await asyncio.sleep(0.02)
-        adapter._enqueue_text_event(_make_event("chunk 3", Platform.DISCORD))
+        await adapter._enqueue_text_event(_make_event("chunk 3", Platform.DISCORD))
 
         await asyncio.sleep(0.2)
 
@@ -115,18 +141,44 @@ class TestDiscordTextBatching:
     async def test_different_chats_not_merged(self):
         adapter = _make_discord_adapter()
 
-        adapter._enqueue_text_event(_make_event("from A", Platform.DISCORD, chat_id="111"))
-        adapter._enqueue_text_event(_make_event("from B", Platform.DISCORD, chat_id="222"))
+        await adapter._enqueue_text_event(_make_event("from A", Platform.DISCORD, chat_id="111"))
+        await adapter._enqueue_text_event(_make_event("from B", Platform.DISCORD, chat_id="222"))
 
         await asyncio.sleep(0.2)
 
         assert adapter.handle_message.call_count == 2
 
     @pytest.mark.asyncio
+    async def test_shared_session_a_b_a_preserves_fifo_and_contiguous_bursts(self):
+        adapter = _make_discord_adapter()
+        adapter.config.extra["group_sessions_per_user"] = False
+
+        def shared_event(text: str, user_id: str) -> MessageEvent:
+            return MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=SessionSource(
+                    platform=Platform.DISCORD,
+                    chat_id="shared-room",
+                    chat_type="group",
+                    user_id=user_id,
+                ),
+            )
+
+        await adapter._enqueue_text_event(shared_event("A1", "alice"))
+        await adapter._enqueue_text_event(shared_event("B", "bob"))
+        await adapter._enqueue_text_event(shared_event("A2", "alice"))
+        await asyncio.sleep(0.2)
+
+        dispatched = [call.args[0] for call in adapter.handle_message.call_args_list]
+        assert [event.text for event in dispatched] == ["A1", "B", "A2"]
+        assert [event.source.user_id for event in dispatched] == ["alice", "bob", "alice"]
+
+    @pytest.mark.asyncio
     async def test_batch_cleans_up_after_flush(self):
         adapter = _make_discord_adapter()
 
-        adapter._enqueue_text_event(_make_event("test", Platform.DISCORD))
+        await adapter._enqueue_text_event(_make_event("test", Platform.DISCORD))
         await asyncio.sleep(0.2)
 
         assert len(adapter._pending_text_batches) == 0
@@ -137,7 +189,7 @@ class TestDiscordTextBatching:
         adapter = _make_discord_adapter()
         # Simulate a chunk near Discord's 2000-char split point
         long_text = "x" * 1950
-        adapter._enqueue_text_event(_make_event(long_text, Platform.DISCORD))
+        await adapter._enqueue_text_event(_make_event(long_text, Platform.DISCORD))
 
         # After the short delay (0.1s), should NOT have flushed yet (split delay is 0.3s)
         await asyncio.sleep(0.15)
@@ -181,13 +233,13 @@ class TestDiscordTextBatching:
         adapter.handle_message = slow_handle
 
         # Prime batch 1 and wait for it to land inside handle_message.
-        adapter._enqueue_text_event(_make_event("batch 1", Platform.DISCORD))
+        await adapter._enqueue_text_event(_make_event("batch 1", Platform.DISCORD))
         await asyncio.wait_for(handle_started.wait(), timeout=1.0)
 
         # A new chunk arrives — _enqueue_text_event fires
         # prior_task.cancel() on batch 1's flush task, which is
         # currently awaiting inside handle_message.
-        adapter._enqueue_text_event(_make_event("batch 2 follow-up", Platform.DISCORD))
+        await adapter._enqueue_text_event(_make_event("batch 2 follow-up", Platform.DISCORD))
 
         # Let the cancel propagate.
         await asyncio.sleep(0.05)
@@ -241,7 +293,7 @@ class TestMatrixTextBatching:
         adapter = _make_matrix_adapter()
         event = _make_event("hello world", Platform.MATRIX)
 
-        adapter._enqueue_text_event(event)
+        await adapter._enqueue_text_event(event)
 
         adapter.handle_message.assert_not_called()
         await asyncio.sleep(0.2)
@@ -253,9 +305,9 @@ class TestMatrixTextBatching:
     async def test_split_messages_aggregated(self):
         adapter = _make_matrix_adapter()
 
-        adapter._enqueue_text_event(_make_event("first part", Platform.MATRIX))
+        await adapter._enqueue_text_event(_make_event("first part", Platform.MATRIX))
         await asyncio.sleep(0.02)
-        adapter._enqueue_text_event(_make_event("second part", Platform.MATRIX))
+        await adapter._enqueue_text_event(_make_event("second part", Platform.MATRIX))
 
         adapter.handle_message.assert_not_called()
         await asyncio.sleep(0.2)
@@ -269,8 +321,8 @@ class TestMatrixTextBatching:
     async def test_different_rooms_not_merged(self):
         adapter = _make_matrix_adapter()
 
-        adapter._enqueue_text_event(_make_event("room A", Platform.MATRIX, chat_id="!aaa:matrix.org"))
-        adapter._enqueue_text_event(_make_event("room B", Platform.MATRIX, chat_id="!bbb:matrix.org"))
+        await adapter._enqueue_text_event(_make_event("room A", Platform.MATRIX, chat_id="!aaa:matrix.org"))
+        await adapter._enqueue_text_event(_make_event("room B", Platform.MATRIX, chat_id="!bbb:matrix.org"))
 
         await asyncio.sleep(0.2)
 
@@ -281,7 +333,7 @@ class TestMatrixTextBatching:
         """Chunks near the 4000-char limit should trigger longer delay."""
         adapter = _make_matrix_adapter()
         long_text = "x" * 3950
-        adapter._enqueue_text_event(_make_event(long_text, Platform.MATRIX))
+        await adapter._enqueue_text_event(_make_event(long_text, Platform.MATRIX))
 
         await asyncio.sleep(0.15)
         adapter.handle_message.assert_not_called()
@@ -292,7 +344,7 @@ class TestMatrixTextBatching:
     @pytest.mark.asyncio
     async def test_batch_cleans_up_after_flush(self):
         adapter = _make_matrix_adapter()
-        adapter._enqueue_text_event(_make_event("test", Platform.MATRIX))
+        await adapter._enqueue_text_event(_make_event("test", Platform.MATRIX))
         await asyncio.sleep(0.2)
         assert len(adapter._pending_text_batches) == 0
 
@@ -326,7 +378,7 @@ class TestWeComTextBatching:
         adapter = _make_wecom_adapter()
         event = _make_event("hello world", Platform.WECOM)
 
-        adapter._enqueue_text_event(event)
+        await adapter._enqueue_text_event(event)
 
         adapter.handle_message.assert_not_called()
         await asyncio.sleep(0.2)
@@ -338,9 +390,9 @@ class TestWeComTextBatching:
     async def test_split_messages_aggregated(self):
         adapter = _make_wecom_adapter()
 
-        adapter._enqueue_text_event(_make_event("first part", Platform.WECOM))
+        await adapter._enqueue_text_event(_make_event("first part", Platform.WECOM))
         await asyncio.sleep(0.02)
-        adapter._enqueue_text_event(_make_event("second part", Platform.WECOM))
+        await adapter._enqueue_text_event(_make_event("second part", Platform.WECOM))
 
         adapter.handle_message.assert_not_called()
         await asyncio.sleep(0.2)
@@ -354,8 +406,8 @@ class TestWeComTextBatching:
     async def test_different_chats_not_merged(self):
         adapter = _make_wecom_adapter()
 
-        adapter._enqueue_text_event(_make_event("chat A", Platform.WECOM, chat_id="chat_a"))
-        adapter._enqueue_text_event(_make_event("chat B", Platform.WECOM, chat_id="chat_b"))
+        await adapter._enqueue_text_event(_make_event("chat A", Platform.WECOM, chat_id="chat_a"))
+        await adapter._enqueue_text_event(_make_event("chat B", Platform.WECOM, chat_id="chat_b"))
 
         await asyncio.sleep(0.2)
 
@@ -366,7 +418,7 @@ class TestWeComTextBatching:
         """Chunks near the 4000-char limit should trigger longer delay."""
         adapter = _make_wecom_adapter()
         long_text = "x" * 3950
-        adapter._enqueue_text_event(_make_event(long_text, Platform.WECOM))
+        await adapter._enqueue_text_event(_make_event(long_text, Platform.WECOM))
 
         await asyncio.sleep(0.15)
         adapter.handle_message.assert_not_called()
@@ -377,7 +429,7 @@ class TestWeComTextBatching:
     @pytest.mark.asyncio
     async def test_batch_cleans_up_after_flush(self):
         adapter = _make_wecom_adapter()
-        adapter._enqueue_text_event(_make_event("test", Platform.WECOM))
+        await adapter._enqueue_text_event(_make_event("test", Platform.WECOM))
         await asyncio.sleep(0.2)
         assert len(adapter._pending_text_batches) == 0
 
@@ -396,6 +448,7 @@ def _make_telegram_adapter():
     adapter.config = config
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
+    adapter._pending_text_batch_senders = {}
     adapter._text_batch_delay_seconds = 0.1
     adapter._text_batch_split_delay_seconds = 0.3
     adapter._active_sessions = {}
@@ -409,7 +462,7 @@ class TestTelegramAdaptiveDelay:
     @pytest.mark.asyncio
     async def test_short_chunk_uses_normal_delay(self):
         adapter = _make_telegram_adapter()
-        adapter._enqueue_text_event(_make_event("short msg", Platform.TELEGRAM))
+        await adapter._enqueue_text_event(_make_event("short msg", Platform.TELEGRAM))
 
         # Should flush after the normal 0.1s delay
         await asyncio.sleep(0.15)
@@ -420,7 +473,7 @@ class TestTelegramAdaptiveDelay:
         """A chunk near the 4096-char limit should trigger longer delay."""
         adapter = _make_telegram_adapter()
         long_text = "x" * 4050  # near the 4096 limit
-        adapter._enqueue_text_event(_make_event(long_text, Platform.TELEGRAM))
+        await adapter._enqueue_text_event(_make_event(long_text, Platform.TELEGRAM))
 
         # After the short delay, should NOT have flushed yet
         await asyncio.sleep(0.15)
@@ -435,9 +488,9 @@ class TestTelegramAdaptiveDelay:
         """Two near-limit chunks should both be merged."""
         adapter = _make_telegram_adapter()
 
-        adapter._enqueue_text_event(_make_event("x" * 4050, Platform.TELEGRAM))
+        await adapter._enqueue_text_event(_make_event("x" * 4050, Platform.TELEGRAM))
         await asyncio.sleep(0.05)
-        adapter._enqueue_text_event(_make_event("continuation text", Platform.TELEGRAM))
+        await adapter._enqueue_text_event(_make_event("continuation text", Platform.TELEGRAM))
 
         # Short chunk arrived → should use normal delay now
         await asyncio.sleep(0.15)
@@ -474,6 +527,37 @@ def _make_feishu_adapter():
 
 
 class TestFeishuAdaptiveDelay:
+    @pytest.mark.asyncio
+    async def test_shared_session_a_b_a_batch_preserves_fifo(self):
+        adapter = _make_feishu_adapter()
+        adapter.config.extra["group_sessions_per_user"] = False
+
+        def shared_event(text: str, user_id: str) -> MessageEvent:
+            return MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=SessionSource(
+                    platform=Platform.FEISHU,
+                    chat_id="shared-feishu-room",
+                    chat_type="group",
+                    user_id=user_id,
+                ),
+            )
+
+        await adapter._enqueue_text_event(shared_event("A1", "alice"))
+        await adapter._enqueue_text_event(shared_event("B", "bob"))
+        await adapter._enqueue_text_event(shared_event("A2", "alice"))
+        await asyncio.sleep(0.2)
+
+        dispatched = [
+            call.args[0]
+            for call in adapter._handle_message_with_guards.call_args_list
+        ]
+        assert [event.text for event in dispatched] == ["A1", "B", "A2"]
+        assert [event.source.user_id for event in dispatched] == [
+            "alice", "bob", "alice",
+        ]
+
     @pytest.mark.asyncio
     async def test_short_chunk_uses_normal_delay(self):
         adapter = _make_feishu_adapter()

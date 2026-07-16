@@ -644,7 +644,10 @@ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
         "tester",
     )
     adapter.send.assert_awaited_once()
-    assert "ABC12DEF" in adapter.send.await_args.args[1]
+    pairing_message = adapter.send.await_args.args[1]
+    assert "ABC12DEF" in pairing_message
+    assert "`hermes pairing approve whatsapp ABC12DEF`" in pairing_message
+    assert "hermes -p" not in pairing_message
 
 
 @pytest.mark.asyncio

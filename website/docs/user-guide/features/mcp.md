@@ -718,11 +718,16 @@ task-local routing values remain raw. They are stable and linkable: this is
 pseudonymization, not anonymity.
 
 At message ingress, a non-empty event-level triggering ID takes precedence;
-source-only adapter IDs remain valid, and synthetic goal continuations clear a
-prior triggering ID. Queued follow-ups rebind the sender, triggering message
-ID, and routed profile privacy policy before forwarding. `HERMES_UI_SESSION_ID`
-is deliberately excluded because it is a frontend return path rather than the
-durable gateway invocation identity.
+source-only adapter IDs remain valid, and synthetic turns without a platform
+message trigger clear any prior triggering ID. Queued follow-ups rebind the
+sender, triggering message ID, and routed profile privacy policy before
+forwarding. A legacy interrupt or late-steer fallback that retains only text,
+or a queued event without a trusted source, is treated as unattributed, so its
+MCP session metadata is omitted. Synthetic background completions use their
+event-carried sender instead of the session creator; if no trusted event sender
+is available, they are also unattributed and their metadata is omitted.
+`HERMES_UI_SESSION_ID` is deliberately excluded because it is a frontend return
+path rather than the durable gateway invocation identity.
 
 :::caution
 Enable this only for a server you trust with the resulting identifiers or

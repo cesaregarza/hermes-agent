@@ -33,7 +33,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
-from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    MessageEvent,
+    MessageType,
+    SendResult,
+    _UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY,
+)
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
@@ -1046,6 +1051,7 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     """
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
+    source.message_id = "stale-origin-message"
     pending_entry = SessionEntry(
         session_key="agent:main:telegram:group:resume-chat:topic-1",
         session_id="sid",
@@ -1070,7 +1076,30 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     assert isinstance(event, MessageEvent)
     assert event.internal is True
     assert event.message_type == MessageType.TEXT
-    assert event.source == source
+    assert event.source.platform == source.platform
+    assert event.source.chat_id == source.chat_id
+    assert event.source.thread_id == source.thread_id
+    assert pending_entry.origin.message_id == "stale-origin-message"
+    assert event.message_id is None
+    assert event.source.message_id is None
+    assert runner._source_with_trigger_message_id(event).message_id is None
+    assert event.metadata[_UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY] is True
+
+    from gateway.session_context import reset_session_vars
+    from tools.mcp_tool import _build_session_context_meta
+
+    try:
+        rebound_source, policy = runner._bind_followup_event_context(
+            event,
+            session_key=pending_entry.session_key,
+            session_id=pending_entry.session_id,
+        )
+        assert rebound_source.user_id is None
+        assert rebound_source.message_id is None
+        assert policy is None
+        assert _build_session_context_meta() is None
+    finally:
+        reset_session_vars()
     # Text is empty — the existing _is_resume_pending branch in
     # _handle_message_with_agent owns the system-note injection so we don't
     # double it up.

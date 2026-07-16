@@ -3972,6 +3972,9 @@ class SlackAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        normalized_channel_id = str(channel_id or normalized_user_id)
+        normalized_chat_type = "dm" if str(channel_id or "").startswith("D") else "group"
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
@@ -3980,8 +3983,8 @@ class SlackAdapter(BasePlatformAdapter):
 
                 source = SessionSource(
                     platform=Platform.SLACK,
-                    chat_id=str(channel_id or normalized_user_id),
-                    chat_type="dm" if str(channel_id or "").startswith("D") else "group",
+                    chat_id=normalized_channel_id,
+                    chat_type=normalized_chat_type,
                     user_id=normalized_user_id,
                     user_name=str(user_name).strip() if user_name else None,
                     scope_id=str(team_id) if team_id else None,
@@ -3989,10 +3992,31 @@ class SlackAdapter(BasePlatformAdapter):
                 return bool(auth_fn(source))
             except Exception:
                 logger.debug(
-                    "[Slack] Falling back to env-only interactive auth for user %s",
+                    "[Slack] Gateway interactive auth failed for user %s; denying",
                     normalized_user_id,
                     exc_info=True,
                 )
+                return False
+
+        # Secondary handlers are closures, so handler.__self__ cannot recover
+        # their runner/profile. Normal startup installs a profile-bound callback
+        # on every adapter; use it when no bound primary runner is available.
+        # The bound-runner path above intentionally comes first because it
+        # carries Slack's workspace ``team_id`` through ``SessionSource``.
+        if getattr(self, "_authorization_check", None) is not None:
+            return (
+                self._is_sender_authorized(
+                    normalized_user_id,
+                    normalized_chat_type,
+                    normalized_channel_id,
+                )
+                is True
+            )
+
+        if getattr(self, "_profile_routes_enabled", True) is False:
+            # A secondary adapter missing its registered callback must not use
+            # the primary process allowlist.
+            return False
 
         if os.getenv("SLACK_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
             return True

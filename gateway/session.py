@@ -9,6 +9,7 @@ Handles:
 """
 
 import asyncio
+import dataclasses
 import hashlib
 import logging
 import os
@@ -73,7 +74,7 @@ def _hash_sender_id(value: str) -> str:
 
 
 def _hash_chat_id(value: str) -> str:
-    """Hash the numeric portion of a chat ID, preserving platform prefix.
+    """Hash the identifier portion of a chat ID, preserving platform prefix.
 
     ``telegram:12345`` → ``telegram:<hash>``
     ``12345``          → ``<hash>``
@@ -192,6 +193,14 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
+
+    # Internal, wire-INVISIBLE credential owner for the live transport adapter.
+    # This can differ from ``profile`` when a shared primary bot routes a turn
+    # into another runtime profile: session/config/secrets follow ``profile``,
+    # while replies must still leave through the bot that received the event.
+    # Excluded from SessionSource.to_dict()/from_dict(); SessionEntry persists a
+    # trusted local copy separately for restart-safe completion routing.
+    transport_profile: Optional[str] = None
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
@@ -462,6 +471,27 @@ def _pii_safe_chat_label(source: SessionSource) -> str:
     return str(source.chat_name)
 
 
+def _pii_safe_home_label(platform: Platform, home: HomeChannel) -> str:
+    """Return a genuine home-channel name or a deterministic chat pseudonym.
+
+    ``/sethome`` falls back to the chat ID when an adapter has no display name.
+    Phone transports can therefore persist a phone number as ``HomeChannel.name``;
+    treat the name with the same identifier-derived-label policy as the active
+    source instead of assuming every configured display label is non-PII.
+    """
+    basis = home.chat_id or home.name
+    fallback = _hash_chat_id(str(basis)) if basis else "chat"
+    if not home.name:
+        return fallback
+    if _display_name_is_identifier_derived(
+        home.name,
+        platform=platform,
+        identifiers=[home.chat_id],
+    ):
+        return fallback
+    return str(home.name)
+
+
 def _discord_tools_loaded() -> bool:
     """True iff the agent will actually have Discord tools this session.
 
@@ -535,20 +565,28 @@ def build_session_context_prompt(
     - Where it can deliver scheduled task outputs
 
     When *redact_pii* is True **and** the source platform is an eligible
-    built-in or has opted in through its plugin registry entry, phone numbers
-    are stripped and user/chat IDs are replaced with deterministic hashes
-    before being sent to the LLM. Platforms like Discord are excluded because
-    mentions need real IDs. Routing still uses the original values (they stay
-    in SessionSource).
+    built-in or has opted in through its plugin registry entry, user/chat
+    identity fields and phone- or routing-ID-derived labels are replaced with
+    deterministic pseudonyms in outbound context. This does not scan arbitrary
+    message content for phone numbers. Platforms like Discord are excluded
+    because mentions need real IDs. Routing still uses the original values
+    (they stay in SessionSource).
     """
-    # Only apply redaction on platforms where IDs aren't needed for mentions.
-    if redact_pii:
+    requested_redaction = redact_pii
+
+    def _redact_platform(platform: Platform) -> bool:
+        if not requested_redaction:
+            return False
         try:
-            redact_pii = _is_pii_redaction_eligible(context.source.platform)
+            return _is_pii_redaction_eligible(platform)
         except Exception:
             # Preserve the historical prompt behavior: registry failures leave
             # identifiers raw instead of breaking prompt construction.
-            redact_pii = False
+            return False
+
+    # Source and each cross-platform home destination have independent
+    # eligibility (Discord/Slack IDs must remain raw for mention semantics).
+    redact_pii = _redact_platform(context.source.platform)
     lines = [
         "## Current Session Context",
         "",
@@ -717,8 +755,10 @@ def build_session_context_prompt(
         lines.append("")
         lines.append("**Home Channels (default destinations):**")
         for platform, home in context.home_channels.items():
-            hc_id = _hash_chat_id(home.chat_id) if redact_pii else home.chat_id
-            safe_name = _format_untrusted_prompt_value(home.name)
+            redact_home = _redact_platform(platform)
+            hc_id = _hash_chat_id(home.chat_id) if redact_home else home.chat_id
+            home_name = _pii_safe_home_label(platform, home) if redact_home else home.name
+            safe_name = _format_untrusted_prompt_value(home_name)
             safe_id = _format_untrusted_prompt_value(hc_id)
             lines.append(f"  - {platform.value}: {safe_name} (ID: {safe_id})")
 
@@ -746,7 +786,9 @@ def build_session_context_prompt(
 
     # Platform home channels
     for platform, home in context.home_channels.items():
-        home_name = _format_untrusted_prompt_value(home.name)
+        redact_home = _redact_platform(platform)
+        home_label = _pii_safe_home_label(platform, home) if redact_home else home.name
+        home_name = _format_untrusted_prompt_value(home_label)
         lines.append(f"- `\"{platform.value}\"` → Home channel ({home_name})")
 
     # Note about explicit targeting
@@ -781,6 +823,29 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
     return cleaned or None
 
 
+def _routing_origin_from_source(source: SessionSource) -> SessionSource:
+    """Return the durable routing snapshot for an authorized ingress.
+
+    ``message_id`` identifies one triggering message, not a destination. Keeping
+    it on a long-lived session origin can make a later background completion
+    reply to stale content. All other fields -- including process-local trust
+    and transport-owner markers -- are retained for live routing; their own
+    serializers remain responsible for keeping wire-invisible fields off disk.
+    """
+    return dataclasses.replace(source, message_id=None)
+
+
+def _routing_transport_from_source(source: SessionSource) -> Optional[str]:
+    """Return trusted local transport provenance for a routing origin."""
+    return "relay" if source.delivered_via_upstream_relay is True else None
+
+
+def _routing_transport_profile_from_source(source: SessionSource) -> Optional[str]:
+    """Return the trusted local credential owner for a routing origin."""
+    owner = str(getattr(source, "transport_profile", "") or "").strip()
+    return owner or None
+
+
 @dataclass
 class SessionEntry:
     """
@@ -795,6 +860,14 @@ class SessionEntry:
     
     # Origin metadata for delivery routing
     origin: Optional[SessionSource] = None
+    # Trusted local transport provenance. Kept outside SessionSource.to_dict()
+    # so relay authorization cannot be forged over the connector wire, while
+    # durable background completions can still recover the process-shared
+    # RelayAdapter after a gateway restart.
+    origin_transport: Optional[str] = None
+    # Trusted local multiplex credential owner. Kept outside the serialized
+    # SessionSource so peers cannot choose which bot credential sends replies.
+    origin_transport_profile: Optional[str] = None
     
     # Display metadata
     display_name: Optional[str] = None
@@ -896,14 +969,34 @@ class SessionEntry:
             # unsanitized dict directly on the entry.
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.origin:
-            result["origin"] = self.origin.to_dict()
+            result["origin"] = _routing_origin_from_source(self.origin).to_dict()
+        if self.origin_transport == "relay":
+            result["origin_transport"] = "relay"
+        if self.origin_transport_profile:
+            result["origin_transport_profile"] = self.origin_transport_profile
         return result
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionEntry":
         origin = None
         if "origin" in data and isinstance(data["origin"], dict):
-            origin = SessionSource.from_dict(data["origin"])
+            origin = _routing_origin_from_source(SessionSource.from_dict(data["origin"]))
+        origin_transport = (
+            "relay" if data.get("origin_transport") == "relay" else None
+        )
+        origin_transport_profile = (
+            str(data.get("origin_transport_profile") or "").strip() or None
+        )
+        if origin is not None and origin_transport == "relay":
+            origin = dataclasses.replace(
+                origin,
+                delivered_via_upstream_relay=True,
+            )
+        if origin is not None and origin_transport_profile:
+            origin = dataclasses.replace(
+                origin,
+                transport_profile=origin_transport_profile,
+            )
         
         platform = None
         if data.get("platform"):
@@ -945,6 +1038,8 @@ class SessionEntry:
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),
             origin=origin,
+            origin_transport=origin_transport,
+            origin_transport_profile=origin_transport_profile,
             display_name=data.get("display_name"),
             platform=platform,
             chat_type=data.get("chat_type", "dm"),
@@ -1483,15 +1578,29 @@ class SessionStore:
         requested_session_key: str,
         recovered: Dict[str, Any],
     ) -> bool:
-        """Prevent non-multiplexed gateways from reviving another profile's row."""
-        if getattr(self.config, "multiplex_profiles", False):
-            return True
-
+        """Prevent durable peer fallback from crossing profile namespaces."""
         recovered_key = str(recovered.get("session_key") or "")
-        if not recovered_key or recovered_key == requested_session_key:
+        if recovered_key == requested_session_key:
             return True
 
+        requested_profile = self._profile_from_session_key(requested_session_key)
         recovered_profile = self._profile_from_session_key(recovered_key)
+        if recovered_profile is None:
+            persisted_profile = str(recovered.get("profile_name") or "").strip()
+            recovered_profile = persisted_profile or None
+
+        if getattr(self.config, "multiplex_profiles", False):
+            # Exact lookup already missed. Peer-tuple recovery is safe only
+            # inside the same explicit profile namespace; legacy rows without
+            # either key or profile_name are ambiguous and fail closed.
+            return bool(
+                requested_profile
+                and recovered_profile
+                and recovered_profile == requested_profile
+            )
+
+        if not recovered_key and recovered_profile is None:
+            return True
         if recovered_profile is None:
             return True
 
@@ -1505,6 +1614,115 @@ class SessionStore:
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
             profile=self._resolve_profile_for_key(source),
         )
+
+    @staticmethod
+    def _refresh_routing_origin_locked(
+        entry: SessionEntry,
+        source: SessionSource,
+    ) -> bool:
+        """Refresh trusted completion routing while ``self._lock`` is held."""
+        origin = _routing_origin_from_source(source)
+        origin_transport = _routing_transport_from_source(source)
+        origin_transport_profile = _routing_transport_profile_from_source(source)
+        if (
+            entry.origin == origin
+            and entry.origin_transport == origin_transport
+            and entry.origin_transport_profile == origin_transport_profile
+        ):
+            return False
+        entry.origin = origin
+        entry.origin_transport = origin_transport
+        entry.origin_transport_profile = origin_transport_profile
+        return True
+
+    @staticmethod
+    def _routing_source_snapshot_locked(
+        entry: SessionEntry,
+    ) -> Optional[SessionSource]:
+        """Return one coherent delivery source while ``self._lock`` is held.
+
+        ``SessionEntry.origin`` and its two process-local provenance fields are
+        one routing record.  Reading them independently lets a concurrent
+        direct/relay or credential-owner transition produce a mixed source
+        (for example, a direct origin carrying the old relay trust marker).
+        Rebuild the public snapshot from all three fields under the same lock
+        and explicitly clear per-message attribution.
+        """
+        origin = getattr(entry, "origin", None)
+        if not isinstance(origin, SessionSource):
+            return None
+        return dataclasses.replace(
+            origin,
+            message_id=None,
+            transport_profile=(
+                str(getattr(entry, "origin_transport_profile", "") or "").strip()
+                or None
+            ),
+            delivered_via_upstream_relay=(
+                getattr(entry, "origin_transport", None) == "relay"
+            ),
+        )
+
+    def routing_source_snapshot(self, session_key: str) -> Optional[SessionSource]:
+        """Return a lock-coherent completion-routing source for ``session_key``."""
+        if not session_key:
+            return None
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            return self._routing_source_snapshot_locked(entry)
+
+    def refresh_routing_origin_if_current(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        source: SessionSource,
+    ) -> Optional[SessionSource]:
+        """Refresh queued-turn routing iff its original session is still live.
+
+        A recursive queued turn can race with ``/new`` or another session
+        switch after the outer turn finishes.  Comparing and updating under a
+        single lock prevents the old turn from overwriting the replacement
+        session's destination or trusted transport provenance.  The returned
+        source is the same lock-coherent, message-id-free snapshot callers
+        should place in their live routing cache.
+        """
+        if not session_key or not expected_session_id:
+            return None
+
+        persisted_snapshot = None
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if (
+                entry is None
+                or str(getattr(entry, "session_id", "")) != expected_session_id
+            ):
+                return None
+            if self._refresh_routing_origin_locked(entry, source):
+                persisted_snapshot = self._snapshot_routing_locked()
+            routing_source = self._routing_source_snapshot_locked(entry)
+
+        if persisted_snapshot is not None:
+            self._persist_routing_data(*persisted_snapshot)
+        return routing_source
+
+    def _refresh_singleflight_waiter_origin(
+        self,
+        entry: SessionEntry,
+        source: SessionSource,
+    ) -> None:
+        """Apply a waiting ingress's routing provenance after its owner exits."""
+        snapshot = None
+        with self._lock:
+            self._ensure_loaded_locked()
+            current = self._entries.get(entry.session_key)
+            if current is entry and self._refresh_routing_origin_locked(entry, source):
+                snapshot = self._snapshot_routing_locked()
+        if snapshot is not None:
+            self._persist_routing_data(*snapshot)
 
     def _create_entry_from_recovered_row(
         self,
@@ -1524,7 +1742,9 @@ class SessionStore:
             session_id=str(row["id"]),
             created_at=created_at,
             updated_at=now,
-            origin=source,
+            origin=_routing_origin_from_source(source),
+            origin_transport=_routing_transport_from_source(source),
+            origin_transport_profile=_routing_transport_profile_from_source(source),
             display_name=source.chat_name,
             platform=source.platform,
             chat_type=source.chat_type,
@@ -1562,9 +1782,8 @@ class SessionStore:
             recovered=recovered,
         ):
             logger.warning(
-                "Gateway session DB recovery ignored %s for %s because "
-                "multiplex_profiles is disabled and the row belongs to a "
-                "different profile",
+                "Gateway session DB recovery ignored %s for %s because the "
+                "row belongs to a different or ambiguous profile",
                 recovered.get("session_key"),
                 session_key,
             )
@@ -1610,9 +1829,8 @@ class SessionStore:
             recovered=recovered,
         ):
             logger.warning(
-                "Gateway session DB recovery ignored %s for %s because "
-                "multiplex_profiles is disabled and the row belongs to a "
-                "different profile",
+                "Gateway session DB recovery ignored %s for %s because the "
+                "row belongs to a different or ambiguous profile",
                 recovered.get("session_key"),
                 session_key,
             )
@@ -1946,6 +2164,7 @@ class SessionStore:
             if slot.error is not None:
                 raise slot.error
             assert slot.result is not None
+            self._refresh_singleflight_waiter_origin(slot.result, source)
             return slot.result
 
         try:
@@ -2064,6 +2283,7 @@ class SessionStore:
                     # Another thread handled this entry during our lock-free
                     # window.  Treat as healthy -- bump updated_at and save.
                     entry.updated_at = now
+                    self._refresh_routing_origin_locked(entry, source)
                     _needs_save = True
                 else:
                     # Stale check clean.  Apply reset decision.
@@ -2077,6 +2297,7 @@ class SessionStore:
                         _needs_recover = True
                     else:
                         entry.updated_at = now
+                        self._refresh_routing_origin_locked(entry, source)
                         _needs_save = True
             else:
                 if not force_new:
@@ -2093,6 +2314,8 @@ class SessionStore:
                     if published is None:
                         self._entries[session_key] = recovered
                         published = recovered
+                    else:
+                        self._refresh_routing_origin_locked(published, source)
                 entry = published
                 _needs_save = True
 
@@ -2105,7 +2328,9 @@ class SessionStore:
                 session_id=session_id,
                 created_at=now,
                 updated_at=now,
-                origin=source,
+                origin=_routing_origin_from_source(source),
+                origin_transport=_routing_transport_from_source(source),
+                origin_transport_profile=_routing_transport_profile_from_source(source),
                 display_name=source.chat_name,
                 platform=source.platform,
                 chat_type=source.chat_type,
@@ -2123,6 +2348,7 @@ class SessionStore:
                     published = candidate
                 else:
                     published = current
+                    self._refresh_routing_origin_locked(published, source)
             assert published is not None
             entry = published
             _needs_save = True
@@ -2400,6 +2626,8 @@ class SessionStore:
                 created_at=now,
                 updated_at=now,
                 origin=old_entry.origin,
+                origin_transport=old_entry.origin_transport,
+                origin_transport_profile=old_entry.origin_transport_profile,
                 display_name=display_name if display_name is not None else old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
@@ -2472,6 +2700,8 @@ class SessionStore:
                 created_at=now,
                 updated_at=now,
                 origin=old_entry.origin,
+                origin_transport=old_entry.origin_transport,
+                origin_transport_profile=old_entry.origin_transport_profile,
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,

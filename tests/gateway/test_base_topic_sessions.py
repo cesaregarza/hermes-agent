@@ -114,6 +114,61 @@ class TestBasePlatformTopicSessions:
         assert adapter.get_pending_message(build_session_key(pending_event.source)) == pending_event
 
     @pytest.mark.asyncio
+    async def test_busy_handler_failure_does_not_merge_different_senders(self):
+        """The adapter's single-slot fallback must fail closed on identity."""
+        adapter = DummyTelegramAdapter()
+        adapter.config.extra["group_sessions_per_user"] = False
+        adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))
+
+        async def broken_busy_handler(_event, _session_key):
+            raise RuntimeError("runner unavailable")
+
+        adapter.set_busy_session_handler(broken_busy_handler)
+        alice_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            thread_id="77",
+            user_id="alice",
+        )
+        bob_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            chat_type="group",
+            thread_id="77",
+            user_id="bob",
+        )
+        session_key = build_session_key(
+            alice_source,
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+        )
+        alice = MessageEvent(
+            text="alice photo",
+            message_type=MessageType.PHOTO,
+            source=alice_source,
+            media_urls=["/tmp/alice.jpg"],
+            media_types=["image/jpeg"],
+        )
+        bob = MessageEvent(
+            text="bob photo",
+            message_type=MessageType.PHOTO,
+            source=bob_source,
+            media_urls=["/tmp/bob.jpg"],
+            media_types=["image/jpeg"],
+        )
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._pending_messages[session_key] = alice
+
+        await adapter.handle_message(bob)
+
+        # Single-slot fallback is last-writer-wins, but it must never combine
+        # Bob's content under Alice's source after the runner callback fails.
+        assert adapter._pending_messages[session_key] is bob
+        assert bob.media_urls == ["/tmp/bob.jpg"]
+        assert alice.media_urls == ["/tmp/alice.jpg"]
+
+    @pytest.mark.asyncio
     async def test_process_message_background_replies_in_same_topic(self):
         adapter = DummyTelegramAdapter()
         typing_calls = []

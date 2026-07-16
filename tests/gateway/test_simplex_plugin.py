@@ -142,6 +142,32 @@ def test_adapter_platform_identity():
     assert adapter.platform is Platform("simplex")
 
 
+def test_group_text_batch_key_is_session_scoped():
+    from gateway.config import Platform, PlatformConfig
+    from gateway.platforms.base import MessageEvent
+    from gateway.session import SessionSource
+
+    adapter = SimplexAdapter(PlatformConfig(enabled=True))
+
+    def event_for(user_id: str) -> MessageEvent:
+        return MessageEvent(
+            text="chunk",
+            source=SessionSource(
+                platform=Platform("simplex"),
+                chat_id="shared-group",
+                chat_type="group",
+                user_id=user_id,
+            ),
+        )
+
+    alice_first = event_for("alice")
+    alice_second = event_for("alice")
+    bob = event_for("bob")
+
+    assert adapter._text_batch_key(alice_first) == adapter._text_batch_key(alice_second)
+    assert adapter._text_batch_key(alice_first) == adapter._text_batch_key(bob)
+
+
 # ---------------------------------------------------------------------------
 # 5. Helper functions (magic-byte detection)
 # ---------------------------------------------------------------------------

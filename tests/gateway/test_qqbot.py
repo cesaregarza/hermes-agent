@@ -1580,6 +1580,53 @@ class TestDefaultInteractionDispatch:
         assert getattr(QQAdapter, "send_exec_approval", None) is not None
         assert getattr(QQAdapter, "send_update_prompt", None) is not None
 
+    def test_named_profile_session_key_parser_preserves_profile(self):
+        adapter = self._make_adapter()
+
+        assert adapter._parse_gateway_session_key(
+            "agent:coder:qqbot:group:g-1:owner"
+        ) == {
+            "platform": "qqbot",
+            "chat_type": "group",
+            "chat_id": "g-1",
+            "profile": "coder",
+            "user_id": "owner",
+        }
+
+    @pytest.mark.asyncio
+    async def test_named_profile_approval_click_resolves_exact_session_key(self):
+        adapter = self._make_adapter()
+        resolve_calls = []
+
+        def fake_resolve(session_key, choice, resolve_all=False):
+            resolve_calls.append((session_key, choice, resolve_all))
+            return 1
+
+        import tools.approval
+        orig = tools.approval.resolve_gateway_approval
+        tools.approval.resolve_gateway_approval = fake_resolve
+        try:
+            from gateway.platforms.qqbot.keyboards import parse_interaction_event
+            event = parse_interaction_event({
+                "id": "i",
+                "chat_type": 2,
+                "user_openid": "u-42",
+                "data": {
+                    "resolved": {
+                        "button_data": (
+                            "approve:agent:coder:qqbot:c2c:u-42:allow-once"
+                        )
+                    }
+                },
+            })
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            tools.approval.resolve_gateway_approval = orig
+
+        assert resolve_calls == [
+            ("agent:coder:qqbot:c2c:u-42", "once", False)
+        ]
+
     @pytest.mark.asyncio
     async def test_approval_click_once_maps_to_once(self):
         """'allow-once' button → resolve_gateway_approval(session, 'once')."""

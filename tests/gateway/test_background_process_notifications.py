@@ -14,7 +14,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform
+from gateway.platforms.base import _UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY
 from gateway.run import GatewayRunner, _parse_session_key
+from gateway.session import build_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +264,7 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
             thread_id="42",
             user_id="123",
             user_name="Emiliyan",
+            message_id="stale-origin-message",
         )
     )
 
@@ -281,6 +284,54 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
     assert synth_event.source.thread_id == "42"
     assert synth_event.source.user_id == "123"
     assert synth_event.source.user_name == "Emiliyan"
+    assert synth_event.source.message_id is None
+    assert synth_event.message_id is None
+    assert synth_event.metadata[_UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY] is True
+    assert runner._source_with_trigger_message_id(synth_event).message_id is None
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_uses_event_sender_not_session_creator(
+    monkeypatch, tmp_path
+):
+    """Shared-session completions retain the watcher who started the process."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100",
+            chat_type="group",
+            thread_id="42",
+            user_id="alice",
+            user_name="Alice",
+            message_id="alice-origin-message",
+        )
+    )
+    evt = {
+        "session_id": "proc_bob",
+        "session_key": "agent:main:telegram:group:-100:42",
+        "user_id": "bob",
+        "user_name": "Bob",
+        "message_id": "bob-trigger-message",
+    }
+
+    await runner._inject_watch_notification("[SYSTEM: Bob's process finished]", evt)
+
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert synth_event.source.chat_id == "-100"
+    assert synth_event.source.thread_id == "42"
+    assert synth_event.source.user_id == "bob"
+    assert synth_event.source.user_name == "Bob"
+    assert synth_event.source.user_id_alt is None
+    assert synth_event.source.message_id is None
+    assert synth_event.message_id == "bob-trigger-message"
+    assert _UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY not in synth_event.metadata
+    assert runner._source_with_trigger_message_id(synth_event).message_id == (
+        "bob-trigger-message"
+    )
 
 
 @pytest.mark.asyncio
@@ -371,6 +422,7 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
             thread_id="24296",
             user_id="1",
             user_name="Fabio",
+            message_id="stale-origin-message",
         )
     )
 
@@ -386,6 +438,8 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
     synth_event = adapter.handle_message.await_args.args[0]
     assert synth_event.message_id == "777"
     assert synth_event.source.thread_id == "24296"
+    assert synth_event.source.message_id is None
+    assert runner._source_with_trigger_message_id(synth_event).message_id == "777"
 
 
 def test_build_process_event_source_falls_back_to_session_key_chat_type(monkeypatch, tmp_path):
@@ -410,6 +464,25 @@ def test_build_process_event_source_falls_back_to_session_key_chat_type(monkeypa
     assert source.thread_id == "42"
     assert source.user_id == "123"
     assert source.user_name == "Emiliyan"
+
+
+def test_build_process_event_source_derives_named_profile_from_session_key(
+    monkeypatch, tmp_path
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+
+    source = runner._build_process_event_source(
+        {
+            "session_id": "proc_coder",
+            "session_key": "agent:coder:telegram:dm:123",
+        }
+    )
+
+    assert source is not None
+    assert source.platform is Platform.TELEGRAM
+    assert source.chat_type == "dm"
+    assert source.chat_id == "123"
+    assert source.profile == "coder"
 
 
 def test_build_process_event_source_uses_cached_live_source_before_session_key_parse(
@@ -446,6 +519,97 @@ def test_build_process_event_source_uses_cached_live_source_before_session_key_p
     assert source.user_name == "alice"
 
 
+def test_build_process_event_source_uses_coherent_store_provenance_snapshot(
+    monkeypatch, tmp_path
+):
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    session_key = "agent:ops:discord:dm:relay-chat"
+    snapshot_calls = []
+
+    def routing_snapshot(key):
+        snapshot_calls.append(key)
+        return SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="relay-chat",
+            chat_type="dm",
+            user_id="relay-owner",
+            message_id="stale-trigger",
+            profile="ops",
+            transport_profile="primary-bot",
+            delivered_via_upstream_relay=True,
+        )
+
+    monkeypatch.setattr(
+        runner.session_store,
+        "routing_source_snapshot",
+        routing_snapshot,
+    )
+    runner._cache_session_source(
+        session_key,
+        SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="wrong-cache-destination",
+        ),
+    )
+
+    source = runner._build_process_event_source(
+        {
+            "session_id": "proc-relay",
+            "session_key": session_key,
+        }
+    )
+
+    assert snapshot_calls == [session_key]
+    assert source is not None
+    assert source.platform is Platform.DISCORD
+    assert source.chat_id == "relay-chat"
+    assert source.message_id is None
+    assert source.profile == "ops"
+    assert source.transport_profile == "primary-bot"
+    assert source.delivered_via_upstream_relay is True
+
+
+def test_process_event_preserves_alt_id_for_same_signal_sender(monkeypatch, tmp_path):
+    """A watcher overlay must not move a Signal turn out of its UUID lane."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    origin = SessionSource(
+        platform=Platform.SIGNAL,
+        chat_id="signal-group",
+        chat_type="group",
+        user_id="+15551234567",
+        user_id_alt="signal-user-uuid",
+        user_name="Alice",
+    )
+    session_key = build_session_key(
+        origin,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+    runner.session_store._entries[session_key] = SimpleNamespace(origin=origin)
+
+    source = runner._build_process_event_source(
+        {
+            "session_id": "proc_signal",
+            "session_key": session_key,
+            "user_id": "+15551234567",
+            "user_name": "Alice",
+        }
+    )
+
+    assert source is not None
+    assert source.user_id == "+15551234567"
+    assert source.user_id_alt == "signal-user-uuid"
+    assert build_session_key(
+        source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    ) == session_key
+
+
 @pytest.mark.asyncio
 async def test_inject_watch_notification_ignores_foreground_event_source(monkeypatch, tmp_path):
     """Negative test: watch notification must NOT route to the foreground thread."""
@@ -479,6 +643,45 @@ async def test_inject_watch_notification_ignores_foreground_event_source(monkeyp
     # Must route to thread 42 (process origin), NOT some other thread
     assert synth_event.source.thread_id == "42"
     assert synth_event.source.user_id == "proc_owner"
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_uses_relay_transport_for_relay_origin(
+    monkeypatch, tmp_path
+):
+    """Stored relay origins keep their process-shared transport on wakeup."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    relay_adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner.adapters = {Platform.RELAY: relay_adapter}
+    session_key = "agent:main:discord:dm:relay-chat"
+    runner.session_store._entries[session_key] = SimpleNamespace(
+        session_id="gateway-relay-session",
+        origin=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="relay-chat",
+            chat_type="dm",
+            user_id="relay-owner",
+            delivered_via_upstream_relay=True,
+        ),
+        origin_transport="relay",
+        origin_transport_profile=None,
+    )
+
+    accepted = await runner._inject_watch_notification(
+        "[SYSTEM: relay watch match]",
+        {
+            "session_id": "proc-relay",
+            "session_key": session_key,
+        },
+    )
+
+    assert accepted is True
+    relay_adapter.handle_message.assert_awaited_once()
+    event = relay_adapter.handle_message.await_args.args[0]
+    assert event.source.platform is Platform.DISCORD
+    assert event.source.delivered_via_upstream_relay is True
 
 
 def test_build_process_event_source_returns_none_for_empty_evt(monkeypatch, tmp_path):
@@ -524,6 +727,16 @@ def test_parse_session_key_valid():
     assert result == {"platform": "telegram", "chat_type": "group", "chat_id": "-100"}
 
 
+def test_parse_session_key_named_profile():
+    result = _parse_session_key("agent:coder:telegram:dm:123")
+    assert result == {
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "profile": "coder",
+    }
+
+
 def test_parse_session_key_with_extra_parts():
     """6th part in a group key may be a user_id, not a thread_id — omit it."""
     result = _parse_session_key("agent:main:discord:group:chan123:thread456")
@@ -555,4 +768,4 @@ def test_parse_session_key_too_short():
 
 def test_parse_session_key_wrong_prefix():
     assert _parse_session_key("cron:main:telegram:dm:123") is None
-    assert _parse_session_key("agent:cron:telegram:dm:123") is None
+    assert _parse_session_key("agent:bad.profile:telegram:dm:123") is None

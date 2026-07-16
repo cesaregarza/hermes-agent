@@ -491,6 +491,129 @@ class TestBusySessionAck:
         overflow = runner._queued_events.get(sk, [])
         assert [e.text for e in overflow] == ["second message"]
 
+    @pytest.mark.parametrize("incoming_type", [MessageType.PHOTO, MessageType.TEXT])
+    def test_media_followups_from_different_senders_stay_separate(self, incoming_type):
+        """Shared-session media must not inherit another user's identity."""
+        runner, _sentinel = _make_runner()
+        runner._queued_events = {}
+        adapter = _make_adapter()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        sk = "agent:main:telegram:group:-1001:thread:77"
+
+        alice = MessageEvent(
+            text="alice caption",
+            message_type=MessageType.PHOTO,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="-1001",
+                thread_id="77",
+                chat_type="group",
+                user_id="alice",
+            ),
+            message_id="alice-message",
+            media_urls=["/tmp/alice.jpg"],
+            media_types=["image/jpeg"],
+        )
+        bob = MessageEvent(
+            text="bob follow-up",
+            message_type=incoming_type,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="-1001",
+                thread_id="77",
+                chat_type="group",
+                user_id="bob",
+            ),
+            message_id="bob-message",
+            media_urls=["/tmp/bob.jpg"] if incoming_type == MessageType.PHOTO else [],
+            media_types=["image/jpeg"] if incoming_type == MessageType.PHOTO else [],
+        )
+
+        runner._queue_or_replace_pending_event(sk, alice)
+        runner._queue_or_replace_pending_event(sk, bob)
+
+        assert adapter._pending_messages[sk] is alice
+        assert alice.text == "alice caption"
+        assert alice.media_urls == ["/tmp/alice.jpg"]
+        assert runner._queued_events[sk] == [bob]
+
+    def test_media_followups_from_same_sender_still_merge_as_album(self):
+        """The sender guard must preserve same-user photo album batching."""
+        runner, _sentinel = _make_runner()
+        runner._queued_events = {}
+        adapter = _make_adapter()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        sk = "agent:main:telegram:group:-1001:thread:77"
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            thread_id="77",
+            chat_type="group",
+            user_id="alice",
+        )
+        first = MessageEvent(
+            text="first caption",
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="alice-1",
+            media_urls=["/tmp/one.jpg"],
+            media_types=["image/jpeg"],
+        )
+        second = MessageEvent(
+            text="second caption",
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="alice-2",
+            media_urls=["/tmp/two.jpg"],
+            media_types=["image/jpeg"],
+        )
+
+        runner._queue_or_replace_pending_event(sk, first)
+        runner._queue_or_replace_pending_event(sk, second)
+
+        assert adapter._pending_messages[sk] is first
+        assert first.text == "first caption\n\nsecond caption"
+        assert first.media_urls == ["/tmp/one.jpg", "/tmp/two.jpg"]
+        assert first.media_types == ["image/jpeg", "image/jpeg"]
+        assert sk not in runner._queued_events
+
+    def test_same_sender_merge_does_not_jump_existing_overflow(self):
+        """A/B/A arrivals remain globally FIFO even when A events can merge."""
+        runner, _sentinel = _make_runner()
+        runner._queued_events = {}
+        adapter = _make_adapter()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        sk = "agent:main:telegram:group:-1001:thread:77"
+
+        def _event(sender, text, *, photo=False):
+            return MessageEvent(
+                text=text,
+                message_type=MessageType.PHOTO if photo else MessageType.TEXT,
+                source=SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id="-1001",
+                    thread_id="77",
+                    chat_type="group",
+                    user_id=sender,
+                ),
+                message_id=f"{sender}-{text}",
+                media_urls=[f"/tmp/{text}.jpg"] if photo else [],
+                media_types=["image/jpeg"] if photo else [],
+            )
+
+        alice_head = _event("alice", "first", photo=True)
+        bob = _event("bob", "second")
+        alice_tail = _event("alice", "third")
+
+        runner._queue_or_replace_pending_event(sk, alice_head, merge_text=True)
+        runner._queue_or_replace_pending_event(sk, bob, merge_text=True)
+        runner._queue_or_replace_pending_event(sk, alice_tail, merge_text=True)
+
+        assert adapter._pending_messages[sk] is alice_head
+        assert alice_head.text == "first"
+        assert alice_head.media_urls == ["/tmp/first.jpg"]
+        assert runner._queued_events[sk] == [bob, alice_tail]
+
     @pytest.mark.asyncio
     async def test_debounce_suppresses_rapid_acks(self):
         """Second message within 30s should NOT send another ack."""

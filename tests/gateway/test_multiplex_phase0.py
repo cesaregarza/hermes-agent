@@ -265,3 +265,53 @@ class TestSessionStoreUnmultiplexedRecovery:
         assert recovered.session_id == "sess-coder"
         assert recovered.session_key == "agent:main:telegram:dm:99"
         assert store._db.reopened == ["sess-coder"]
+
+
+class TestSessionStoreMultiplexedRecovery:
+    """Durable peer fallback must stay inside the requested profile."""
+
+    def _store_with_row(self, tmp_path, row):
+        config = GatewayConfig(multiplex_profiles=True)
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = _RecoveringDB(row)
+        store._loaded = True
+        return store
+
+    def test_coder_row_cannot_recover_into_writer(self, tmp_path):
+        row = {
+            "id": "sess-coder",
+            "started_at": 1700000000,
+            "session_key": "agent:coder:telegram:dm:99",
+        }
+        store = self._store_with_row(tmp_path, row)
+        source = _src(chat_id="99", chat_type="dm", profile="writer")
+
+        recovered = store._recover_session_from_db(
+            session_key="agent:writer:telegram:dm:99",
+            source=source,
+            now=datetime.fromtimestamp(1700000001),
+        )
+
+        assert recovered is None
+        assert store._db.reopened == []
+
+    def test_matching_writer_row_recovers_and_reopens(self, tmp_path):
+        row = {
+            "id": "sess-writer",
+            "started_at": 1700000000,
+            "session_key": "agent:writer:telegram:dm:99",
+        }
+        store = self._store_with_row(tmp_path, row)
+        source = _src(chat_id="99", chat_type="dm", profile="writer")
+
+        recovered = store._recover_session_from_db(
+            session_key="agent:writer:telegram:dm:99",
+            source=source,
+            now=datetime.fromtimestamp(1700000001),
+        )
+
+        assert recovered is not None
+        assert recovered.session_id == "sess-writer"
+        assert recovered.session_key == "agent:writer:telegram:dm:99"
+        assert store._db.reopened == ["sess-writer"]

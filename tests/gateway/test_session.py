@@ -1,11 +1,13 @@
 """Tests for gateway session management."""
 import json
+import threading
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import (
+    SessionEntry,
     SessionSource,
     SessionStore,
     build_session_context,
@@ -1866,3 +1868,318 @@ class TestGatewayRoutingTable:
         )
         assert entry.session_key not in rows
         restarted._db.close()
+
+
+class TestGatewayRoutingProvenance:
+    """The latest authorized ingress owns durable completion routing."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_db(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+    @staticmethod
+    def _source(
+        *,
+        relay: bool,
+        message_id: str,
+        profile: str | None = None,
+        transport_profile: str | None = None,
+    ) -> SessionSource:
+        return SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_name="release-room",
+            chat_type="channel",
+            user_id="user-1",
+            message_id=message_id,
+            profile=profile,
+            transport_profile=transport_profile,
+            delivered_via_upstream_relay=relay,
+        )
+
+    @staticmethod
+    def _persisted_entry(store: SessionStore, session_key: str):
+        rows = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        return json.loads(rows[session_key])
+
+    def test_direct_to_relay_refreshes_durable_completion_origin(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        direct = store.get_or_create_session(
+            self._source(relay=False, message_id="direct-message")
+        )
+
+        relay = store.get_or_create_session(
+            self._source(relay=True, message_id="relay-message")
+        )
+
+        assert relay.session_id == direct.session_id
+        assert relay.origin is not None
+        assert relay.origin.platform == Platform.DISCORD
+        assert relay.origin.message_id is None
+        assert relay.origin.delivered_via_upstream_relay is True
+        assert relay.origin_transport == "relay"
+
+        persisted = self._persisted_entry(store, relay.session_key)
+        assert "message_id" not in persisted["origin"]
+        assert persisted["origin_transport"] == "relay"
+
+        store._db.close()
+        restarted = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        restarted._ensure_loaded()
+        completion_origin = restarted._entries[relay.session_key].origin
+        assert completion_origin is not None
+        assert completion_origin.platform == Platform.DISCORD
+        assert completion_origin.message_id is None
+        assert completion_origin.delivered_via_upstream_relay is True
+        restarted._db.close()
+
+    def test_relay_to_direct_refreshes_durable_completion_origin(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        relay = store.get_or_create_session(
+            self._source(relay=True, message_id="relay-message")
+        )
+
+        direct = store.get_or_create_session(
+            self._source(relay=False, message_id="direct-message")
+        )
+
+        assert direct.session_id == relay.session_id
+        assert direct.origin is not None
+        assert direct.origin.message_id is None
+        assert direct.origin.delivered_via_upstream_relay is False
+        assert direct.origin_transport is None
+
+        persisted = self._persisted_entry(store, direct.session_key)
+        assert "message_id" not in persisted["origin"]
+        assert "origin_transport" not in persisted
+
+        store._db.close()
+        restarted = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        restarted._ensure_loaded()
+        completion_origin = restarted._entries[direct.session_key].origin
+        assert completion_origin is not None
+        assert completion_origin.message_id is None
+        assert completion_origin.delivered_via_upstream_relay is False
+        assert restarted._entries[direct.session_key].origin_transport is None
+        restarted._db.close()
+
+    def test_session_entry_relay_provenance_roundtrip_strips_message_id(self):
+        from datetime import datetime
+
+        now = datetime.now()
+        entry = SessionEntry(
+            session_key="agent:main:discord:channel-1",
+            session_id="20260716_120000_deadbeef",
+            created_at=now,
+            updated_at=now,
+            origin=self._source(relay=True, message_id="one-turn-only"),
+            origin_transport="relay",
+            platform=Platform.DISCORD,
+            chat_type="channel",
+        )
+
+        serialized = entry.to_dict()
+        restored = SessionEntry.from_dict(serialized)
+
+        assert "message_id" not in serialized["origin"]
+        assert serialized["origin_transport"] == "relay"
+        assert restored.origin is not None
+        assert restored.origin.message_id is None
+        assert restored.origin.delivered_via_upstream_relay is True
+        assert restored.origin_transport == "relay"
+
+    def test_transport_owner_roundtrip_stays_outside_wire_source(self):
+        from datetime import datetime
+
+        now = datetime.now()
+        source = self._source(
+            relay=False,
+            message_id="one-turn-only",
+            profile="ops",
+            transport_profile="default",
+        )
+        entry = SessionEntry(
+            session_key="agent:ops:discord:channel:channel-1",
+            session_id="20260716_120000_cafefeed",
+            created_at=now,
+            updated_at=now,
+            origin=source,
+            origin_transport_profile="default",
+            platform=Platform.DISCORD,
+            chat_type="channel",
+        )
+
+        serialized = entry.to_dict()
+        restored = SessionEntry.from_dict(serialized)
+
+        assert serialized["origin"]["profile"] == "ops"
+        assert "transport_profile" not in serialized["origin"]
+        assert serialized["origin_transport_profile"] == "default"
+        assert restored.origin is not None
+        assert restored.origin.profile == "ops"
+        assert restored.origin.transport_profile == "default"
+        assert restored.origin_transport_profile == "default"
+
+    def test_conditional_queued_refresh_is_coherent_and_restart_safe(
+        self, tmp_path
+    ):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        original = store.get_or_create_session(
+            self._source(
+                relay=False,
+                message_id="direct-trigger",
+                profile="ops",
+                transport_profile="primary",
+            )
+        )
+
+        relay_source = self._source(
+            relay=True,
+            message_id="queued-relay-trigger",
+            profile="ops",
+            transport_profile="relay-owner",
+        )
+        relay_snapshot = store.refresh_routing_origin_if_current(
+            original.session_key,
+            original.session_id,
+            relay_source,
+        )
+
+        assert relay_snapshot is not None
+        assert relay_snapshot.message_id is None
+        assert relay_snapshot.delivered_via_upstream_relay is True
+        assert relay_snapshot.transport_profile == "relay-owner"
+        assert store.routing_source_snapshot(original.session_key) == relay_snapshot
+        persisted = self._persisted_entry(store, original.session_key)
+        assert "message_id" not in persisted["origin"]
+        assert "transport_profile" not in persisted["origin"]
+        assert persisted["origin_transport"] == "relay"
+        assert persisted["origin_transport_profile"] == "relay-owner"
+
+        store._db.close()
+        restarted = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        after_restart = restarted.routing_source_snapshot(original.session_key)
+        assert after_restart is not None
+        assert after_restart.message_id is None
+        assert after_restart.delivered_via_upstream_relay is True
+        assert after_restart.transport_profile == "relay-owner"
+
+        direct_source = self._source(
+            relay=False,
+            message_id="queued-direct-trigger",
+            profile="ops",
+            transport_profile="secondary-owner",
+        )
+        direct_snapshot = restarted.refresh_routing_origin_if_current(
+            original.session_key,
+            original.session_id,
+            direct_source,
+        )
+        assert direct_snapshot is not None
+        assert direct_snapshot.message_id is None
+        assert direct_snapshot.delivered_via_upstream_relay is False
+        assert direct_snapshot.transport_profile == "secondary-owner"
+        restarted._db.close()
+
+        second_restart = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        final_snapshot = second_restart.routing_source_snapshot(original.session_key)
+        assert final_snapshot is not None
+        assert final_snapshot.message_id is None
+        assert final_snapshot.delivered_via_upstream_relay is False
+        assert final_snapshot.transport_profile == "secondary-owner"
+        second_restart._db.close()
+
+    def test_conditional_queued_refresh_rejects_session_reset_race(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        original = store.get_or_create_session(
+            self._source(
+                relay=False,
+                message_id="old-trigger",
+                profile="ops",
+                transport_profile="primary",
+            )
+        )
+        reset = store.reset_session(original.session_key)
+        assert reset is not None
+        assert reset.session_id != original.session_id
+
+        stale_refresh = store.refresh_routing_origin_if_current(
+            original.session_key,
+            original.session_id,
+            self._source(
+                relay=True,
+                message_id="stale-queued-trigger",
+                profile="ops",
+                transport_profile="stale-owner",
+            ),
+        )
+
+        assert stale_refresh is None
+        current = store.routing_source_snapshot(original.session_key)
+        assert current is not None
+        assert current.message_id is None
+        assert current.delivered_via_upstream_relay is False
+        assert current.transport_profile == "primary"
+        assert store.peek_session_id(original.session_key) == reset.session_id
+        store._db.close()
+
+    def test_routing_source_snapshot_waits_for_whole_provenance_transition(
+        self, tmp_path
+    ):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        entry = store.get_or_create_session(
+            self._source(
+                relay=True,
+                message_id="relay-trigger",
+                profile="ops",
+                transport_profile="relay-owner",
+            )
+        )
+        direct_source = self._source(
+            relay=False,
+            message_id="direct-trigger",
+            profile="ops",
+            transport_profile="direct-owner",
+        )
+        transition_started = threading.Event()
+        release_transition = threading.Event()
+        reader_started = threading.Event()
+        snapshot_done = threading.Event()
+        captured = {}
+
+        def transition():
+            with store._lock:
+                # Deliberately expose an impossible intermediate record while
+                # holding the lock: direct origin + old relay provenance.
+                entry.origin = direct_source
+                transition_started.set()
+                release_transition.wait(timeout=2)
+                entry.origin_transport = None
+                entry.origin_transport_profile = "direct-owner"
+
+        def read_snapshot():
+            reader_started.set()
+            captured["source"] = store.routing_source_snapshot(entry.session_key)
+            snapshot_done.set()
+
+        writer = threading.Thread(target=transition)
+        reader = threading.Thread(target=read_snapshot)
+        writer.start()
+        assert transition_started.wait(timeout=2)
+        reader.start()
+        assert reader_started.wait(timeout=2)
+        assert snapshot_done.wait(timeout=0.05) is False
+        release_transition.set()
+        writer.join(timeout=2)
+        reader.join(timeout=2)
+
+        snapshot = captured["source"]
+        assert snapshot is not None
+        assert snapshot.message_id is None
+        assert snapshot.delivered_via_upstream_relay is False
+        assert snapshot.transport_profile == "direct-owner"
+        store._db.close()

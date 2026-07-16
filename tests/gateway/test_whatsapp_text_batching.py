@@ -77,9 +77,9 @@ def test_rapid_texts_collapse_into_single_dispatch():
     adapter.handle_message = _capture
 
     async def _drive():
-        adapter._enqueue_text_event(_event("one"))
-        adapter._enqueue_text_event(_event("two"))
-        adapter._enqueue_text_event(_event("three"))
+        await adapter._enqueue_text_event(_event("one"))
+        await adapter._enqueue_text_event(_event("two"))
+        await adapter._enqueue_text_event(_event("three"))
         assert dispatched == []  # nothing flushed during the burst
         await asyncio.sleep(0.2)
 
@@ -100,7 +100,7 @@ def test_lone_message_dispatched_alone():
     adapter.handle_message = _capture
 
     async def _drive():
-        adapter._enqueue_text_event(_event("solo"))
+        await adapter._enqueue_text_event(_event("solo"))
         await asyncio.sleep(0.2)
 
     asyncio.run(_drive())

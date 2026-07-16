@@ -6,10 +6,12 @@ from unittest.mock import patch
 
 import pytest
 
+from gateway.config import Platform
 from gateway.platforms.base import (
     BasePlatformAdapter,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
+    _message_events_same_sender,
     cache_audio_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
@@ -19,6 +21,46 @@ from gateway.platforms.base import (
     _log_safe_path,
     _prefix_within_utf16_limit,
 )
+from gateway.session import SessionSource
+
+
+class TestMessageEventSenderIdentity:
+    @staticmethod
+    def _event(*, chat_type: str, user_id: str | None = None) -> MessageEvent:
+        return MessageEvent(
+            text="chunk",
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="shared-chat",
+                chat_type=chat_type,
+                thread_id="shared-thread" if chat_type == "thread" else None,
+                user_id=user_id,
+            ),
+        )
+
+    def test_same_proven_sender_matches(self):
+        first = self._event(chat_type="thread", user_id="alice")
+        second = self._event(chat_type="thread", user_id="alice")
+
+        assert _message_events_same_sender(first, second)
+
+    def test_different_users_in_shared_thread_do_not_match(self):
+        alice = self._event(chat_type="thread", user_id="alice")
+        bob = self._event(chat_type="thread", user_id="bob")
+
+        assert not _message_events_same_sender(alice, bob)
+
+    def test_anonymous_shared_events_are_isolated(self):
+        first = self._event(chat_type="thread")
+        second = self._event(chat_type="thread")
+
+        assert not _message_events_same_sender(first, second)
+
+    def test_senderless_events_in_same_dm_coalesce(self):
+        first = self._event(chat_type="dm")
+        second = self._event(chat_type="dm")
+
+        assert _message_events_same_sender(first, second)
 
 
 class TestInboundMediaSizeCap:

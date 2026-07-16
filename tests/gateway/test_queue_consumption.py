@@ -333,6 +333,32 @@ class TestQueueConsumptionAfterCompletion:
             )
         assert runner._queue_depth(session_key, adapter=adapter) == 3
 
+    def test_enqueue_repairs_empty_slot_before_appending_new_tail(self):
+        """A late arrival cannot jump older overflow while the slot is empty."""
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        adapter = _StubAdapter()
+        session_key = "telegram:user:repair"
+        older = MessageEvent(
+            text="older-B",
+            message_type=MessageType.TEXT,
+            source=MagicMock(),
+            message_id="q-B",
+        )
+        newer = MessageEvent(
+            text="newer-C",
+            message_type=MessageType.TEXT,
+            source=MagicMock(),
+            message_id="q-C",
+        )
+        runner._queued_events = {session_key: [older]}
+
+        runner._enqueue_fifo(session_key, newer, adapter)
+
+        assert adapter._pending_messages[session_key] is older
+        assert runner._queued_events[session_key] == [newer]
+
     def test_enqueue_preserves_text_no_merging(self):
         """Each /queue item keeps its own text — never merged with neighbors."""
         from gateway.run import GatewayRunner

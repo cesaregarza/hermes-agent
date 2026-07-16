@@ -788,12 +788,12 @@ class TestProfileScopedStorage:
 
     def test_profile_store_uses_profiles_subdir(self, tmp_path, monkeypatch):
         """PairingStore(profile="yangyang") puts files under
-        <HERMES_HOME>/profiles/yangyang/pairing/."""
+        <HERMES_HOME>/profiles/yangyang/platforms/pairing/."""
         from hermes_constants import get_hermes_home
         monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
         store = PairingStore(profile="yangyang")
         assert store.profile == "yangyang"
-        expected = tmp_path / "profiles" / "yangyang" / "pairing"
+        expected = tmp_path / "profiles" / "yangyang" / "platforms" / "pairing"
         assert store._dir == expected
         assert store._approved_path("weixin") == expected / "weixin-approved.json"
         # Auto-creates the directory
@@ -830,42 +830,44 @@ class TestProfileScopedStorage:
 
         assert global_store._rate_limit_path() == tmp_path / "_rate_limits.json"
         assert profile_store._rate_limit_path() == (
-            tmp_path / "profiles" / "yangyang" / "pairing" / "_rate_limits.json"
+            tmp_path
+            / "profiles"
+            / "yangyang"
+            / "platforms"
+            / "pairing"
+            / "_rate_limits.json"
         )
 
     def test_pairing_store_for_helper_routes_by_profile(self, tmp_path, monkeypatch):
         """_pairing_store_for(source) on a gateway-like object picks the
-        per-profile store when source.profile is set, and falls back to
-        the global store when it isn't (defensive — single-profile
-        gateways, or any code path that hasn't stamped source.profile)."""
+        per-profile store when source.profile is set. In multiplex mode an
+        unstamped source resolves to the primary map entry, while an unknown
+        profile fails closed instead of inheriting the global store."""
+        from gateway.authz_mixin import GatewayAuthorizationMixin
         from gateway.session import SessionSource
         from gateway.config import Platform
 
         class FakeGateway:
             def __init__(self):
+                self.config = type("Config", (), {"multiplex_profiles": True})()
                 self.pairing_store = object()  # sentinel
                 self.pairing_stores = {
                     "default": "default-store",
                     "yangyang": "yangyang-store",
                 }
 
-            # Method under test — copy of the real helper so this test
-            # is self-contained even if the real one moves.
-            def _pairing_store_for(self, source):
-                per_profile = getattr(self, "pairing_stores", None) or {}
-                profile = getattr(source, "profile", None)
-                if profile and profile in per_profile:
-                    return per_profile[profile]
-                return getattr(self, "pairing_store", None)
+            _pairing_store_for = GatewayAuthorizationMixin._pairing_store_for
+
+            def _runtime_profile_for_source(self, source):
+                return source.profile or "default"
 
         g = FakeGateway()
         # source with profile="yangyang" → per-profile store
         s_yy = SessionSource(platform=Platform.WEIXIN, chat_id="c", profile="yangyang")
         assert g._pairing_store_for(s_yy) == "yangyang-store"
-        # source with no profile → fallback to global
+        # source with no profile → explicit primary map entry
         s_none = SessionSource(platform=Platform.WEIXIN, chat_id="c")
-        assert g._pairing_store_for(s_none) is g.pairing_store
-        # source with an unknown profile → fallback (defensive)
+        assert g._pairing_store_for(s_none) == "default-store"
+        # source with an unknown profile → deny
         s_unknown = SessionSource(platform=Platform.WEIXIN, chat_id="c", profile="ghost")
-        assert g._pairing_store_for(s_unknown) is g.pairing_store
-
+        assert g._pairing_store_for(s_unknown) is None

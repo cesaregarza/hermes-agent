@@ -104,6 +104,7 @@ def _make_adapter() -> BasePlatformAdapter:
     adapter._busy_text_debounce_seconds = 0.1
     adapter._busy_text_hard_cap_seconds = 1.0
     adapter._text_debounce = {}
+    adapter._text_debounce_overflow = {}
     adapter._auto_tts_default = False
     adapter._auto_tts_enabled_chats = set()
     adapter._auto_tts_disabled_chats = set()
@@ -269,6 +270,47 @@ async def test_text_debounce_does_not_merge_different_senders():
 
     assert adapter._pending_messages[session_key].text == "from alice"
     assert _debounced_event(adapter, session_key).text == "from bob"
+
+
+@pytest.mark.asyncio
+async def test_text_debounce_preserves_three_senders_in_fifo_order():
+    """One pending slot plus debounce state must not drop a third sender."""
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 1.0
+    events = [
+        _make_event(
+            f"from {sender}",
+            chat_type="group",
+            user_id=sender,
+            user_name=sender.title(),
+            thread_id="topic-1",
+        )
+        for sender in ("alice", "bob", "charlie")
+    ]
+    session_key = build_session_key(events[0].source)
+    assert all(build_session_key(event.source) == session_key for event in events)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    for event in events:
+        await adapter.handle_message(event)
+
+    alice = adapter._pending_messages.pop(session_key)
+    assert (alice.source.user_id, alice.text) == ("alice", "from alice")
+    assert (_debounced_event(adapter, session_key).source.user_id) == "bob"
+    assert [event.source.user_id for event in adapter._text_debounce_overflow[session_key]] == [
+        "charlie",
+    ]
+
+    assert await adapter._flush_text_debounce_now(session_key) is True
+    bob = adapter._pending_messages.pop(session_key)
+    assert (bob.source.user_id, bob.text) == ("bob", "from bob")
+    assert (_debounced_event(adapter, session_key).source.user_id) == "charlie"
+    assert session_key not in adapter._text_debounce_overflow
+
+    assert await adapter._flush_text_debounce_now(session_key) is True
+    charlie = adapter._pending_messages.pop(session_key)
+    assert (charlie.source.user_id, charlie.text) == ("charlie", "from charlie")
+    assert session_key not in adapter._text_debounce
 
 
 @pytest.mark.asyncio

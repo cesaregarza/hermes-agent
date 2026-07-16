@@ -10,12 +10,11 @@ default ``busy_input_mode='interrupt'`` path — calling
 completions (terminal ``notify_on_complete``), which also re-enter as internal
 events.
 
-The fix: ``_handle_active_session_busy_message`` returns ``False`` early for any
-event with ``internal=True``, so the base adapter queues it silently (no
-interrupt, no ack) and it cascades as a new turn after the current one finishes.
-This preserves strict message-role alternation and the design invariant that a
-completion surfaces as a NEW turn only when idle, never spliced into a running
-turn.
+The fix: ``_handle_active_session_busy_message`` queues ``internal=True``
+events through the runner's sender-safe FIFO and returns ``True`` without an
+interrupt or acknowledgment. This preserves strict message-role alternation,
+keeps different participants' events separate, and ensures a completion
+surfaces as a NEW turn only when idle, never spliced into a running turn.
 """
 
 from __future__ import annotations
@@ -45,6 +44,7 @@ from gateway.platforms.base import (  # noqa: E402
     SessionSource,
     build_session_key,
 )
+from gateway.config import Platform  # noqa: E402
 from gateway.run import GatewayRunner  # noqa: E402
 
 
@@ -118,12 +118,145 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
 
     handled = await runner._handle_active_session_busy_message(event, sk)
 
-    # Returns False so the base adapter silently queues the internal event
-    # as a cascading next turn — it must NOT be handled-with-interrupt here.
-    assert handled is False
+    # Handled silently through the runner's sender-safe FIFO.
+    assert handled is True
+    assert adapter._pending_messages[sk] is event
     # The active turn must survive.
     parent.interrupt.assert_not_called()
     # No "⚡ Interrupting current task" (or any) ack for a synthetic event.
+    adapter._send_with_retry.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_relay_internal_event_uses_relay_transport_fifo() -> None:
+    """Underlying relay platforms must resolve to the registered RelayAdapter."""
+    runner = _make_runner()
+    runner._busy_input_mode = "interrupt"
+    relay_adapter = _make_adapter()
+    relay_adapter.platform = Platform.RELAY
+    event = MessageEvent(
+        text="[background process completed]",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="relay-chat",
+            chat_type="dm",
+            user_id="relay-user",
+            delivered_via_upstream_relay=True,
+        ),
+        internal=True,
+    )
+    session_key = build_session_key(event.source)
+    runner.adapters[Platform.RELAY] = relay_adapter
+
+    handled = await runner._handle_active_session_busy_message(
+        event, session_key,
+    )
+
+    assert handled is True
+    assert relay_adapter._pending_messages[session_key] is event
+    relay_adapter._send_with_retry.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_normal_relay_busy_events_use_relay_transport_fifo(
+    monkeypatch,
+) -> None:
+    """Underlying-platform relay messages never touch a local adapter slot."""
+    runner = _make_runner()
+    runner._busy_input_mode = "interrupt"
+    runner._queued_events = {}
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    relay_adapter = _make_adapter()
+    relay_adapter.platform = Platform.RELAY
+    local_adapter = _make_adapter()
+    local_adapter.platform = Platform.DISCORD
+    runner.adapters = {
+        Platform.RELAY: relay_adapter,
+        Platform.DISCORD: local_adapter,
+    }
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="relay-chat",
+        chat_type="group",
+        delivered_via_upstream_relay=True,
+    )
+    session_key = build_session_key(source)
+    parent = _make_running_parent()
+    runner._running_agents[session_key] = parent
+    alice = MessageEvent(
+        text="alice",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            **{**source.__dict__, "user_id": "alice"}
+        ),
+    )
+    bob = MessageEvent(
+        text="bob",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            **{**source.__dict__, "user_id": "bob"}
+        ),
+    )
+
+    assert await runner._handle_active_session_busy_message(
+        alice, session_key
+    ) is True
+    assert await runner._handle_active_session_busy_message(
+        bob, session_key
+    ) is True
+
+    assert relay_adapter._pending_messages[session_key] is alice
+    assert runner._queued_events[session_key] == [bob]
+    assert local_adapter._pending_messages == {}
+    assert parent.interrupt.call_count == 2
+
+
+@pytest.mark.parametrize("completion_user", ["alice", "bob"])
+@pytest.mark.asyncio
+async def test_internal_event_stays_separate_from_user_media(completion_user) -> None:
+    """Synthetic content is its own turn, regardless of sender identity."""
+    runner = _make_runner()
+    runner._busy_input_mode = "interrupt"
+    runner._queued_events = {}
+    adapter = _make_adapter()
+    platform = adapter.platform
+    sk = "agent:main:telegram:group:-1001:thread:77"
+    alice = MessageEvent(
+        text="alice photo",
+        message_type=MessageType.PHOTO,
+        source=SessionSource(
+            platform=platform,
+            chat_id="-1001",
+            thread_id="77",
+            chat_type="group",
+            user_id="alice",
+        ),
+        media_urls=["/tmp/alice.jpg"],
+        media_types=["image/jpeg"],
+    )
+    bob_completion = MessageEvent(
+        text="bob background completion",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=platform,
+            chat_id="-1001",
+            thread_id="77",
+            chat_type="group",
+            user_id=completion_user,
+        ),
+        internal=True,
+    )
+    adapter._pending_messages[sk] = alice
+    runner.adapters[platform] = adapter
+
+    handled = await runner._handle_active_session_busy_message(bob_completion, sk)
+
+    assert handled is True
+    assert adapter._pending_messages[sk] is alice
+    assert alice.text == "alice photo"
+    assert alice.media_urls == ["/tmp/alice.jpg"]
+    assert runner._queued_events[sk] == [bob_completion]
     adapter._send_with_retry.assert_not_called()
 
 

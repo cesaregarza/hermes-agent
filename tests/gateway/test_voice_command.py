@@ -976,6 +976,7 @@ class TestVoiceChannelCommands:
             user_id="user1",
             user_name="user1",
             platform=Platform.DISCORD,
+            message_id="stale-join-message",
         )
 
         mock_adapter = AsyncMock()
@@ -995,6 +996,10 @@ class TestVoiceChannelCommands:
         assert event.source.chat_type == "group"
         assert event.source.chat_name == "Hermes Server / #general"
         assert event.source.user_id == "42"
+        assert mock_adapter._voice_sources[111]["message_id"] == "stale-join-message"
+        assert event.message_id is None
+        assert event.source.message_id is None
+        assert runner._source_with_trigger_message_id(event).message_id is None
 
     @pytest.mark.asyncio
     async def test_input_posts_transcript_in_text_channel(self, runner):

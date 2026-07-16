@@ -271,6 +271,9 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
+    _cancel_pending_batch_task,
+    _message_events_same_sender,
+    _pending_batch_lock,
     cache_image_from_url,
     cache_audio_from_url,
 )
@@ -1252,7 +1255,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             event = await self._build_message_event(msg_data)
                             if event:
                                 if event.message_type == MessageType.TEXT:
-                                    self._enqueue_text_event(event)
+                                    await self._enqueue_text_event(event)
                                 else:
                                     await self.handle_message(event)
             except asyncio.CancelledError:
@@ -1274,14 +1277,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text message batching."""
         from gateway.session import build_session_key
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=event.source.profile,
         )
+        return session_key
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    async def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
         When WhatsApp delivers rapid-fire messages (e.g. forwarded
@@ -1289,8 +1293,21 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         period before dispatching the combined message.
         """
         key = self._text_batch_key(event)
+        async with _pending_batch_lock(
+            self, key, store_attr="_pending_text_batch_locks",
+        ):
+            await self._enqueue_text_event_for_key(key, event)
+
+    async def _enqueue_text_event_for_key(
+        self, key: str, event: MessageEvent,
+    ) -> None:
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
+        if existing is not None:
+            await _cancel_pending_batch_task(self._pending_text_batch_tasks, key)
+            if not _message_events_same_sender(existing, event):
+                await self._flush_text_batch_now(key)
+                existing = None
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
@@ -1302,9 +1319,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
 
-        prior_task = self._pending_text_batch_tasks.get(key)
-        if prior_task and not prior_task.done():
-            prior_task.cancel()
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
@@ -1320,13 +1334,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             else:
                 delay = self._text_batch_delay_seconds
             await asyncio.sleep(delay)
-            event = self._pending_text_batches.pop(key, None)
-            if not event:
+            if self._pending_text_batch_tasks.get(key) is not current_task:
                 return
-            await self.handle_message(event)
+            await self._flush_text_batch_now(key)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
+
+    async def _flush_text_batch_now(self, key: str) -> None:
+        """Dispatch the oldest contiguous sender burst immediately."""
+        event = self._pending_text_batches.pop(key, None)
+        if event:
+            await self.handle_message(event)
 
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""

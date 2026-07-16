@@ -33,7 +33,7 @@ from gateway.whatsapp_identity import (
     expand_whatsapp_aliases,
     normalize_whatsapp_identifier,
 )
-from hermes_constants import get_hermes_dir, get_hermes_home
+from hermes_constants import _legacy_path_has_content, get_hermes_dir, get_hermes_home
 from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
@@ -197,11 +197,30 @@ def _merge_pairing_dir(active_dir: Path, alternate_dir: Path) -> None:
             _secure_write(dest, json.dumps(merged, indent=2, ensure_ascii=False))
 
 
-def _migrate_split_pairing_dirs() -> None:
-    home = get_hermes_home()
+def _pairing_dir_for_home(home: Path) -> Path:
+    """Resolve the active pairing directory for an explicit profile home.
+
+    This mirrors :func:`hermes_constants.get_hermes_dir` without relying on
+    the process/context-local HERMES_HOME.  A multiplex gateway needs to open
+    several profiles' stores concurrently, so resolving them through the
+    primary process environment would either double-nest a named profile or
+    read the wrong profile entirely.
+    """
+    old_dir = home / "pairing"
+    if _legacy_path_has_content(old_dir):
+        return old_dir
+    return home / "platforms" / "pairing"
+
+
+def _migrate_split_pairing_dirs(
+    *,
+    home: Optional[Path] = None,
+    active: Optional[Path] = None,
+) -> None:
+    home = home or get_hermes_home()
     old_dir = home / "pairing"
     new_dir = home / "platforms" / "pairing"
-    active = PAIRING_DIR
+    active = active or PAIRING_DIR
     alternate = new_dir if active.resolve() == old_dir.resolve() else old_dir
     _merge_pairing_dir(active, alternate)
 
@@ -241,9 +260,9 @@ class PairingStore:
       - {platform}-approved.json  : approved (paired) users
       - _rate_limits.json         : rate limit tracking
 
-    When constructed with ``profile="<name>"``, storage lives under
-    ``<HERMES_HOME>/profiles/<name>/pairing/`` (per-profile, used by
-    multiplexing gateways so each profile has its own whitelist).
+    When constructed with ``profile="<name>"``, storage resolves from that
+    profile's canonical HERMES_HOME (per-profile, used by multiplexing
+    gateways so each profile has its own whitelist).
     Without a profile, storage is the global ``<HERMES_HOME>/pairing/``
     directory (backward-compat for the ``hermes pairing`` CLI).
     """
@@ -252,15 +271,37 @@ class PairingStore:
         # Resolve storage directory lazily — tests use a temp HERMES_HOME
         # and PairingStore may be constructed before the env is set.
         if profile:
-            from hermes_constants import get_hermes_home
-            self._dir = get_hermes_home() / "profiles" / profile / "pairing"
+            from hermes_cli.profiles import (
+                normalize_profile_name,
+                validate_profile_name,
+            )
+            from hermes_constants import get_hermes_home as _get_current_hermes_home
+
+            profile = normalize_profile_name(profile)
+            validate_profile_name(profile)
+            current_home = _get_current_hermes_home()
+            # If the process itself started from a named profile, anchor
+            # sibling stores at the common Hermes root instead of producing
+            # ``profiles/<active>/profiles/<requested>``.
+            root_home = (
+                current_home.parent.parent
+                if current_home.parent.name == "profiles"
+                else current_home
+            )
+            profile_home = (
+                root_home if profile == "default" else root_home / "profiles" / profile
+            )
+            self._dir = _pairing_dir_for_home(profile_home)
         else:
             self._dir = PAIRING_DIR
         self._dir.mkdir(parents=True, exist_ok=True)
-        if not profile:
-            # Heal installs whose global pairing data ended up split across
-            # the legacy and new directories (per-profile stores never had
-            # the legacy/new split).
+        # Heal installs whose pairing data ended up split across the legacy
+        # and new directories. Explicit profile stores must do this too: the
+        # profile-aware CLI and a multiplex gateway must observe the same
+        # approval files.
+        if profile:
+            _migrate_split_pairing_dirs(home=profile_home, active=self._dir)
+        else:
             _migrate_split_pairing_dirs()
         # Protects all read-modify-write cycles. The gateway runs multiple
         # platform adapters concurrently in threads sharing one PairingStore.

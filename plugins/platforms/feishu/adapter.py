@@ -136,6 +136,9 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
+    _cancel_pending_batch_task,
+    _message_events_same_sender,
+    _pending_batch_lock,
     cache_document_from_bytes,
     cache_image_from_url,
     cache_audio_from_bytes,
@@ -3335,13 +3338,15 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=event.source.profile,
         )
-        return f"{session_key}:media:{event.message_type.value}"
+        return f"{session_key}:media"
 
     @staticmethod
     def _media_batch_is_compatible(existing: MessageEvent, incoming: MessageEvent) -> bool:
         return (
-            existing.message_type == incoming.message_type
+            _message_events_same_sender(existing, incoming)
+            and existing.message_type == incoming.message_type
             and existing.reply_to_message_id == incoming.reply_to_message_id
             and existing.reply_to_text == incoming.reply_to_text
             and existing.source.thread_id == incoming.source.thread_id
@@ -3349,11 +3354,20 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _enqueue_media_event(self, event: MessageEvent) -> None:
         key = self._media_batch_key(event)
+        async with _pending_batch_lock(
+            self, key, store_attr="_pending_media_batch_locks",
+        ):
+            await self._enqueue_media_event_for_key(key, event)
+
+    async def _enqueue_media_event_for_key(
+        self, key: str, event: MessageEvent,
+    ) -> None:
         existing = self._pending_media_batches.get(key)
         if existing is None:
             self._pending_media_batches[key] = event
             self._schedule_media_batch_flush(key)
             return
+        await _cancel_pending_batch_task(self._pending_media_batch_tasks, key)
         if not self._media_batch_is_compatible(existing, event):
             await self._flush_media_batch_now(key)
             self._pending_media_batches[key] = event
@@ -3635,18 +3649,20 @@ class FeishuAdapter(BasePlatformAdapter):
         """Return the session-scoped key used for Feishu text aggregation."""
         from gateway.session import build_session_key
 
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=event.source.profile,
         )
+        return session_key
 
     @staticmethod
     def _text_batch_is_compatible(existing: MessageEvent, incoming: MessageEvent) -> bool:
         """Only merge text events when reply/thread context is identical."""
         return (
-            existing.reply_to_message_id == incoming.reply_to_message_id
+            _message_events_same_sender(existing, incoming)
+            and existing.reply_to_message_id == incoming.reply_to_message_id
             and existing.reply_to_text == incoming.reply_to_text
             and existing.source.thread_id == incoming.source.thread_id
         )
@@ -3654,6 +3670,14 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Debounce rapid Feishu text bursts into a single MessageEvent."""
         key = self._text_batch_key(event)
+        async with _pending_batch_lock(
+            self, key, store_attr="_pending_text_batch_locks",
+        ):
+            await self._enqueue_text_event_for_key(key, event)
+
+    async def _enqueue_text_event_for_key(
+        self, key: str, event: MessageEvent,
+    ) -> None:
         chunk_len = len(event.text or "")
         existing = self._pending_text_batches.get(key)
         if existing is None:
@@ -3663,6 +3687,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._schedule_text_batch_flush(key)
             return
 
+        await _cancel_pending_batch_task(self._pending_text_batch_tasks, key)
         if not self._text_batch_is_compatible(existing, event):
             await self._flush_text_batch_now(key)
             self._pending_text_batches[key] = event

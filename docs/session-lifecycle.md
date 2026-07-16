@@ -526,13 +526,18 @@ def build_session_context(source, config, session_entry=None) -> SessionContext
 The dynamic system prompt section (`## Current Session Context`) can optionally redact
 personally identifiable information before sending to the LLM:
 
-- User IDs → `user_<12hex>` (SHA-256 prefix)
-- Chat IDs → `<platform>:<12hex>` or just `<12hex>`
-- Platforms excluded from redaction: Discord (needs raw IDs for `@mentions`),
-  and any plugin-registered platform not marked `pii_safe`.
+- User IDs and identifier-derived user labels → `user_<12hex>` (SHA-256 prefix)
+- Chat and home-channel IDs → `<platform>:<12hex>` or just `<12hex>`
+- Identifier-derived chat/home labels → the same deterministic chat pseudonym;
+  genuine display names are preserved
+- Eligible built-ins: WhatsApp, WhatsApp Cloud, Signal, Telegram, and
+  BlueBubbles. Plugin platforms must opt in with `pii_safe`. Discord and Slack
+  remain excluded because their mention systems need raw IDs.
 
-Redaction applies only to the system prompt text. Routing, session keys, and adapter
-operations always use the original values.
+The hashes are stable and linkable pseudonyms, not anonymity. Redaction changes
+only outbound contextual copies (the LLM prompt and shared-session sender prefix,
+plus metadata sent to explicitly opted-in MCP servers); routing, session keys,
+and adapter operations always use the original values.
 
 ---
 

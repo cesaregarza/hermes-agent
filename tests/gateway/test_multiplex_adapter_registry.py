@@ -1,9 +1,12 @@
 """Phase 3: secondary-profile adapter registry + same-token conflict detection."""
 import logging
+from pathlib import Path
 
 import pytest
+from unittest.mock import patch
 
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _profile_runtime_scope
+from gateway.session import SessionSource
 
 
 class _FakeAdapter:
@@ -107,6 +110,7 @@ class TestProfileMessageHandler:
 
         async def _fake_handle(event):
             seen["profile"] = event.source.profile
+            seen["transport_profile"] = event.source.transport_profile
             return "ok"
 
         runner._handle_message = _fake_handle
@@ -121,27 +125,182 @@ class TestProfileMessageHandler:
         result = await handler(_Evt())
         assert result == "ok"
         assert seen["profile"] == "coder"
+        assert seen["transport_profile"] == "coder"
 
     @pytest.mark.asyncio
-    async def test_does_not_override_existing_profile(self):
+    async def test_secondary_owner_overrides_existing_route_profile(self):
         runner = GatewayRunner.__new__(GatewayRunner)
         seen = {}
 
         async def _fake_handle(event):
             seen["profile"] = event.source.profile
+            seen["transport_profile"] = event.source.transport_profile
             return "ok"
 
         runner._handle_message = _fake_handle
         handler = runner._make_profile_message_handler("coder")
 
         class _Src:
-            profile = "writer"  # already stamped (e.g. by URL prefix)
+            profile = "writer"  # stale/shared-route value
+            transport_profile = "default"
 
         class _Evt:
             source = _Src()
 
         await handler(_Evt())
-        assert seen["profile"] == "writer"
+        assert seen == {
+            "profile": "coder",
+            "transport_profile": "coder",
+        }
+
+
+class TestPrimaryAdapterOwnership:
+    def test_named_active_profile_uses_primary_registry(self, monkeypatch):
+        from gateway.config import GatewayConfig, Platform
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        primary = _FakeAdapter()
+        default_secondary = _FakeAdapter()
+        runner.adapters = {Platform.TELEGRAM: primary}
+        runner._profile_adapters = {
+            "default": {Platform.TELEGRAM: default_secondary},
+        }
+
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="coder",
+        ):
+            assert (
+                runner._authorization_adapter(Platform.TELEGRAM, "coder")
+                is primary
+            )
+            assert (
+                runner._authorization_adapter(Platform.TELEGRAM, "default")
+                is default_secondary
+            )
+            assert runner._authorization_adapter(
+                Platform.TELEGRAM, "missing"
+            ) is None
+
+    def test_profile_runtime_scope_cannot_retarget_primary_registry(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Context-local active-profile changes never redefine bot ownership."""
+        from gateway.config import GatewayConfig, Platform
+
+        home = tmp_path / ".hermes"
+        coder_home = home / "profiles" / "coder"
+        coder_home.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._primary_profile_name = "default"
+        primary = _FakeAdapter()
+        secondary = _FakeAdapter()
+        runner.adapters = {Platform.TELEGRAM: primary}
+        runner._profile_adapters = {
+            "coder": {Platform.TELEGRAM: secondary},
+        }
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="shared-chat",
+            profile="coder",
+            transport_profile="default",
+        )
+
+        with _profile_runtime_scope(coder_home):
+            assert runner._active_profile_name() == "coder"
+            assert runner._authorization_adapter(
+                Platform.TELEGRAM,
+                "default",
+            ) is primary
+            assert runner._adapter_for_source(source) is primary
+
+    def test_primary_factory_stamps_named_active_profile(self, monkeypatch):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        adapter = _FakeAdapter()
+        monkeypatch.setattr(
+            runner,
+            "_create_adapter",
+            lambda _platform, _config: adapter,
+        )
+
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="coder",
+        ):
+            created = runner._create_primary_adapter(
+                Platform.TELEGRAM,
+                PlatformConfig(enabled=True, token="test"),
+            )
+
+        assert created is adapter
+        assert adapter._profile_name == "coder"
+        assert adapter._profile_routes_enabled is True
+
+    def test_primary_adapter_auth_callback_uses_routed_runtime(self):
+        from gateway.config import GatewayConfig, Platform
+        from gateway.profile_routing import ProfileRoute
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.config.profile_routes = [
+            ProfileRoute(
+                name="ops-chat",
+                platform="telegram",
+                profile="ops",
+                chat_id="chat-1",
+            )
+        ]
+        runner._primary_profile_name = "default"
+        seen = []
+        runner._is_user_authorized = lambda source: seen.append(source) or True
+
+        callback = runner._make_adapter_auth_check(
+            Platform.TELEGRAM,
+            profile="default",
+        )
+
+        assert callback("user-1", "group", "chat-1") is True
+        assert len(seen) == 1
+        assert seen[0].profile == "ops"
+        assert seen[0].transport_profile == "default"
+
+    def test_secondary_adapter_auth_callback_pins_owner_runtime(self):
+        from gateway.config import GatewayConfig, Platform
+        from gateway.profile_routing import ProfileRoute
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.config.profile_routes = [
+            ProfileRoute(
+                name="ops-chat",
+                platform="telegram",
+                profile="ops",
+                chat_id="chat-1",
+            )
+        ]
+        runner._primary_profile_name = "default"
+        seen = []
+        runner._is_user_authorized = lambda source: seen.append(source) or True
+
+        callback = runner._make_adapter_auth_check(
+            Platform.TELEGRAM,
+            profile="coder",
+        )
+
+        assert callback("user-1", "group", "chat-1") is True
+        assert len(seen) == 1
+        assert seen[0].profile == "coder"
+        assert seen[0].transport_profile == "coder"
 
 
 class TestSecondaryProfileConfigHandling:
@@ -367,7 +526,7 @@ class TestSecondaryProfileConfigHandling:
         runner._handle_active_session_busy_message = object()
         runner._recover_telegram_topic_thread_id = object()
         runner._busy_text_mode = "queue"
-        runner._make_adapter_auth_check = lambda platform, profile_name=None: object()
+        runner._make_adapter_auth_check = lambda platform, **_kwargs: object()
 
         reviewer_cfg = GatewayConfig(multiplex_profiles=True)
         reviewer_cfg.platforms = {
@@ -406,6 +565,7 @@ class TestSecondaryProfileConfigHandling:
         assert runner._profile_adapters["reviewer"] == {
             Platform.TELEGRAM: direct,
         }
+        assert direct._profile_name == "reviewer"
 
     @pytest.mark.asyncio
     async def test_non_multiplex_profile_adapter_start_keeps_relay(self, monkeypatch):
@@ -441,7 +601,7 @@ class TestSecondaryProfileConfigHandling:
         runner._handle_active_session_busy_message = object()
         runner._recover_telegram_topic_thread_id = object()
         runner._busy_text_mode = "queue"
-        runner._make_adapter_auth_check = lambda platform, profile_name=None: object()
+        runner._make_adapter_auth_check = lambda platform, **_kwargs: object()
 
         profile_cfg = GatewayConfig(multiplex_profiles=False)
         profile_cfg.platforms = {

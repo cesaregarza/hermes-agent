@@ -472,7 +472,7 @@ hermes config set security.redact_secrets false
 
 ### Gateway 消息中的 PII 脱敏
 
-与密钥脱敏分开。启用后，gateway 在上下文到达模型之前对用户 ID 进行哈希处理并从会话上下文中去除电话号码：
+该功能与密钥脱敏相互独立。在符合条件的平台上，它会对出站模型上下文及已选择启用此功能的 MCP 元数据中的用户/聊天身份字段，以及由电话号码或路由 ID 派生的标签进行假名化。它不会扫描任意消息内容以查找电话号码：
 
 ```bash
 hermes config set privacy.redact_pii true    # 启用

@@ -1247,22 +1247,22 @@ display:
 
 ```yaml
 privacy:
-  redact_pii: false  # 从 LLM 上下文中删除 PII（仅限 gateway）
+  redact_pii: false  # 对符合条件的 gateway 身份副本进行假名化
 ```
 
-当 `redact_pii` 为 `true` 时，gateway 在将系统提示词发送到受支持平台上的 LLM 之前，会从中删除个人身份信息：
+当 `redact_pii` 为 `true` 时，gateway 会在受支持的平台上，对发送给 LLM 的出站上下文以及发送给明确选择启用该功能的 MCP 服务器的会话元数据中的个人身份信息进行假名化：
 
 | 字段 | 处理方式 |
 |-------|-----------|
-| 电话号码（WhatsApp/Signal 上的用户 ID） | 哈希为 `user_<12-char-sha256>` |
+| 电话号码及由电话号码派生的用户标签 | 哈希为 `user_<12-char-sha256>` |
 | 用户 ID | 哈希为 `user_<12-char-sha256>` |
-| 聊天 ID | 数字部分哈希，保留平台前缀（`telegram:<hash>`） |
-| 主频道 ID | 数字部分哈希 |
-| 用户名/昵称 | **不受影响**（用户选择的，公开可见） |
+| 聊天 ID | 标识符部分哈希，保留平台前缀（`telegram:<hash>`） |
+| 主频道 ID 及由标识符派生的备用名称 | 替换为现有的确定性聊天哈希 |
+| 真实显示名称/用户名 | 保留；由电话号码或路由 ID 派生的适配器备用标签会被假名化 |
 
-**平台支持：** 删除适用于 WhatsApp、Signal 和 Telegram。Discord 和 Slack 被排除，因为它们的提及系统（`<@user_id>`）需要 LLM 上下文中的真实 ID。
+**平台支持：** 内置脱敏适用于 WhatsApp、WhatsApp Cloud、Signal、Telegram 和 BlueBubbles。插件平台可通过 `pii_safe` 能力选择加入。Discord 和 Slack 被排除，因为它们的提及系统（`<@user_id>`）需要 LLM 上下文中的真实 ID。
 
-哈希是确定性的 —— 同一用户始终映射到同一哈希，因此模型仍然可以在群聊中区分用户。路由和传递在内部使用原始值。
+哈希是确定、稳定且可关联的——同一用户会映射到同一假名，因此模型仍能在群聊中区分参与者。这是假名化，而非匿名化。只有出站上下文副本会改变（LLM 提示词和共享会话发送者前缀，以及发送给明确选择启用该功能的 MCP 服务器的会话元数据）；内部路由和传递值保持原始状态。
 
 ## 语音转文字（STT）
 

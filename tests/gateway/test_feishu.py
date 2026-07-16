@@ -1913,6 +1913,120 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertIn("第二张", event.text)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_text_batch_splits_different_senders_in_shared_thread(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.session import SessionSource
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"group_sessions_per_user": False})
+        )
+        alice = MessageEvent(
+            text="Alice",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=adapter.platform,
+                chat_id="oc_shared",
+                chat_type="group",
+                user_id="ou_alice",
+                thread_id="omt_shared",
+            ),
+        )
+        bob = MessageEvent(
+            text="Bob",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=adapter.platform,
+                chat_id="oc_shared",
+                chat_type="group",
+                user_id="ou_bob",
+                thread_id="omt_shared",
+            ),
+        )
+
+        self.assertEqual(adapter._text_batch_key(alice), adapter._text_batch_key(bob))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_media_batch_splits_different_senders_in_shared_thread(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.session import SessionSource
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"group_sessions_per_user": False})
+        )
+        alice = MessageEvent(
+            text="",
+            message_type=MessageType.PHOTO,
+            source=SessionSource(
+                platform=adapter.platform,
+                chat_id="oc_shared",
+                chat_type="group",
+                user_id="ou_alice",
+                thread_id="omt_shared",
+            ),
+            media_urls=["/tmp/alice.png"],
+        )
+        bob = MessageEvent(
+            text="",
+            message_type=MessageType.PHOTO,
+            source=SessionSource(
+                platform=adapter.platform,
+                chat_id="oc_shared",
+                chat_type="group",
+                user_id="ou_bob",
+                thread_id="omt_shared",
+            ),
+            media_urls=["/tmp/bob.png"],
+        )
+
+        self.assertEqual(adapter._media_batch_key(alice), adapter._media_batch_key(bob))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_media_batch_splits_same_sender_across_profiles(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.session import SessionSource
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        alpha = MessageEvent(
+            text="",
+            message_type=MessageType.PHOTO,
+            source=SessionSource(
+                platform=adapter.platform,
+                chat_id="oc_shared",
+                chat_type="group",
+                user_id="ou_alice",
+                thread_id="omt_shared",
+                profile="alpha",
+            ),
+            media_urls=["/tmp/alpha.png"],
+        )
+        beta = MessageEvent(
+            text="",
+            message_type=MessageType.PHOTO,
+            source=SessionSource(
+                platform=adapter.platform,
+                chat_id="oc_shared",
+                chat_type="group",
+                user_id="ou_alice",
+                thread_id="omt_shared",
+                profile="beta",
+            ),
+            media_urls=["/tmp/beta.png"],
+        )
+
+        alpha_key = adapter._media_batch_key(alpha)
+        beta_key = adapter._media_batch_key(beta)
+
+        self.assertNotEqual(alpha_key, beta_key)
+        self.assertTrue(alpha_key.startswith("agent:alpha:"))
+        self.assertTrue(beta_key.startswith("agent:beta:"))
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_image_downloads_then_uses_native_image_send(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter

@@ -1,12 +1,25 @@
 """Regression tests for multiplex profile-aware own-policy authorization."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+
+
+@pytest.fixture
+def profile_auth_env(tmp_path, monkeypatch):
+    """Create real default/coder profile homes without touching user state."""
+    home = tmp_path / ".hermes"
+    coder_home = home / "profiles" / "coder"
+    coder_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home, coder_home
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -48,6 +61,265 @@ def _make_multiplex_runner(monkeypatch):
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = False
     return runner, default_adapter, secondary_adapter
+
+
+def _make_profile_env_runner():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._primary_profile_name = "default"
+    runner.adapters = {}
+    runner._profile_adapters = {}
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    runner.pairing_stores = {}
+    return runner
+
+
+def _telegram_source(profile: str, user_id: str) -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id=user_id,
+        chat_id=f"dm-{user_id}",
+        user_name=user_id,
+        chat_type="dm",
+        profile=profile,
+        transport_profile=profile,
+    )
+
+
+def test_profile_env_allowlists_are_disjoint_and_process_env_is_ignored(
+    profile_auth_env,
+    monkeypatch,
+):
+    """Multiplex auth reads only the routed profile's real ``.env`` file."""
+    home, coder_home = profile_auth_env
+    (home / ".env").write_text(
+        "TELEGRAM_ALLOWED_USERS=default-user\n",
+        encoding="utf-8",
+    )
+    (coder_home / ".env").write_text(
+        "TELEGRAM_ALLOWED_USERS=coder-user\n",
+        encoding="utf-8",
+    )
+    # Poison the process environment with values that would fail open if the
+    # multiplex path inherited os.environ.
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "process-user")
+    monkeypatch.setenv("TELEGRAM_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    runner = _make_profile_env_runner()
+
+    assert runner._is_user_authorized(
+        _telegram_source("default", "default-user")
+    ) is True
+    assert runner._is_user_authorized(
+        _telegram_source("default", "coder-user")
+    ) is False
+    assert runner._is_user_authorized(
+        _telegram_source("coder", "coder-user")
+    ) is True
+    assert runner._is_user_authorized(
+        _telegram_source("coder", "default-user")
+    ) is False
+    assert runner._is_user_authorized(
+        _telegram_source("coder", "process-user")
+    ) is False
+    assert runner._is_user_authorized(
+        _telegram_source("coder", "stranger")
+    ) is False
+
+
+def test_primary_profile_allow_all_does_not_leak_into_coder(
+    profile_auth_env,
+):
+    """Coder remains allowlisted-only when the primary profile is open."""
+    home, coder_home = profile_auth_env
+    (home / ".env").write_text(
+        "TELEGRAM_ALLOW_ALL_USERS=true\n",
+        encoding="utf-8",
+    )
+    (coder_home / ".env").write_text(
+        "TELEGRAM_ALLOWED_USERS=coder-user\n"
+        "TELEGRAM_ALLOW_ALL_USERS=false\n",
+        encoding="utf-8",
+    )
+    runner = _make_profile_env_runner()
+
+    assert runner._is_user_authorized(
+        _telegram_source("default", "anyone")
+    ) is True
+    assert runner._is_user_authorized(
+        _telegram_source("coder", "coder-user")
+    ) is True
+    assert runner._is_user_authorized(
+        _telegram_source("coder", "anyone")
+    ) is False
+
+
+def test_missing_secondary_pairing_store_denies_instead_of_inheriting_primary(
+    profile_auth_env,
+    monkeypatch,
+):
+    """An unavailable coder store cannot reuse a primary CLI approval."""
+    home, coder_home = profile_auth_env
+    (home / ".env").write_text("", encoding="utf-8")
+    (coder_home / ".env").write_text("", encoding="utf-8")
+    for key in (
+        "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    runner = _make_profile_env_runner()
+    primary_store = MagicMock()
+    primary_store.is_approved.return_value = True
+    runner.pairing_store = primary_store
+    runner.pairing_stores = {"default": primary_store}
+
+    assert runner._is_user_authorized(
+        _telegram_source("coder", "primary-approved-user")
+    ) is False
+    primary_store.is_approved.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transport_profile", "uses_primary_transport"),
+    [("coder", False), ("default", True)],
+)
+async def test_pairing_issuance_uses_runtime_profile_store_only(
+    monkeypatch,
+    transport_profile,
+    uses_primary_transport,
+):
+    """Coder pairing stays scoped when delivered directly or by a shared bot."""
+    from gateway.run import GatewayRunner
+
+    primary_store = MagicMock()
+    coder_store = MagicMock()
+    coder_store._is_rate_limited.return_value = False
+    coder_store.generate_code.return_value = "CODER123"
+    primary_adapter = SimpleNamespace(send=AsyncMock())
+    coder_adapter = SimpleNamespace(send=AsyncMock())
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._primary_profile_name = "default"
+    runner.adapters = {Platform.TELEGRAM: primary_adapter}
+    runner._profile_adapters = {
+        "coder": {Platform.TELEGRAM: coder_adapter},
+    }
+    runner.pairing_store = primary_store
+    runner.pairing_stores = {"coder": coder_store}
+    runner.session_store = MagicMock()
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._update_prompt_pending = {}
+    runner._is_user_authorized = lambda _source: False
+    runner._get_unauthorized_dm_behavior = lambda *_args, **_kwargs: "pair"
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda *_args, **_kwargs: [],
+    )
+    event = MessageEvent(
+        text="hello",
+        message_id="message-1",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="coder-user",
+            chat_id="coder-dm",
+            user_name="Coder",
+            chat_type="dm",
+            profile="coder",
+            transport_profile=transport_profile,
+        ),
+    )
+
+    assert await runner._handle_message(event) is None
+
+    coder_store._is_rate_limited.assert_called_once_with(
+        "telegram",
+        "coder-user",
+    )
+    coder_store.generate_code.assert_called_once_with(
+        "telegram",
+        "coder-user",
+        "Coder",
+    )
+    delivery_adapter = primary_adapter if uses_primary_transport else coder_adapter
+    other_adapter = coder_adapter if uses_primary_transport else primary_adapter
+    delivery_adapter.send.assert_awaited_once()
+    pairing_message = delivery_adapter.send.await_args.args[1]
+    assert "CODER123" in pairing_message
+    assert "`hermes -p coder pairing approve telegram CODER123`" in pairing_message
+    primary_store._is_rate_limited.assert_not_called()
+    primary_store.generate_code.assert_not_called()
+    other_adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_named_primary_default_secondary_pairing_command_is_scoped(monkeypatch):
+    """Multiplex default still needs ``-p default`` when coder is primary."""
+    from gateway.run import GatewayRunner
+
+    coder_store = MagicMock()
+    default_store = MagicMock()
+    default_store._is_rate_limited.return_value = False
+    default_store.generate_code.return_value = "DEFAULT1"
+    coder_adapter = SimpleNamespace(send=AsyncMock())
+    default_adapter = SimpleNamespace(send=AsyncMock())
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._primary_profile_name = "coder"
+    runner.adapters = {Platform.TELEGRAM: coder_adapter}
+    runner._profile_adapters = {
+        "default": {Platform.TELEGRAM: default_adapter},
+    }
+    runner.pairing_store = coder_store
+    runner.pairing_stores = {
+        "coder": coder_store,
+        "default": default_store,
+    }
+    runner.session_store = MagicMock()
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._update_prompt_pending = {}
+    runner._is_user_authorized = lambda _source: False
+    runner._get_unauthorized_dm_behavior = lambda *_args, **_kwargs: "pair"
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda *_args, **_kwargs: [],
+    )
+    event = MessageEvent(
+        text="hello",
+        message_id="message-default",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="default-user",
+            chat_id="default-dm",
+            user_name="Default User",
+            chat_type="dm",
+            profile="default",
+            transport_profile="default",
+        ),
+    )
+
+    assert await runner._handle_message(event) is None
+
+    default_store.generate_code.assert_called_once_with(
+        "telegram",
+        "default-user",
+        "Default User",
+    )
+    default_adapter.send.assert_awaited_once()
+    pairing_message = default_adapter.send.await_args.args[1]
+    assert "`hermes -p default pairing approve telegram DEFAULT1`" in pairing_message
+    coder_store.generate_code.assert_not_called()
+    coder_adapter.send.assert_not_awaited()
 
 
 def test_secondary_open_policy_not_authorized_by_default_allowlist(monkeypatch):

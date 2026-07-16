@@ -65,6 +65,9 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    _cancel_pending_batch_task,
+    _message_events_same_sender,
+    _pending_batch_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -662,7 +665,7 @@ class SimplexAdapter(BasePlatformAdapter):
         # message instead of dropping earlier ones when the user pastes
         # several lines in quick succession.
         if msg_type == MessageType.TEXT and text:
-            self._enqueue_text_event(msg_event)
+            await self._enqueue_text_event(msg_event)
         else:
             await self.handle_message(msg_event)
 
@@ -674,10 +677,23 @@ class SimplexAdapter(BasePlatformAdapter):
         """Session-scoped key for text message batching."""
         return f"{event.source.platform.value}:{event.source.chat_id}"
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    async def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer."""
         key = self._text_batch_key(event)
+        async with _pending_batch_lock(
+            self, key, store_attr="_pending_text_batch_locks",
+        ):
+            await self._enqueue_text_event_for_key(key, event)
+
+    async def _enqueue_text_event_for_key(
+        self, key: str, event: MessageEvent,
+    ) -> None:
         existing = self._pending_text_batches.get(key)
+        if existing is not None:
+            await _cancel_pending_batch_task(self._pending_text_batch_tasks, key)
+            if not _message_events_same_sender(existing, event):
+                await self._flush_text_batch_now(key)
+                existing = None
         if existing is None:
             self._pending_text_batches[key] = event
         else:
@@ -689,9 +705,6 @@ class SimplexAdapter(BasePlatformAdapter):
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
 
-        prior_task = self._pending_text_batch_tasks.get(key)
-        if prior_task and not prior_task.done():
-            prior_task.cancel()
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
@@ -701,18 +714,24 @@ class SimplexAdapter(BasePlatformAdapter):
         current_task = asyncio.current_task()
         try:
             await asyncio.sleep(self._text_batch_delay)
-            event = self._pending_text_batches.pop(key, None)
-            if not event:
+            if self._pending_text_batch_tasks.get(key) is not current_task:
                 return
-            logger.info(
-                "[SimpleX] Flushing text batch %s (%d chars)",
-                key,
-                len(event.text or ""),
-            )
-            await self.handle_message(event)
+            await self._flush_text_batch_now(key)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
+
+    async def _flush_text_batch_now(self, key: str) -> None:
+        """Dispatch the oldest contiguous sender burst immediately."""
+        event = self._pending_text_batches.pop(key, None)
+        if not event:
+            return
+        logger.info(
+            "[SimpleX] Flushing text batch %s (%d chars)",
+            key,
+            len(event.text or ""),
+        )
+        await self.handle_message(event)
 
     # ------------------------------------------------------------------
     # Command interface

@@ -1589,22 +1589,22 @@ Signal is listed as a valid platform key because the setting can be saved per pl
 
 ```yaml
 privacy:
-  redact_pii: false  # Strip PII from LLM context (gateway only)
+  redact_pii: false  # Pseudonymize eligible gateway identity copies
 ```
 
-When `redact_pii` is `true`, the gateway redacts personally identifiable information from the system prompt before sending it to the LLM on supported platforms:
+When `redact_pii` is `true`, the gateway pseudonymizes personally identifiable information in outbound LLM context and in session metadata sent to explicitly opted-in MCP servers on supported platforms:
 
 | Field | Treatment |
 |-------|-----------|
-| Phone numbers (user ID on WhatsApp/Signal) | Hashed to `user_<12-char-sha256>` |
+| Phone numbers and phone-derived user labels | Hashed to `user_<12-char-sha256>` |
 | User IDs | Hashed to `user_<12-char-sha256>` |
-| Chat IDs | Numeric portion hashed, platform prefix preserved (`telegram:<hash>`) |
-| Home channel IDs | Numeric portion hashed |
-| User names / usernames | **Not affected** (user-chosen, publicly visible) |
+| Chat IDs | Identifier portion hashed, platform prefix preserved (`telegram:<hash>`) |
+| Home channel IDs and identifier-derived fallback names | Replaced with the existing deterministic chat hash |
+| Genuine display names / usernames | Preserved; adapter fallbacks derived from phone numbers or routing IDs are pseudonymized |
 
-**Platform support:** Redaction applies to WhatsApp, Signal, and Telegram. Discord and Slack are excluded because their mention systems (`<@user_id>`) require the real ID in the LLM context.
+**Platform support:** Built-in redaction applies to WhatsApp, WhatsApp Cloud, Signal, Telegram, and BlueBubbles. Plugin platforms can opt in with the `pii_safe` capability. Discord and Slack are excluded because their mention systems (`<@user_id>`) require the real ID in the LLM context.
 
-Hashes are deterministic — the same user always maps to the same hash, so the model can still distinguish between users in group chats. Routing and delivery use the original values internally.
+Hashes are deterministic, stable, and linkable — the same user maps to the same pseudonym so the model can distinguish participants in group chats. This is pseudonymization, not anonymity. Only outbound contextual copies change (the LLM prompt and shared-session sender prefix, plus session metadata for explicitly opted-in MCP servers); internal routing and delivery values remain raw.
 
 ## Speech-to-Text (STT)
 

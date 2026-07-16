@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
+import weakref
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
@@ -34,12 +35,81 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+_UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY = (
+    "_hermes_unattributed_session_context"
+)
 
 
 def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
     value = getattr(platform, "value", platform)
     return str(value or "").lower()
+
+
+def _message_event_sender_identity(candidate) -> tuple[str, ...] | None:
+    """Return a canonical, provable event sender identity when available."""
+    metadata = getattr(candidate, "metadata", None) or {}
+    if metadata.get(_UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY):
+        return None
+    source = getattr(candidate, "source", None)
+    if source is None:
+        return None
+    platform = _platform_name(getattr(source, "platform", None))
+    sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
+    if sender:
+        return (platform, "user", str(sender))
+    if (
+        getattr(source, "chat_type", None) in {"dm", "private"}
+        and getattr(source, "chat_id", None)
+    ):
+        return (platform, "dm", str(source.chat_id))
+    return None
+
+
+def _message_events_same_sender(existing, incoming) -> bool:
+    """Return whether two events have the same provable sender identity.
+
+    Shared-session events without a sender must not be merged: doing so can
+    attach one participant's identity to another participant's text or media.
+    Direct-message chat identity is a safe fallback because the chat itself is
+    the single-user boundary.
+    """
+
+    existing_sender = _message_event_sender_identity(existing)
+    incoming_sender = _message_event_sender_identity(incoming)
+    return existing_sender is not None and existing_sender == incoming_sender
+
+
+async def _cancel_pending_batch_task(task_map, key: str) -> None:
+    """Cancel and reap one debounce timer without racing its replacement.
+
+    Adapter-level batching uses one timer per *session*, not per sender.  A
+    sender transition therefore cancels the quiet-period timer and flushes the
+    preceding contiguous burst before accepting the next one.  Awaiting the
+    cancelled task closes the small window where an old timer could pop the
+    newly-installed batch or erase its replacement task handle.
+    """
+    task = task_map.get(key)
+    if task is None or task is asyncio.current_task():
+        return
+    if not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    if task_map.get(key) is task:
+        task_map.pop(key, None)
+
+
+def _pending_batch_lock(owner, key: str, *, store_attr: str):
+    """Return a lazily-created per-session lock for ordered batch mutation."""
+    lock_map = getattr(owner, store_attr, None)
+    if lock_map is None:
+        lock_map = weakref.WeakValueDictionary()
+        setattr(owner, store_attr, lock_map)
+    lock = lock_map.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        lock_map[key] = lock
+    return lock
 
 
 def _float_env(name: str, default: float) -> float:
@@ -2166,6 +2236,32 @@ def merge_pending_message_event(
     pending_messages[session_key] = event
 
 
+def _store_pending_message_event_sender_safe(
+    pending_messages: Dict[str, MessageEvent],
+    session_key: str,
+    event: MessageEvent,
+    *,
+    merge_text: bool = False,
+) -> None:
+    """Use single-slot fallback semantics without cross-sender merging.
+
+    The gateway runner normally owns a full FIFO. This fallback is used only
+    when an adapter's busy callback declines or fails, where the adapter has a
+    single pending slot. Same-sender bursts may still merge; otherwise the new
+    event replaces the slot instead of inheriting the prior event's source.
+    """
+    existing = pending_messages.get(session_key)
+    if existing is not None and not _message_events_same_sender(existing, event):
+        pending_messages[session_key] = event
+        return
+    merge_pending_message_event(
+        pending_messages,
+        session_key,
+        event,
+        merge_text=merge_text,
+    )
+
+
 # Error substrings that indicate a transient *connection* failure worth retrying.
 # "timeout" / "timed out" / "readtimeout" / "writetimeout" are intentionally
 # excluded: a read/write timeout on a non-idempotent call (e.g. send_message)
@@ -2378,6 +2474,14 @@ class BasePlatformAdapter(ABC):
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
+        # Owning multiplex profile for per-credential secondary adapters.
+        # Profile-routed shared adapters normally stamp this in build_source;
+        # the owner fallback covers secondary adapters before Base keying.
+        self._profile_name: Optional[str] = None
+        # Shared primary adapters may apply gateway.profile_routes. Secondary
+        # per-credential adapters set this False: their credential owner is an
+        # authoritative runtime boundary, not a route suggestion.
+        self._profile_routes_enabled: bool = True
         self._message_handler: Optional[MessageHandler] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
@@ -2415,6 +2519,7 @@ class BasePlatformAdapter(ABC):
             "HERMES_GATEWAY_BUSY_TEXT_HARD_CAP_SECONDS", 1.0
         )
         self._text_debounce: dict[str, TextDebounceState] = {}
+        self._text_debounce_overflow: dict[str, list[MessageEvent]] = {}
         # Background message-processing tasks spawned by handle_message().
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
@@ -4262,6 +4367,13 @@ class BasePlatformAdapter(ABC):
             self._text_debounce = store
         return store
 
+    def _text_debounce_overflow_store(self) -> dict[str, list[MessageEvent]]:
+        store = getattr(self, "_text_debounce_overflow", None)
+        if store is None:
+            store = {}
+            self._text_debounce_overflow = store
+        return store
+
     def _is_queue_text_debounce_candidate(self, event: MessageEvent) -> bool:
         """Return True for normal text eligible for queue-mode debounce."""
         result = (
@@ -4282,22 +4394,61 @@ class BasePlatformAdapter(ABC):
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
         """Return True when two text debounce events came from the same sender."""
+        return _message_events_same_sender(existing, event)
 
-        def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
-            source = getattr(candidate, "source", None)
-            if source is None:
-                return None
-            platform = _platform_name(getattr(source, "platform", None))
-            sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
-            if sender:
-                return (platform, str(sender))
-            if getattr(source, "chat_type", None) in {"dm", "private"} and getattr(source, "chat_id", None):
-                return (platform, "dm", str(source.chat_id))
-            return None
+    @staticmethod
+    def _merge_text_debounce_event(existing: MessageEvent, event: MessageEvent) -> None:
+        """Append one adjacent same-sender text chunk without changing provenance."""
+        if event.text:
+            existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+        latest_message_id = getattr(event, "message_id", None)
+        latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
+        if latest_message_id is not None:
+            existing.message_id = str(latest_message_id)
+        if latest_anchor is not None and hasattr(existing, "reply_to_message_id"):
+            existing.reply_to_message_id = str(latest_anchor)
 
-        existing_sender = _identity(existing)
-        incoming_sender = _identity(event)
-        return existing_sender is not None and existing_sender == incoming_sender
+    def _append_text_debounce_overflow(
+        self, session_key: str, event: MessageEvent,
+    ) -> None:
+        """Append a later sender burst behind the active debounce head."""
+        overflow_store = self._text_debounce_overflow_store()
+        overflow = overflow_store.setdefault(session_key, [])
+        if overflow and self._can_merge_text_debounce_events(overflow[-1], event):
+            self._merge_text_debounce_event(overflow[-1], event)
+            return
+        # Match the runner's bounded busy FIFO. This is a defensive fallback
+        # for adapters used without GatewayRunner's busy-session handler.
+        if len(overflow) >= 32:
+            logger.warning(
+                "[%s] Dropping queue-text burst for session %s — debounce "
+                "overflow at cap (32).",
+                self.name,
+                session_key,
+            )
+            return
+        overflow.append(event)
+
+    def _promote_text_debounce_overflow(self, session_key: str) -> None:
+        """Move the next preserved sender burst into the debounce head."""
+        store = self._text_debounce_store()
+        if session_key in store:
+            return
+        overflow_store = self._text_debounce_overflow_store()
+        overflow = overflow_store.get(session_key)
+        if not overflow:
+            overflow_store.pop(session_key, None)
+            return
+        event = overflow.pop(0)
+        if not overflow:
+            overflow_store.pop(session_key, None)
+        now = time.monotonic()
+        store[session_key] = TextDebounceState(
+            event=event,
+            task=None,
+            first_ts=now,
+            last_ts=now,
+        )
 
     def _text_debounce_delay(self, session_key: str) -> float:
         """Return bounded busy-text debounce delay for ``session_key``."""
@@ -4313,22 +4464,24 @@ class BasePlatformAdapter(ABC):
         """Buffer normal queue-mode busy text and schedule a bounded flush."""
         store = self._text_debounce_store()
         state = store.get(session_key)
+        overflow = self._text_debounce_overflow_store().get(session_key)
+
+        if state is not None and overflow:
+            # Once a later sender burst exists, all new arrivals belong at the
+            # FIFO tail. Merging into the head would move them ahead of an
+            # intervening participant.
+            self._append_text_debounce_overflow(session_key, event)
+            return
 
         if state is not None and not self._can_merge_text_debounce_events(state.event, event):
             # Preserve sender attribution in shared sessions. The current
-            # buffer becomes the next pending turn; the new sender starts a
-            # fresh debounce burst when the pending slot allows it.
+            # buffer becomes the next pending turn. If that single slot is
+            # occupied, retain the new sender in a bounded FIFO instead of
+            # dropping it.
             await self._flush_text_debounce_now(session_key)
             state = store.get(session_key)
             if state is not None and not self._can_merge_text_debounce_events(state.event, event):
-                existing_pending = self._pending_messages.get(session_key)
-                if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
-                    merge_pending_message_event(
-                        self._pending_messages,
-                        session_key,
-                        event,
-                        merge_text=True,
-                    )
+                self._append_text_debounce_overflow(session_key, event)
                 return
 
         now = time.monotonic()
@@ -4341,18 +4494,7 @@ class BasePlatformAdapter(ABC):
             )
             store[session_key] = state
         else:
-            if event.text:
-                state.event.text = (
-                    f"{state.event.text}\n{event.text}"
-                    if state.event.text
-                    else event.text
-                )
-            latest_message_id = getattr(event, "message_id", None)
-            latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
-            if latest_message_id is not None:
-                state.event.message_id = str(latest_message_id)
-            if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
-                state.event.reply_to_message_id = str(latest_anchor)
+            self._merge_text_debounce_event(state.event, event)
             state.last_ts = now
 
         if state.task is not None and not state.task.done():
@@ -4402,6 +4544,7 @@ class BasePlatformAdapter(ABC):
             state.event,
             merge_text=True,
         )
+        self._promote_text_debounce_overflow(session_key)
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:
@@ -4409,6 +4552,7 @@ class BasePlatformAdapter(ABC):
         state = self._text_debounce_store().pop(session_key, None)
         if state is not None and state.task is not None and not state.task.done():
             state.task.cancel()
+        self._text_debounce_overflow_store().pop(session_key, None)
 
     # ------------------------------------------------------------------
     # Session task + guard ownership helpers
@@ -4671,6 +4815,16 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        source = getattr(event, "source", None)
+        owning_profile = getattr(self, "_profile_name", None)
+        routes_enabled = bool(getattr(self, "_profile_routes_enabled", True))
+        if source is not None and owning_profile:
+            source.transport_profile = owning_profile
+            if not routes_enabled:
+                # A secondary adapter's own credential/profile wins even when
+                # the event shape also matches a shared-primary profile route.
+                source.profile = owning_profile
+
         coerce_plaintext_gateway_command(event)
 
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
@@ -4679,10 +4833,28 @@ class BasePlatformAdapter(ABC):
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        source = getattr(event, "source", None)
+        if source is not None and routes_enabled and not source.profile:
+            runner = getattr(self, "gateway_runner", None)
+            if runner is not None:
+                try:
+                    source.profile = runner._profile_name_for_source(source)
+                except Exception:
+                    logger.warning(
+                        "[%s] Profile resolution failed for %s/%s",
+                        self.name,
+                        self.platform,
+                        source.chat_id,
+                        exc_info=True,
+                    )
+            if not source.profile:
+                source.profile = owning_profile
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=getattr(event.source, "profile", None),
         )
 
         # On-entry self-heal: if the adapter still has an _active_sessions
@@ -4820,7 +4992,9 @@ class BasePlatformAdapter(ABC):
             # then process them immediately after the current task finishes.
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-                merge_pending_message_event(self._pending_messages, session_key, event)
+                _store_pending_message_event_sender_safe(
+                    self._pending_messages, session_key, event,
+                )
                 return  # Don't interrupt now - will run after current task completes
 
             if self._is_queue_text_debounce_candidate(event):
@@ -4839,7 +5013,7 @@ class BasePlatformAdapter(ABC):
                     self.name,
                     session_key,
                 )
-                merge_pending_message_event(
+                _store_pending_message_event_sender_safe(
                     self._pending_messages,
                     session_key,
                     event,
@@ -5500,6 +5674,7 @@ class BasePlatformAdapter(ABC):
             if state.task is not None and not state.task.done():
                 state.task.cancel()
         self._text_debounce_store().clear()
+        self._text_debounce_overflow_store().clear()
 
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""
@@ -5531,20 +5706,23 @@ class BasePlatformAdapter(ABC):
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform.
 
-        When ``gateway.profile_routes`` is configured, the routing engine
-        resolves the matching profile from guild/chat/thread and stamps it on
-        ``source.profile``. Downstream code (``_resolve_profile_home_for_source``
-        in run.py) reads that field to enter ``_profile_runtime_scope`` for
-        per-profile HERMES_HOME isolation.
+        ``source.profile`` is the runtime target (session/config/secrets), while
+        ``source.transport_profile`` is the credential owner used for replies.
+        They differ when a shared primary bot routes a turn to another profile.
+        Secondary per-credential adapters disable routes and pin both values to
+        their owner.
         """
         # Normalize empty topic to None
         if chat_topic is not None and not chat_topic.strip():
             chat_topic = None
 
-        # Resolve profile from configured routes (None when no match / no routes)
-        profile = None
+        owning_profile = getattr(self, "_profile_name", None)
+        routes_enabled = bool(getattr(self, "_profile_routes_enabled", True))
+        # Resolve runtime profile from configured routes only for the shared
+        # primary adapter. Secondary credential-owned adapters are isolated.
+        profile = owning_profile
         runner = getattr(self, "gateway_runner", None)
-        if runner is not None:
+        if routes_enabled and runner is not None:
             try:
                 profile = runner._profile_name_for_source(
                     SessionSource(
@@ -5562,14 +5740,14 @@ class BasePlatformAdapter(ABC):
                         guild_id=str(guild_id) if guild_id else None,
                         parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
                         message_id=str(message_id) if message_id else None,
+                        transport_profile=owning_profile,
                     )
-                )
+                ) or owning_profile
             except Exception:
                 logger.warning(
                     "Profile resolution failed for %s/%s, defaulting to active profile",
                     self.platform, chat_id, exc_info=True,
                 )
-
         return SessionSource(
             platform=self.platform,
             chat_id=str(chat_id),
@@ -5587,6 +5765,7 @@ class BasePlatformAdapter(ABC):
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
             profile=profile,
+            transport_profile=owning_profile,
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,

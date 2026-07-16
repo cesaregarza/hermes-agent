@@ -1846,6 +1846,8 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    _UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY,
+    _message_events_same_sender,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     merge_pending_message_event,
@@ -2639,7 +2641,7 @@ def _parse_session_key(session_key: str) -> "dict | None":
     """Parse a session key into its component parts.
 
     Session keys follow the format
-    ``agent:main:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
+    ``agent:{profile_namespace}:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
     Returns a dict with ``platform``, ``chat_type``, ``chat_id``, and
     optionally ``thread_id`` keys, or None if the key doesn't match.
 
@@ -2649,12 +2651,22 @@ def _parse_session_key(session_key: str) -> "dict | None":
     thread_id, so we leave ``thread_id`` out to avoid mis-routing.
     """
     parts = session_key.split(":")
-    if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
+    if len(parts) >= 5 and parts[0] == "agent":
+        namespace = parts[1]
+        if namespace != "main":
+            try:
+                from hermes_cli.profiles import validate_profile_name
+
+                validate_profile_name(namespace)
+            except (ImportError, ValueError):
+                return None
         result = {
             "platform": parts[2],
             "chat_type": parts[3],
             "chat_id": parts[4],
         }
+        if namespace != "main":
+            result["profile"] = namespace
         if len(parts) > 5 and parts[3] in {"dm", "thread"}:
             result["thread_id"] = parts[5]
         return result
@@ -2979,6 +2991,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        # Immutable owner of the primary adapter registry. The dynamic active
+        # profile follows the per-turn HERMES_HOME override and can become a
+        # secondary profile while that turn runs; credential routing must not.
+        self._primary_profile_name = self._active_profile_name()
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -3281,6 +3297,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.pairing import PairingStore
         self.pairing_store = PairingStore()
         self.pairing_stores: Dict[str, "PairingStore"] = {}
+        if getattr(self.config, "multiplex_profiles", False):
+            # The primary registry's profile uses the exact same store as the
+            # profile-aware ``hermes pairing`` CLI. This is especially
+            # important when the process starts from a named profile: creating
+            # ``PairingStore(profile=<primary>)`` would resolve a second store
+            # instead of the CLI-visible one.
+            self.pairing_stores[self._primary_profile_name] = self.pairing_store
         
         # Event hook system
         from gateway.hooks import HookRegistry
@@ -4590,8 +4613,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if queued_events is None:
             queued_events = {}
             self._queued_events = queued_events
+        overflow = queued_events.get(session_key)
         if session_key in pending_slot:
             queued_events.setdefault(session_key, []).append(queued_event)
+        elif overflow:
+            # Repair the head/tail invariant before appending. A Base adapter
+            # can transiently pop the slot while older overflow remains; a new
+            # arrival must not occupy the slot and jump that backlog.
+            pending_slot[session_key] = overflow.pop(0)
+            overflow.append(queued_event)
         else:
             pending_slot[session_key] = queued_event
 
@@ -4629,6 +4659,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # No adapter — push back so we don't silently drop the item.
             queued_events.setdefault(session_key, []).insert(0, next_queued)
         return pending_event
+
+    def _requeue_fifo_front(
+        self,
+        session_key: str,
+        event: "MessageEvent",
+        adapter: Any,
+    ) -> None:
+        """Restore a dequeued event to the FIFO head without merging it.
+
+        Recursion-cap handling runs after the next overflow event has already
+        been promoted into the adapter slot. Put the older current event back
+        in front and move that promoted event to the start of overflow so no
+        sender identity, content, or arrival ordering is lost.
+        """
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if pending_slot is None:
+            return
+        displaced = pending_slot.get(session_key)
+        pending_slot[session_key] = event
+        if displaced is None:
+            return
+        queued_events = getattr(self, "_queued_events", None)
+        if queued_events is None:
+            queued_events = {}
+            self._queued_events = queued_events
+        queued_events.setdefault(session_key, []).insert(0, displaced)
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
@@ -5467,7 +5523,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        merge_text: bool = False,
+    ) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return
@@ -5481,18 +5543,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        if existing is not None and (
+        has_mergeable_media = existing is not None and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
             or bool(getattr(event, "media_urls", None))
+        )
+        has_mergeable_text = (
+            existing is not None
+            and merge_text
+            and getattr(existing, "message_type", None) == MessageType.TEXT
+            and event.message_type == MessageType.TEXT
+        )
+        overflow = getattr(self, "_queued_events", {}).get(session_key, [])
+        if (
+            (has_mergeable_media or has_mergeable_text)
+            and _message_events_same_sender(existing, event)
+            and not overflow
         ):
-            # Preserve photo-burst / media-merge semantics for the head slot.
+            # Preserve same-sender album and legacy text-burst semantics.
+            # Different or unattributed senders fall through to FIFO so one
+            # participant's content can never inherit another's identity.
+            # Once an overflow tail exists, appending is also required for
+            # global FIFO order: merging A/C into the head of A/B/C would let
+            # the later C content jump ahead of B.
             merge_pending_message_event(
                 adapter._pending_messages,
                 session_key,
                 event,
-                merge_text=event.message_type == MessageType.TEXT,
+                merge_text=merge_text,
             )
             return
 
@@ -5628,8 +5707,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Normal busy case (agent actively running a task)
         adapter = self._adapter_for_source(event.source)
-        if not adapter:
-            return False  # let default path handle it
 
         # --- Internal synthetic events must never interrupt/steer ---
         # Async-delegation completions (delegate_task(background=true)) and
@@ -5640,10 +5717,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Interrupting current task" ack — exactly the opposite of the design
         # invariant that a completion surfaces as a NEW turn only when idle and
         # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
+        # which historically queued internal events silently. Queue them here
+        # instead so they use the sender-safe FIFO rather than the adapter's
+        # single-slot raw merge path.
         if getattr(event, "internal", False):
+            if adapter is not None:
+                if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+                    logger.warning(
+                        "Dropping internal follow-up for session %s — pending queue at cap (%d).",
+                        session_key,
+                        self._BUSY_QUEUE_MAX_PENDING,
+                    )
+                else:
+                    # Internal completions are independent synthetic turns,
+                    # never an extension of a user's text/media burst—even
+                    # when they carry the same sender for return routing.
+                    self._enqueue_fifo(session_key, event, adapter)
+                return True
+            # Preserve adapter-local fallback semantics for custom/unregistered
+            # transports instead of claiming the event was queued and dropping it.
             return False
+
+        if not adapter:
+            return False  # let default path handle it
 
         running_agent = self._running_agents.get(session_key)
 
@@ -6904,8 +7000,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             event = MessageEvent(
                 text="",
                 message_type=MessageType.TEXT,
-                source=source,
+                source=dataclasses.replace(source, message_id=None),
                 internal=True,
+                metadata={_UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY: True},
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -7310,7 +7407,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             enabled_platform_count += 1
             
-            adapter = self._create_adapter(platform, platform_config)
+            adapter = self._create_primary_adapter(platform, platform_config)
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
                 _pval = platform.value
@@ -7331,7 +7428,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+            adapter.set_authorization_check(
+                self._make_adapter_auth_check(
+                    adapter.platform,
+                    profile_name=getattr(adapter, "_profile_name", None),
+                )
+            )
             adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
@@ -7834,6 +7936,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name="Handoff",
             thread_id=effective_thread_id,
         )
+        if getattr(self.config, "multiplex_profiles", False):
+            dest_source.transport_profile = self._primary_adapter_profile_name()
+            dest_source.profile = (
+                self._profile_name_for_source(dest_source)
+                or self._primary_adapter_profile_name()
+            )
 
         # Compute the gateway's session_key for that destination using the
         # same rules its adapters use, so switch_session targets the right
@@ -7846,6 +7954,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             dest_source,
             group_sessions_per_user=extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+            profile=dest_source.profile,
         )
 
         # Make sure there's an entry in the session_store for this key. If
@@ -8117,6 +8226,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
+    def _create_primary_adapter(
+        self,
+        platform: Platform,
+        platform_config: PlatformConfig,
+    ):
+        """Create an active-profile adapter with its owner stamped up front."""
+        adapter = self._create_adapter(platform, platform_config)
+        if adapter is not None:
+            if getattr(self.config, "multiplex_profiles", False):
+                owner = str(
+                    getattr(self, "_primary_profile_name", "")
+                    or self._active_profile_name()
+                )
+                self._primary_profile_name = owner
+                adapter._profile_name = owner
+                adapter._profile_routes_enabled = True
+            else:
+                adapter._profile_name = None
+                adapter._profile_routes_enabled = False
+        return adapter
+
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in
     # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
@@ -8183,7 +8313,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 adapter = None
                 try:
-                    adapter = self._create_adapter(platform, platform_config)
+                    adapter = self._create_primary_adapter(platform, platform_config)
                     if not adapter:
                         logger.warning(
                             "Reconnect %s: adapter creation returned None, removing from retry queue",
@@ -8197,7 +8327,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-                    adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+                    adapter.set_authorization_check(
+                        self._make_adapter_auth_check(
+                            adapter.platform,
+                            profile_name=getattr(adapter, "_profile_name", None),
+                        )
+                    )
                     adapter._busy_text_mode = self._busy_text_mode
 
                     # Reconnect after an outage: preserve the platform's
@@ -8793,11 +8928,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
 
         try:
-            from hermes_cli.profiles import profiles_to_serve, get_active_profile_name
+            from gateway.pairing import PairingStore
+            from hermes_cli.profiles import get_active_profile_name, profiles_to_serve
         except Exception:
             return 0
 
-        active = get_active_profile_name() or "default"
+        active = str(
+            getattr(self, "_primary_profile_name", "")
+            or get_active_profile_name()
+            or "default"
+        )
+        served_profiles = profiles_to_serve(multiplex=True)
+
+        # Pairing authorization can run as soon as an adapter connects, so
+        # materialize every store before starting any secondary adapter. The
+        # primary profile always aliases the CLI-compatible global store that
+        # was created in ``__init__``. Each secondary gets an explicit
+        # canonical profile store; a construction failure leaves no map entry
+        # and therefore denies instead of inheriting the primary approvals.
+        primary_store = getattr(self, "pairing_store", None)
+        if primary_store is not None:
+            self.pairing_stores[active] = primary_store
+        else:
+            self.pairing_stores.pop(active, None)
+        for profile_name, _profile_home in served_profiles:
+            if profile_name == active or profile_name in self.pairing_stores:
+                continue
+            try:
+                self.pairing_stores[profile_name] = PairingStore(profile=profile_name)
+            except Exception:
+                self.pairing_stores.pop(profile_name, None)
+                logger.error(
+                    "Failed to initialize pairing store for profile '%s'; "
+                    "pairing authorization will fail closed for that profile",
+                    profile_name,
+                    exc_info=True,
+                )
+
         connected = 0
         # (platform, token-fingerprint) -> profile that claimed it. Detects two
         # profiles trying to poll the same bot credential (impossible to do
@@ -8808,7 +8975,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if fp is not None:
                 claimed[(_plat, fp)] = active
 
-        for profile_name, profile_home in profiles_to_serve(multiplex=True):
+        for profile_name, profile_home in served_profiles:
             if profile_name == active:
                 continue  # handled by the primary startup loop
             try:
@@ -8832,15 +8999,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Record served profiles in runtime status for `hermes status`.
         try:
             from gateway.status import write_runtime_status
-            from gateway.pairing import PairingStore
             served = [active] + sorted(self._profile_adapters.keys())
-            # Per-profile PairingStores so authz_mixin can route pairing
-            # checks to the right whitelist. The active profile gets a store
-            # at its HERMES_HOME; additional served profiles get one under
-            # profiles/<name>/pairing/. See gateway.pairing.PairingStore.
-            for name in served:
-                if name and name not in self.pairing_stores:
-                    self.pairing_stores[name] = PairingStore(profile=name)
             write_runtime_status(served_profiles=served)
         except Exception:
             logger.debug("could not record served_profiles", exc_info=True)
@@ -8913,6 +9072,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform.value,
                 )
                 continue
+            # Stamp the owning profile before any adapter-side batching or
+            # BasePlatformAdapter active-session keying. The message-handler
+            # wrapper below remains a final defense at runner dispatch time.
+            adapter._profile_name = profile_name
+            adapter._profile_routes_enabled = False
 
             # Same-token conflict detection — refuse a duplicate poll.
             fp = self._adapter_credential_fingerprint(adapter)
@@ -8960,7 +9124,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return connected
 
     def _make_profile_message_handler(self, profile_name: str):
-        """Return a message handler that stamps source.profile then delegates.
+        """Return a handler that pins a secondary adapter's runtime and owner.
 
         Auth runs inside ``_handle_message`` *before* the agent-turn scope is
         installed. For secondary profiles under multiplex, wrap the whole
@@ -8976,8 +9140,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _handler(event):
             try:
-                if getattr(event, "source", None) is not None and not event.source.profile:
+                if getattr(event, "source", None) is not None:
+                    # A per-credential secondary adapter is authoritative. A
+                    # shared-bot profile route cannot steal its turn or reply
+                    # credential.
                     event.source.profile = profile_name
+                    event.source.transport_profile = profile_name
             except Exception:
                 pass
             if profile_home is not None:
@@ -9185,13 +9353,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ) -> bool:
             if not user_id:
                 return False
+            multiplex = bool(
+                getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            )
+            primary_owner = self._primary_adapter_profile_name()
+            transport_owner = (
+                (profile_name or primary_owner) if multiplex else profile_name
+            )
             source = SessionSource(
                 platform=platform,
                 chat_id=chat_id or "",
                 chat_type=chat_type or "group",
                 user_id=user_id,
-                profile=profile_name,
+                transport_profile=transport_owner,
             )
+            if multiplex:
+                if profile_name and profile_name != primary_owner:
+                    # Secondary per-credential adapters are authoritative and
+                    # are never retargeted by shared-bot profile routes.
+                    source.profile = profile_name
+                else:
+                    source.profile = (
+                        self._profile_name_for_source(source)
+                        or profile_name
+                        or primary_owner
+                    )
+            elif profile_name:
+                source.profile = profile_name
             return self._is_user_authorized(source)
         return check
 
@@ -9361,19 +9549,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and self._get_unauthorized_dm_behavior(
                     source.platform,
                     profile=source.profile,
+                    transport_profile=getattr(source, "transport_profile", None),
                 )
                 == "pair"
             ):
                 platform_name = source.platform.value if source.platform else "unknown"
+                pairing_store = self._pairing_store_for(source)
+                if pairing_store is None:
+                    logger.warning(
+                        "Cannot issue pairing code for profile %r: no pairing store",
+                        source.profile,
+                    )
+                    return None
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
-                if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                if pairing_store._is_rate_limited(platform_name, source.user_id):
                     return None
-                code = self.pairing_store.generate_code(
+                code = pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
+                    runtime_profile = self._runtime_profile_for_source(source)
+                    profile_selector = (
+                        f"-p {shlex.quote(runtime_profile)} "
+                        if getattr(self.config, "multiplex_profiles", False)
+                        else ""
+                    )
+                    approval_command = (
+                        f"hermes {profile_selector}pairing approve "
+                        f"{shlex.quote(platform_name)} {shlex.quote(code)}"
+                    )
                     adapter = self._adapter_for_source(source)
                     if adapter:
                         await adapter.send(
@@ -9381,7 +9587,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"Hi~ I don't recognize you yet!\n\n"
                             f"Here's your pairing code: `{code}`\n\n"
                             f"Ask the bot owner to run:\n"
-                            f"`hermes pairing approve {platform_name} {code}`"
+                            f"`{approval_command}`"
                         )
                 else:
                     adapter = self._adapter_for_source(source)
@@ -9392,7 +9598,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Please try again later!"
                         )
                     # Record rate limit so subsequent messages are silently ignored
-                    self.pairing_store._record_rate_limit(platform_name, source.user_id)
+                    pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
         # Intercept messages that are responses to a pending /update prompt.
@@ -9894,9 +10100,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                self._queue_or_replace_pending_event(_quick_key, event)
                 return None
 
             _telegram_followup_grace = float(
@@ -9920,11 +10124,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if self._busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
-                        merge_pending_message_event(
-                            adapter._pending_messages,
-                            _quick_key,
-                            event,
-                            merge_text=True,
+                        self._queue_or_replace_pending_event(
+                            _quick_key, event, merge_text=True,
                         )
                 return None
 
@@ -9938,14 +10139,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the
                 # agent starts.
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
+                self._queue_or_replace_pending_event(
+                    _quick_key, event, merge_text=True,
+                )
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():
@@ -10010,10 +10206,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
+            # Preserve the complete event before reducing the interrupt signal
+            # to text. The recursive drain needs its sender, triggering message
+            # ID, and routed profile to rebind ContextVars safely.
+            self._queue_or_replace_pending_event(_quick_key, event)
             running_agent.interrupt(event.text)
-            # NOTE: self._pending_messages was write-only (never consumed).
-            # The actual interrupt message is delivered via adapter._pending_messages
-            # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
 
         # Check for commands
@@ -11253,6 +11450,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        _unattributed_context = bool(
+            (getattr(event, "metadata", None) or {}).get(
+                _UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY
+            )
+        )
+        if _unattributed_context:
+            # The original source was retained long enough to resolve the
+            # existing queue/session lane. It is not trusted as this synthetic
+            # turn's sender, so strip per-message attribution before prompts,
+            # hooks, tools, and recursive drains can observe it.
+            self._clear_unattributed_event_attribution(event)
+            source = dataclasses.replace(
+                source,
+                chat_name=None,
+                user_id=None,
+                user_name=None,
+                user_id_alt=None,
+                message_id=None,
+            )
+            event.source = source
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
         ).strip()
@@ -11408,15 +11625,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Resolve privacy inside the routed profile and snapshot its tri-state
         # result with the raw identity so worker threads cannot observe a later
         # turn's configuration. ``None`` makes MCP forwarding fail closed.
-        _session_env_tokens, _redact_pii = self._bind_session_context_for_turn(
-            context
+        (
+            _session_env_tokens,
+            _redact_pii,
+            _prompt_redact_pii,
+        ) = self._bind_session_context_for_event(
+            context,
+            unattributed=_unattributed_context,
         )
 
-        # Prompt construction keeps its historical fail-soft behavior when the
-        # policy is unavailable; only a confirmed True enables pseudonyms.
+        # Prompt redaction is independent of MCP identity attribution. A
+        # source-less synthetic turn still retains chat/thread fields for
+        # routing, so apply the routed profile's policy to its LLM prompt even
+        # while external session metadata remains fail-closed.
         context_prompt = build_session_context_prompt(
             context,
-            redact_pii=_redact_pii is True,
+            redact_pii=_prompt_redact_pii is True,
         )
         
         # If the previous session expired and was auto-reset, prepend a notice
@@ -13584,6 +13808,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_name=str(user_id),
                 chat_type="channel",
             )
+        # Voice packets have no platform text-message trigger; do not inherit
+        # the /voice join command's reply anchor from the stored route source.
+        multiplex_profiles = getattr(
+            getattr(self, "config", None),
+            "multiplex_profiles",
+            False,
+        )
+        source = dataclasses.replace(
+            source,
+            message_id=None,
+            transport_profile=(
+                self._primary_adapter_profile_name()
+                if multiplex_profiles
+                else None
+            ),
+        )
+        if multiplex_profiles and not source.profile:
+            source = dataclasses.replace(
+                source,
+                profile=(
+                    self._profile_name_for_source(source)
+                    or self._primary_adapter_profile_name()
+                ),
+            )
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
@@ -15586,6 +15834,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         tokens = self._set_session_env(context, redact_pii=redact_pii)
         return tokens, redact_pii
 
+    def _bind_session_context_for_event(
+        self,
+        context: SessionContext,
+        *,
+        unattributed: bool,
+    ) -> tuple[list, Optional[bool], Optional[bool]]:
+        """Bind tool metadata and return its independent prompt policy.
+
+        Unattributed synthetic events omit MCP session metadata by binding an
+        unavailable policy, but their raw routing fields still enter the LLM
+        session prompt. Resolve the routed profile policy separately so those
+        fields remain pseudonymized when privacy.redact_pii is enabled.
+        """
+        if unattributed:
+            prompt_redact_pii = self._resolve_redact_pii_policy_for_source(
+                context.source
+            )
+            tokens = self._set_session_env(context, redact_pii=None)
+            return tokens, None, prompt_redact_pii
+        tokens, redact_pii = self._bind_session_context_for_turn(context)
+        return tokens, redact_pii, redact_pii
+
     def _bind_followup_event_context(
         self,
         event: MessageEvent,
@@ -15600,6 +15870,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         privacy snapshot. The outer handler remains responsible for clearing
         the final binding when the entire recursive chain unwinds.
         """
+        if (getattr(event, "metadata", None) or {}).get(
+            _UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY
+        ):
+            self._clear_unattributed_event_attribution(event)
+            source = self._bind_unattributed_followup_context(
+                event.source,
+                session_key=session_key,
+                session_id=session_id,
+            )
+            event.source = source
+            return source, None
+
         source = self._source_with_trigger_message_id(event)
         context = SessionContext(
             source=source,
@@ -15610,6 +15892,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         _tokens, redact_pii = self._bind_session_context_for_turn(context)
         return source, redact_pii
+
+    @staticmethod
+    def _clear_unattributed_event_attribution(event: MessageEvent) -> None:
+        """Remove trigger/reply fields that cannot be tied to a trusted sender."""
+        event.message_id = None
+        event.platform_update_id = None
+        event.reply_to_message_id = None
+        event.reply_to_text = None
+        event.reply_to_author_id = None
+        event.reply_to_author_name = None
+        event.reply_to_is_own_message = False
+
+    def _bind_unattributed_followup_context(
+        self,
+        source: SessionSource,
+        *,
+        session_key: str,
+        session_id: str,
+    ) -> SessionSource:
+        """Fail closed when a follow-up lacks trusted event attribution.
+
+        Legacy interrupt and late-steer fallbacks can retain only text, while
+        old queue producers may emit a MessageEvent without a source. Neither
+        carries the sender, triggering message ID, or routed profile policy
+        needed to attest a fresh external identity. Preserve the known session
+        routing fields, clear per-message attribution, and bind an unavailable
+        privacy policy so opt-in MCP metadata is omitted rather than forwarding
+        the preceding turn's identity.
+        """
+        unattributed_source = dataclasses.replace(
+            source,
+            chat_name=None,
+            user_id=None,
+            user_name=None,
+            user_id_alt=None,
+            message_id=None,
+        )
+        context = SessionContext(
+            source=unattributed_source,
+            connected_platforms=[],
+            home_channels={},
+            session_key=session_key,
+            session_id=session_id,
+        )
+        self._set_session_env(context, redact_pii=None)
+        return unattributed_source
 
     def _set_session_env(
         self,
@@ -15633,8 +15961,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (api_server) declare supports_async_delivery=False. Use getattr so
         # bare runners built via object.__new__ (tests) without self.adapters
         # don't blow up — they simply default to supported.
-        _adapters = getattr(self, "adapters", None) or {}
-        _adapter = _adapters.get(context.source.platform)
+        _adapter = self._adapter_for_source(context.source)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         return set_session_vars(
             platform=context.source.platform.value,
@@ -16002,13 +16329,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
+        derived_profile = ""
 
         if session_key:
             try:
-                self.session_store._ensure_loaded()
-                entry = self.session_store._entries.get(session_key)
-                if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                source = self.session_store.routing_source_snapshot(session_key)
+                if isinstance(source, SessionSource):
+                    event_user_id = str(evt.get("user_id") or "").strip()
+                    return dataclasses.replace(
+                        source,
+                        user_id=event_user_id or source.user_id,
+                        user_name=(
+                            str(evt.get("user_name") or "").strip() or None
+                            if event_user_id
+                            else source.user_name
+                        ),
+                        user_id_alt=(
+                            source.user_id_alt
+                            if event_user_id in {
+                                str(source.user_id or ""),
+                                str(source.user_id_alt or ""),
+                            }
+                            else None
+                        ) if event_user_id else source.user_id_alt,
+                        message_id=None,
+                    )
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -16018,17 +16363,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
-                return cached_source
+                event_user_id = str(evt.get("user_id") or "").strip()
+                return dataclasses.replace(
+                    cached_source,
+                    user_id=event_user_id or cached_source.user_id,
+                    user_name=(
+                        str(evt.get("user_name") or "").strip() or None
+                        if event_user_id
+                        else cached_source.user_name
+                    ),
+                    user_id_alt=(
+                        cached_source.user_id_alt
+                        if event_user_id in {
+                            str(cached_source.user_id or ""),
+                            str(cached_source.user_id_alt or ""),
+                        }
+                        else None
+                    ) if event_user_id else cached_source.user_id_alt,
+                    message_id=None,
+                )
 
             _parsed = _parse_session_key(session_key)
             if _parsed:
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
                 derived_chat_id = _parsed["chat_id"]
+                derived_profile = str(_parsed.get("profile") or "").strip()
 
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
         chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
+        profile_name = str(evt.get("profile") or derived_profile or "").strip()
         if not platform_name or not chat_type or not chat_id:
             logger.warning(
                 "Synthetic event source unresolvable: "
@@ -16058,6 +16423,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
+        if profile_name:
+            try:
+                from hermes_cli.profiles import validate_profile_name
+
+                validate_profile_name(profile_name)
+            except (ImportError, ValueError):
+                logger.warning(
+                    "Synthetic process event has invalid profile metadata: %r",
+                    profile_name,
+                )
+                return None
+
         return SessionSource(
             platform=platform,
             chat_id=chat_id,
@@ -16065,6 +16442,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_id=str(evt.get("thread_id") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
+            profile=profile_name or None,
         )
 
     async def _inject_watch_notification(
@@ -16087,11 +16465,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = None
-        for p, a in self.adapters.items():
-            if p.value == platform_name:
-                adapter = a
-                break
+        adapter = self._adapter_for_source(source)
         if not adapter:
             return None
         try:
@@ -16099,6 +16473,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            if not str(evt.get("user_id") or "").strip():
+                metadata[_UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY] = True
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -16245,6 +16621,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         evt["platform"] = parsed.get("platform", "")
         evt["chat_type"] = parsed.get("chat_type", "")
         evt["chat_id"] = parsed.get("chat_id", "")
+        if parsed.get("profile"):
+            evt["profile"] = parsed["profile"]
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
@@ -17721,7 +18099,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
             )
 
-        profile_home = self._resolve_profile_home_for_source(source)
+        # An explicit/routed unknown profile must never inherit the primary
+        # profile's home and credentials. Fail before constructing the agent or
+        # making any provider call.
+        profile_home = self._resolve_profile_home_for_source(source, strict=True)
         with _profile_runtime_scope(profile_home):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
@@ -17752,6 +18133,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         config = getattr(self, "config", None)
         if not getattr(config, "multiplex_profiles", False):
             return None
+        transport_owner = str(
+            getattr(source, "transport_profile", "") or ""
+        ).strip()
+        if (
+            transport_owner
+            and transport_owner != self._primary_adapter_profile_name()
+        ):
+            # Per-credential secondary adapters own their runtime profile;
+            # profile_routes only partition traffic on the shared primary bot.
+            return transport_owner
         routes = getattr(config, "profile_routes", None)
         if not routes:
             return None
@@ -20216,48 +20607,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             pending_text = None
                             if _peek_event is not None:
                                 pending_text = _peek_event.text or ""
-                                # Transcribe audio media BEFORE signaling the
-                                # agent, so voice messages interrupt with the
-                                # real transcript instead of an empty string
-                                # (or file-path placeholder). Matches the UX
-                                # of fresh voice messages including the
-                                # optional 🎙️ echo back to the user.
-                                _media_urls = getattr(_peek_event, "media_urls", None) or []
-                                _media_types = getattr(_peek_event, "media_types", None) or []
-                                _audio_paths = []
-                                for _i, _path in enumerate(_media_urls):
-                                    _mtype = _media_types[_i] if _i < len(_media_types) else ""
-                                    _is_audio = (
-                                        _mtype.startswith("audio/")
-                                        or getattr(_peek_event, "message_type", None) in (MessageType.VOICE, MessageType.AUDIO)
-                                    )
-                                    if _is_audio:
-                                        _audio_paths.append(_path)
-                                if _audio_paths:
-                                    try:
-                                        _enriched, _transcripts = await self._enrich_message_with_transcription(
-                                            pending_text, _audio_paths,
-                                        )
-                                        pending_text = _enriched
-                                        if _transcripts and self._should_echo_stt_transcripts():
-                                            _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                                            for _tx in _transcripts:
-                                                try:
-                                                    await _adapter.send(
-                                                        source.chat_id,
-                                                        f'🎙️ "{_tx}"',
-                                                        metadata=_echo_meta,
-                                                    )
-                                                except Exception as _echo_exc:
-                                                    logger.debug(
-                                                        "Voice-interrupt echo failed (non-fatal): %s",
-                                                        _echo_exc,
-                                                    )
-                                    except Exception as _trans_exc:
-                                        logger.warning(
-                                            "Voice-interrupt transcription failed: %s", _trans_exc,
-                                        )
-                                elif not pending_text and _media_urls:
+                                # Do not inspect audio while it is still in the
+                                # outer session's queue. The event may belong to
+                                # another user/thread/profile lane; transcription
+                                # and its optional echo must happen only after the
+                                # post-run drain validates that lane and refreshes
+                                # its routing provenance. Normal inbound
+                                # preprocessing performs STT exactly once there.
+                                _media_urls = (
+                                    getattr(_peek_event, "media_urls", None) or []
+                                )
+                                if not pending_text and _media_urls:
                                     pending_text = _build_media_placeholder(_peek_event)
                             logger.debug("Interrupt detected from adapter, signaling agent...")
                             agent.interrupt(pending_text)
@@ -20637,50 +20997,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         pending = interrupt_message
                 elif pending_event:
-                    # Transcribe audio media on the dequeued event BEFORE it is
-                    # handed back as the next user turn, so queued/interrupting
-                    # voice messages drain with the real transcript instead of
-                    # a file-path placeholder. When configured, echo each
-                    # transcript back to the user in the same 🎙️ format as
-                    # fresh voice messages.
                     _pending_text = pending_event.text or ""
                     _media_urls = getattr(pending_event, "media_urls", None) or []
-                    _media_types = getattr(pending_event, "media_types", None) or []
-                    _audio_paths = []
-                    for _i, _path in enumerate(_media_urls):
-                        _mtype = _media_types[_i] if _i < len(_media_types) else ""
-                        _is_audio = (
-                            _mtype.startswith("audio/")
-                            or getattr(pending_event, "message_type", None) in (MessageType.VOICE, MessageType.AUDIO)
-                        )
-                        if _is_audio:
-                            _audio_paths.append(_path)
-                    if _audio_paths:
-                        try:
-                            _enriched, _transcripts = await self._enrich_message_with_transcription(
-                                _pending_text, _audio_paths,
-                            )
-                            pending = _enriched or None
-                            if _transcripts and self._should_echo_stt_transcripts():
-                                _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                                for _tx in _transcripts:
-                                    try:
-                                        await adapter.send(
-                                            source.chat_id,
-                                            f'🎙️ "{_tx}"',
-                                            metadata=_echo_meta,
-                                        )
-                                    except Exception as _echo_exc:
-                                        logger.debug(
-                                            "Voice-drain echo failed (non-fatal): %s", _echo_exc,
-                                        )
-                        except Exception as _trans_exc:
-                            logger.warning(
-                                "Voice-drain transcription failed: %s", _trans_exc,
-                            )
-                            pending = _pending_text or _build_media_placeholder(pending_event)
-                    else:
-                        pending = _pending_text or _build_media_placeholder(pending_event)
+                    # Lane ownership is not known yet. Keep this event opaque
+                    # until the routing check below; normal inbound preparation
+                    # transcribes same-lane voice once, while cross-lane events
+                    # are redispatched untouched to their target adapter.
+                    pending = _pending_text or (
+                        _build_media_placeholder(pending_event)
+                        if _media_urls
+                        else None
+                    )
                     if pending:
                         logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
@@ -20744,7 +21071,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        self._requeue_fifo_front(session_key, pending_event, adapter)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
@@ -20826,34 +21153,158 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_prompt_redact_pii: Optional[bool] = None
                 if pending_event is not None:
-                    if getattr(pending_event, "source", None) is None:
-                        pending_event.source = source
-                    next_source = self._source_with_trigger_message_id(pending_event)
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
                             session_key or "?",
                         )
                         return result
-                    # Resolve the follow-up's session key BEFORE preparing the
-                    # inbound text: _prepare_inbound_message_text buffers native
-                    # image paths under the key it is given, and the recursive
-                    # _run_agent below consumes them under next_session_key.
-                    # The write and consume keys must match or the images drop.
-                    try:
-                        next_session_key = self._session_key_for_source(next_source)
-                    except Exception:
-                        logger.debug(
-                            "Queued follow-up session-key resolution failed; reusing %s",
-                            session_key or "?",
-                            exc_info=True,
+                    pinned_followup_session_id = str(
+                        (getattr(pending_event, "metadata", None) or {}).get(
+                            "gateway_session_id"
                         )
-                    next_source, next_redact_pii = self._bind_followup_event_context(
-                        pending_event,
-                        session_key=next_session_key,
-                        session_id=session_id,
-                    )
+                        or ""
+                    ).strip()
+                    if (
+                        pinned_followup_session_id
+                        and pinned_followup_session_id != session_id
+                    ):
+                        # Pinned async completions need the full handler
+                        # boundary: it verifies that the spawning session is
+                        # still live and switches SessionStore/history safely.
+                        # Recursive execution would inject the completion into
+                        # the currently active session instead.
+                        if adapter is not None:
+                            self._requeue_fifo_front(
+                                session_key, pending_event, adapter
+                            )
+                        logger.info(
+                            "Deferring queued completion pinned to session %s "
+                            "from active session %s to the full ingress path",
+                            pinned_followup_session_id,
+                            session_id,
+                        )
+                        return result
+                    if getattr(pending_event, "source", None) is None:
+                        # Keep the existing queue lane, but never manufacture
+                        # sender/message attribution from the preceding turn.
+                        pending_event.metadata = dict(
+                            getattr(pending_event, "metadata", None) or {}
+                        )
+                        pending_event.metadata[
+                            _UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY
+                        ] = True
+                        self._clear_unattributed_event_attribution(pending_event)
+                        next_source = self._bind_unattributed_followup_context(
+                            source,
+                            session_key=session_key,
+                            session_id=session_id,
+                        )
+                        pending_event.source = next_source
+                        next_redact_pii = None
+                        next_prompt_redact_pii = (
+                            self._resolve_redact_pii_policy_for_source(next_source)
+                        )
+                    else:
+                        pending_event_unattributed = bool(
+                            (getattr(pending_event, "metadata", None) or {}).get(
+                                _UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY
+                            )
+                        )
+                        next_source = self._source_with_trigger_message_id(pending_event)
+                        # Resolve the follow-up's session key BEFORE preparing
+                        # the inbound text: native image paths are buffered and
+                        # consumed under this same key.
+                        try:
+                            next_session_key = self._session_key_for_source(next_source)
+                        except Exception:
+                            logger.debug(
+                                "Queued follow-up session-key resolution failed; reusing %s",
+                                session_key or "?",
+                                exc_info=True,
+                            )
+                        if next_session_key != session_key:
+                            # A queued event from another thread/profile/user
+                            # lane must not recurse with this lane's session ID
+                            # and transcript. Hand the complete event back to
+                            # the target transport so normal ingress resolves
+                            # its own SessionEntry, history, guard, and cache.
+                            target_adapter = self._adapter_for_source(next_source)
+                            if target_adapter is None:
+                                logger.warning(
+                                    "Cannot redispatch cross-lane follow-up %s -> %s; "
+                                    "restoring it to the original FIFO",
+                                    session_key or "?",
+                                    next_session_key or "?",
+                                )
+                                if adapter is not None:
+                                    self._requeue_fifo_front(
+                                        session_key, pending_event, adapter
+                                    )
+                            else:
+                                logger.info(
+                                    "Redispatching queued follow-up across session lanes: "
+                                    "%s -> %s",
+                                    session_key or "?",
+                                    next_session_key or "?",
+                                )
+                                await target_adapter.handle_message(pending_event)
+                            return result
+
+                        # The outer turn may have raced with /new, a session
+                        # switch, or a provenance transition while this event
+                        # waited in the adapter queue. Update the durable
+                        # completion route only when the session ID we are
+                        # about to recurse into is still the key's current
+                        # binding. Source-less/unattributed events deliberately
+                        # cannot replace trusted routing identity.
+                        routing_store = getattr(self, "session_store", None)
+                        if (
+                            routing_store is not None
+                            and not pending_event_unattributed
+                        ):
+                            try:
+                                cached_routing_source = await (
+                                    self.async_session_store
+                                    .refresh_routing_origin_if_current(
+                                        next_session_key, session_id, next_source
+                                    )
+                                )
+                            except Exception:
+                                cached_routing_source = None
+                                logger.warning(
+                                    "Queued follow-up routing refresh failed for %s; "
+                                    "restoring it to the FIFO",
+                                    next_session_key or "?",
+                                    exc_info=True,
+                                )
+                            if cached_routing_source is None:
+                                if adapter is not None:
+                                    self._requeue_fifo_front(
+                                        session_key, pending_event, adapter
+                                    )
+                                logger.info(
+                                    "Deferring queued follow-up because session %s "
+                                    "is no longer current for %s",
+                                    session_id,
+                                    next_session_key or "?",
+                                )
+                                return result
+                            self._cache_session_source(
+                                next_session_key, cached_routing_source
+                            )
+                        next_source, next_redact_pii = self._bind_followup_event_context(
+                            pending_event,
+                            session_key=next_session_key,
+                            session_id=session_id,
+                        )
+                        next_prompt_redact_pii = (
+                            self._resolve_redact_pii_policy_for_source(next_source)
+                            if pending_event_unattributed
+                            else next_redact_pii
+                        )
                     next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
@@ -20865,6 +21316,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                else:
+                    next_source = self._bind_unattributed_followup_context(
+                        source,
+                        session_key=session_key,
+                        session_id=session_id,
+                    )
+                    next_prompt_redact_pii = (
+                        self._resolve_redact_pii_policy_for_source(next_source)
+                    )
+
+                # A queued turn may belong to a different sender, routed
+                # profile, chat/thread label, or privacy policy. Never reuse
+                # the preceding turn's dynamic session prompt: doing so can
+                # expose the first sender's identity to the follow-up model
+                # turn even though ContextVars have already been rebound.
+                next_context = build_session_context(next_source, self.config)
+                next_context.session_key = next_session_key
+                next_context.session_id = session_id
+                next_context_prompt = build_session_context_prompt(
+                    next_context,
+                    redact_pii=next_prompt_redact_pii is True,
+                )
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -20897,7 +21370,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 followup_result = await self._run_agent(
                     message=next_message,
-                    context_prompt=context_prompt,
+                    context_prompt=next_context_prompt,
                     history=updated_history,
                     source=next_source,
                     session_id=session_id,

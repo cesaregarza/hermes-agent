@@ -18,6 +18,8 @@ import time -> no import cycle. The lazy import preserves the exact logger name
 from __future__ import annotations
 
 import os
+import dataclasses
+from collections.abc import Mapping
 from typing import Optional
 
 from gateway.config import Platform
@@ -27,24 +29,80 @@ from gateway.whatsapp_identity import (
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
 )
 
-
-def _auth_env(name: str, default: str = "") -> str:
-    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
-    if not name:
-        return default
-    try:
-        from agent.secret_scope import get_secret
-
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
-    except Exception:
-        pass
-    return (os.getenv(name) or default).strip()
-
-
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
+
+    def _primary_adapter_profile_name(self) -> str:
+        """Return the immutable owner of ``self.adapters``.
+
+        ``get_active_profile_name()`` follows the context-local HERMES_HOME
+        override.  It therefore changes while a secondary profile turn is
+        running and cannot be used to decide which credential registry owns an
+        adapter.  Real runners pin ``_primary_profile_name`` at construction;
+        the dynamic fallback only preserves partial-construction test helpers.
+        """
+        pinned = str(getattr(self, "_primary_profile_name", "") or "").strip()
+        if pinned:
+            return pinned
+        try:
+            return self._active_profile_name()
+        except Exception:
+            return "default"
+
+    def _runtime_profile_for_source(self, source: SessionSource) -> str:
+        """Resolve the profile whose policy and secrets govern ``source``."""
+        profile = str(getattr(source, "profile", "") or "").strip()
+        if profile:
+            return profile
+        try:
+            routed = self._profile_name_for_source(source)
+        except Exception:
+            routed = None
+        return str(routed or self._primary_adapter_profile_name())
+
+    def _transport_profile_for_source(self, source: SessionSource) -> Optional[str]:
+        """Resolve the credential owner used for live adapter selection.
+
+        ``transport_profile`` is intentionally distinct from the runtime
+        ``profile``: a shared primary bot may route a turn to another profile
+        while replies must still leave through that primary bot.  Falling back
+        to ``profile`` keeps legacy/restored sources usable until their trusted
+        transport owner has been restamped.
+        """
+        owner = str(getattr(source, "transport_profile", "") or "").strip()
+        if owner:
+            return owner
+        profile = str(getattr(source, "profile", "") or "").strip()
+        return profile or None
+
+    def _authorization_environment(self, source: SessionSource) -> Mapping[str, str]:
+        """Return the runtime profile's authoritative authorization variables.
+
+        Single-profile gateways retain the historical process environment.
+        Multiplex gateways load only the routed profile's ``.env`` mapping and
+        fail closed for an invalid/missing profile; they must never inherit the
+        primary process environment's allowlists.
+        """
+        multiplex = bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        )
+        if not multiplex:
+            return os.environ
+
+        try:
+            runtime_profile = self._runtime_profile_for_source(source)
+            scoped_source = dataclasses.replace(source, profile=runtime_profile)
+            profile_home = self._resolve_profile_home_for_source(
+                scoped_source,
+                strict=True,
+            )
+            from agent.secret_scope import build_profile_secret_scope
+
+            return build_profile_secret_scope(profile_home)
+        except Exception:
+            # Authorization is a security boundary.  An unreadable or unknown
+            # profile is equivalent to having no allowlists/allow-all grants.
+            return {}
 
     def _authorization_adapter(
         self,
@@ -54,15 +112,24 @@ class GatewayAuthorizationMixin:
         """Resolve the live adapter whose intake policy should gate authorization.
 
         In multiplex mode, secondary-profile adapters live in
-        ``_profile_adapters[profile]`` while the default/active profile uses
-        ``self.adapters``. ``SessionSource.profile`` selects which map to consult.
+        ``_profile_adapters[profile]`` while the active profile (which may be a
+        named profile rather than ``default``) uses ``self.adapters``.
+        ``SessionSource.profile`` selects which map to consult.
         When a stamped profile has its own adapter registry entry, the default
         profile's same-platform adapter must not be consulted as a fallback.
         """
         if not platform:
             return None
         profile_name = (profile or "").strip() or None
-        if profile_name and profile_name != "default":
+        multiplex = bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        )
+        if not multiplex or profile_name is None:
+            adapters = getattr(self, "adapters", None) or {}
+            return adapters.get(platform)
+
+        primary_profile = self._primary_adapter_profile_name()
+        if profile_name != primary_profile:
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
             if profile_name in profile_adapters:
                 return profile_adapters[profile_name].get(platform)
@@ -70,18 +137,24 @@ class GatewayAuthorizationMixin:
             # (e.g. its adapter failed to connect) must NOT fall back to the
             # default profile's adapter — that sends replies out the wrong bot.
             return None
-        adapters = getattr(self, "adapters", None) or {}
-        return adapters.get(platform)
+        return (getattr(self, "adapters", None) or {}).get(platform)
 
     def _adapter_for_source(self, source: Optional[SessionSource]):
         """Resolve the live adapter for an inbound ``SessionSource``."""
         if source is None:
             return None
+        if getattr(source, "delivered_via_upstream_relay", False) is True:
+            # Relay sources retain the underlying platform for session
+            # semantics and egress metadata, but their live transport is the
+            # one process-shared RelayAdapter. Never select a same-platform
+            # direct adapter (or a nonexistent secondary Relay registry) for a
+            # frame that arrived over the authenticated relay connection.
+            return (getattr(self, "adapters", None) or {}).get(Platform.RELAY)
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
             getattr(source, "platform", None),
-            getattr(source, "profile", None),
+            self._transport_profile_for_source(source),
         )
 
     def _adapter_authorization_is_upstream(
@@ -262,19 +335,22 @@ class GatewayAuthorizationMixin:
         return False
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Pick the per-profile PairingStore for a source, falling back to global.
+        """Pick the PairingStore owned by ``source``'s runtime profile.
 
-        In a multiplexing gateway, each profile owns its own pairing whitelist
-        so isolation is preserved. When the source has no profile (single-
-        profile gateway, or a path that hasn't stamped profile yet) or the
-        profile isn't registered, fall back to ``self.pairing_store`` (the
-        global default) so existing behavior is preserved.
+        Single-profile gateways retain the historical process-wide store. In
+        multiplex mode every profile, including the primary one, must have an
+        explicit map entry.  Missing entries fail closed instead of inheriting
+        the primary profile's approvals.
         """
+        multiplex = bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        )
+        if not multiplex:
+            return getattr(self, "pairing_store", None)
+
         per_profile = getattr(self, "pairing_stores", None) or {}
-        profile = getattr(source, "profile", None)
-        if profile and profile in per_profile:
-            return per_profile[profile]
-        return getattr(self, "pairing_store", None)
+        profile = self._runtime_profile_for_source(source)
+        return per_profile.get(profile)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -288,6 +364,15 @@ class GatewayAuthorizationMixin:
         5. Default: deny
         """
         from gateway.run import logger
+        authorization_env = self._authorization_environment(source)
+
+        def _getenv(name: str, default: str = "") -> str:
+            if not name:
+                return default
+            value = authorization_env.get(name)
+            return str(value) if value is not None else default
+
+        transport_profile = self._transport_profile_for_source(source)
         # Home Assistant events are system-generated (state changes), not
         # user-initiated messages.  The HASS_TOKEN already authenticates the
         # connection, so HA events are always authorized.
@@ -325,7 +410,7 @@ class GatewayAuthorizationMixin:
         # tests) — defensive against accidental fail-open.
         if source.delivered_via_upstream_relay is True or self._adapter_authorization_is_upstream(
             source.platform,
-            profile=source.profile,
+            profile=transport_profile,
         ):
             return True
 
@@ -347,7 +432,7 @@ class GatewayAuthorizationMixin:
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
             if chat_allowlist_env:
-                raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
+                raw_chat_allowlist = _getenv(chat_allowlist_env).strip()
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -371,7 +456,7 @@ class GatewayAuthorizationMixin:
         }
         if getattr(source, "is_bot", False):
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            if allow_bots_var and _getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True
 
         if not user_id:
@@ -440,7 +525,7 @@ class GatewayAuthorizationMixin:
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
-        if platform_allow_all_var and _auth_env(platform_allow_all_var).lower() in {"true", "1", "yes"}:
+        if platform_allow_all_var and _getenv(platform_allow_all_var).lower() in {"true", "1", "yes"}:
             return True
 
         # Adapter-verified role auth: the Discord adapter already confirmed the
@@ -462,22 +547,22 @@ class GatewayAuthorizationMixin:
         # operator-visible source of truth. (#23778: the original bypass was the
         # inbound message/approval-button gate, not this gate; that gate is
         # fixed separately.)
-        # In multiplex gateways, route to the per-profile PairingStore so each
-        # profile's whitelist is isolated; falls back to the global store when
-        # the source has no profile or the profile isn't registered.
+        # In multiplex gateways, route to the runtime profile's PairingStore so
+        # each profile's whitelist is isolated. A missing store denies rather
+        # than inheriting the primary profile's approvals.
         platform_name = source.platform.value if source.platform else ""
         pairing_store = self._pairing_store_for(source)
         if pairing_store is not None and pairing_store.is_approved(platform_name, user_id):
             return True
 
         # Check platform-specific and global allowlists
-        platform_allowlist = _auth_env(platform_env_map.get(source.platform, ""))
+        platform_allowlist = _getenv(platform_env_map.get(source.platform, "")).strip()
         group_user_allowlist = ""
         group_chat_allowlist = ""
         if source.chat_type in {"group", "forum"}:
-            group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
-            group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
-        global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
+            group_user_allowlist = _getenv(platform_group_user_env_map.get(source.platform, "")).strip()
+            group_chat_allowlist = _getenv(platform_group_chat_env_map.get(source.platform, "")).strip()
+        global_allowlist = _getenv("GATEWAY_ALLOWED_USERS").strip()
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
             # No env allowlist configured. Adapters that own their own
@@ -505,28 +590,28 @@ class GatewayAuthorizationMixin:
             # fail-open.)
             if self._adapter_enforces_own_access_policy(
                 source.platform,
-                profile=source.profile,
+                profile=transport_profile,
             ):
                 if source.chat_type in {"group", "forum", "channel"}:
                     effective_policy = self._adapter_group_policy(
                         source.platform,
-                        profile=source.profile,
+                        profile=transport_profile,
                     )
                     if self._adapter_group_has_sender_allowlist(
                         source.platform,
                         source.chat_id,
-                        profile=source.profile,
+                        profile=transport_profile,
                     ):
                         return True
                 else:
                     effective_policy = self._adapter_dm_policy(
                         source.platform,
-                        profile=source.profile,
+                        profile=transport_profile,
                     )
                 if effective_policy == "allowlist":
                     return True
             # No allowlists configured -- check global allow-all flag
-            return _auth_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
+            return _getenv("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
 
         # Telegram can optionally authorize group traffic by chat ID.
         # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates
@@ -624,6 +709,7 @@ class GatewayAuthorizationMixin:
         platform: Optional[Platform],
         *,
         profile: Optional[str] = None,
+        transport_profile: Optional[str] = None,
     ) -> str:
         """Return how unauthorized DMs should be handled for a platform.
 
@@ -644,6 +730,18 @@ class GatewayAuthorizationMixin:
         6. No allowlist and no explicit config → ``"pair"`` (open-gateway default).
         """
         config = getattr(self, "config", None)
+        env_source = SessionSource(
+            platform=platform or Platform.LOCAL,
+            chat_id="",
+            profile=profile,
+        )
+        authorization_env = self._authorization_environment(env_source)
+
+        def _getenv(name: str, default: str = "") -> str:
+            if not name:
+                return default
+            value = authorization_env.get(name)
+            return str(value) if value is not None else default
 
         # Check for an explicit per-platform override first.
         if config and hasattr(config, "get_unauthorized_dm_behavior") and platform:
@@ -672,7 +770,10 @@ class GatewayAuthorizationMixin:
         # Prefer the profile-scoped live adapter's resolved policy in multiplex
         # mode; fall back to the default profile's config.extra.
         if platform:
-            dm_policy = self._adapter_dm_policy(platform, profile=profile)
+            dm_policy = self._adapter_dm_policy(
+                platform,
+                profile=transport_profile if transport_profile is not None else profile,
+            )
             if not dm_policy and config and hasattr(config, "platforms"):
                 platform_cfg = config.platforms.get(platform)
                 extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
@@ -713,13 +814,13 @@ class GatewayAuthorizationMixin:
                 ),
                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
             }
-            if os.getenv(platform_env_map.get(platform, ""), "").strip():
+            if _getenv(platform_env_map.get(platform, "")).strip():
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
-                if os.getenv(env_key, "").strip():
+                if _getenv(env_key).strip():
                     return "ignore"
 
-        if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
+        if _getenv("GATEWAY_ALLOWED_USERS").strip():
             return "ignore"
 
         return "pair"

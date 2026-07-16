@@ -1,14 +1,25 @@
 import asyncio
 import os
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import (
+    MessageEvent,
+    _UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY,
+)
 from gateway.run import GatewayRunner
-from gateway.session import SessionContext, SessionSource
+from gateway.session import (
+    HomeChannel,
+    SessionContext,
+    SessionSource,
+    _hash_chat_id,
+    build_session_context_prompt,
+)
 from gateway.session_context import (
+    async_delivery_supported,
     get_session_env,
     set_session_vars,
     clear_session_vars,
@@ -81,6 +92,76 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     # Clean up
     runner._clear_session_env(tokens)
     assert session_redact_pii_enabled() is False
+
+
+def test_session_async_delivery_uses_relay_transport_capability():
+    """Relay provenance outranks the underlying platform adapter."""
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._primary_profile_name = "default"
+    direct = SimpleNamespace(supports_async_delivery=False)
+    relay = SimpleNamespace(supports_async_delivery=True)
+    runner.adapters = {
+        Platform.TELEGRAM: direct,
+        Platform.RELAY: relay,
+    }
+    runner._profile_adapters = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="relay-chat",
+        profile="coder",
+        transport_profile="coder",
+        delivered_via_upstream_relay=True,
+    )
+    context = SessionContext(
+        source=source,
+        connected_platforms=[Platform.RELAY],
+        home_channels={},
+        session_key="agent:coder:telegram:dm:relay-chat",
+        session_id="session-relay",
+    )
+
+    tokens = runner._set_session_env(context)
+    try:
+        assert async_delivery_supported() is True
+        assert runner._adapter_for_source(source) is relay
+    finally:
+        runner._clear_session_env(tokens)
+
+
+def test_session_async_delivery_uses_secondary_transport_not_runtime_profile():
+    """Capability follows the credential owner, not the routed agent profile."""
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._primary_profile_name = "default"
+    primary = SimpleNamespace(supports_async_delivery=True)
+    runtime_profile_adapter = SimpleNamespace(supports_async_delivery=True)
+    secondary_transport = SimpleNamespace(supports_async_delivery=False)
+    runner.adapters = {Platform.TELEGRAM: primary}
+    runner._profile_adapters = {
+        "ops": {Platform.TELEGRAM: runtime_profile_adapter},
+        "coder": {Platform.TELEGRAM: secondary_transport},
+    }
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="secondary-chat",
+        profile="ops",
+        transport_profile="coder",
+    )
+    context = SessionContext(
+        source=source,
+        connected_platforms=[Platform.TELEGRAM],
+        home_channels={},
+        session_key="agent:ops:telegram:dm:secondary-chat",
+        session_id="session-secondary",
+    )
+
+    tokens = runner._set_session_env(context)
+    try:
+        assert async_delivery_supported() is False
+        assert runner._adapter_for_source(source) is secondary_transport
+    finally:
+        runner._clear_session_env(tokens)
 
 
 def test_redact_pii_policy_lifecycle_keeps_raw_identity_unmapped():
@@ -171,6 +252,68 @@ def test_gateway_binding_uses_routed_profile_privacy_policy(tmp_path, monkeypatc
         assert secondary_meta["com.nousresearch.hermes/message_id"] == _hash_message_id(
             secondary_context.source.message_id
         )
+    finally:
+        runner._clear_session_env(tokens)
+
+
+def test_unattributed_event_omits_mcp_identity_but_redacts_prompt(
+    tmp_path, monkeypatch,
+):
+    """Routing IDs stay pseudonymized even when sender attribution is absent."""
+    from tools.mcp_tool import _build_session_context_meta
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "privacy:\n  redact_pii: true\n",
+        encoding="utf-8",
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner.adapters = {}
+    chat_id = "+15551234567"
+    home_id = "+15557654321"
+    event = MessageEvent(
+        text="[background process completed]",
+        source=SessionSource(
+            platform=Platform.WHATSAPP_CLOUD,
+            chat_id=chat_id,
+            chat_type="dm",
+        ),
+        metadata={_UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY: True},
+    )
+    context = SessionContext(
+        source=event.source,
+        connected_platforms=[Platform.WHATSAPP_CLOUD],
+        home_channels={
+            Platform.WHATSAPP_CLOUD: HomeChannel(
+                platform=Platform.WHATSAPP_CLOUD,
+                chat_id=home_id,
+                name=home_id,
+            )
+        },
+        session_key=f"agent:main:whatsapp_cloud:dm:{chat_id}",
+        session_id="session-unattributed",
+    )
+
+    tokens, mcp_policy, prompt_policy = runner._bind_session_context_for_event(
+        context,
+        unattributed=bool(
+            event.metadata[_UNATTRIBUTED_SESSION_CONTEXT_METADATA_KEY]
+        ),
+    )
+    try:
+        assert mcp_policy is None
+        assert prompt_policy is True
+        assert session_redact_pii_enabled() is None
+        assert _build_session_context_meta() is None
+        prompt = build_session_context_prompt(
+            context,
+            redact_pii=prompt_policy is True,
+        )
+        assert chat_id not in prompt
+        assert home_id not in prompt
+        assert _hash_chat_id(chat_id) in prompt
+        assert _hash_chat_id(home_id) in prompt
     finally:
         runner._clear_session_env(tokens)
 

@@ -109,9 +109,14 @@ values remain raw. User, thread, message, and session pseudonyms use
 The hashes are deterministic, stable, and linkable: they are pseudonyms, not
 anonymity. Non-empty event-level triggering message IDs take precedence at
 message ingress, while adapters that supply only a source-level message ID
-remain supported. Synthetic goal continuations clear the prior triggering ID
-instead of reusing it. Queued follow-ups rebind the sender, triggering message
-ID, and routed profile privacy policy before the next tool call.
+remain supported. Synthetic turns without a platform message trigger clear any
+prior triggering ID instead of reusing it. Queued follow-ups rebind the sender,
+triggering message ID, and routed profile privacy policy before the next tool
+call. If a legacy interrupt or late-steer fallback retains only text, or a
+queued event lacks a trusted source, Hermes marks that follow-up unattributed
+and omits MCP session metadata. Synthetic background completions likewise use
+their event-carried sender rather than the session creator; without a trusted
+event sender they are unattributed and their MCP session metadata is omitted.
 
 `HERMES_UI_SESSION_ID` is intentionally excluded. It identifies an in-process
 frontend return path, not the durable gateway invocation identity attested to

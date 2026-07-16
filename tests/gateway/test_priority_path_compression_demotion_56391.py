@@ -150,9 +150,15 @@ async def test_priority_path_does_not_interrupt_when_compression_in_flight():
 @pytest.mark.asyncio
 async def test_priority_path_still_interrupts_without_compression_lock():
     """Sanity control: without a compression lock, the PRIORITY path's
-    default interrupt behavior is unchanged."""
+    default interrupt behavior is unchanged, while the complete event is
+    retained for identity-safe recursive draining."""
     runner, agent_mock, sk = _make_runner(compression_in_flight=False)
 
     await runner._handle_message(_make_event("still there?"))
 
     agent_mock.interrupt.assert_called_once_with("still there?")
+    queued = runner.adapters[Platform.TELEGRAM]._pending_messages.get(sk)
+    assert queued is not None
+    assert queued.text == "still there?"
+    assert queued.message_id == "m1"
+    assert queued.source.user_id == "u1"

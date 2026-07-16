@@ -543,7 +543,7 @@ hermes config set security.redact_secrets false
 
 ### PII redaction in gateway messages
 
-Separate from secret redaction. When enabled, the gateway hashes user IDs and strips phone numbers from the session context before it reaches the model:
+Separate from secret redaction. On eligible platforms, this pseudonymizes user/chat identity fields and phone- or routing-ID-derived labels in outbound model context and opted-in MCP metadata. It does not scan arbitrary message content for phone numbers:
 
 ```bash
 hermes config set privacy.redact_pii true    # enable

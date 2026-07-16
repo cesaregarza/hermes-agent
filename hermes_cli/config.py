@@ -2108,7 +2108,7 @@ DEFAULT_CONFIG = {
 
     # Privacy settings
     "privacy": {
-        "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
+        "redact_pii": False,  # Pseudonymize eligible identity fields in outbound context
     },
     
     # Text-to-speech configuration

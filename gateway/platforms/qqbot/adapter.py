@@ -1074,15 +1074,25 @@ class QQAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _parse_gateway_session_key(session_key: str) -> Optional[Dict[str, str]]:
-        """Parse ``agent:main:<platform>:<chat_type>:<chat_id>[:<user_id>]``."""
+        """Parse ``agent:<profile>:<platform>:<chat_type>:<chat_id>...``."""
         parts = str(session_key or "").split(":")
-        if len(parts) < 5 or parts[0] != "agent" or parts[1] != "main":
+        if len(parts) < 5 or parts[0] != "agent":
             return None
+        namespace = parts[1]
+        if namespace != "main":
+            try:
+                from hermes_cli.profiles import validate_profile_name
+
+                validate_profile_name(namespace)
+            except (ImportError, ValueError):
+                return None
         parsed = {
             "platform": parts[2],
             "chat_type": parts[3],
             "chat_id": parts[4],
         }
+        if namespace != "main":
+            parsed["profile"] = namespace
         if len(parts) > 5:
             parsed["user_id"] = parts[5]
         return parsed

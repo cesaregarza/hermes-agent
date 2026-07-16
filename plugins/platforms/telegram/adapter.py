@@ -266,6 +266,9 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_IMAGE_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
+    _cancel_pending_batch_task,
+    _message_event_sender_identity,
+    _pending_batch_lock,
     utf16_len,
 )
 from plugins.platforms.telegram.telegram_ids import (
@@ -685,8 +688,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._media_batch_delay_seconds = env_float("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", 0.8)
         self._pending_photo_batches: Dict[str, MessageEvent] = {}
         self._pending_photo_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_photo_batch_senders: Dict[str, tuple[str, ...] | None] = {}
         self._media_group_events: Dict[str, MessageEvent] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
+        self._media_group_senders: Dict[str, tuple[str, ...] | None] = {}
+        self._media_group_ids: Dict[str, str] = {}
         # Buffer rapid text messages so Telegram client-side splits of long
         # messages are aggregated into a single MessageEvent.  Lower defaults
         # (0.3s / 1.0s instead of 0.6s / 2.0s) let short replies stream
@@ -708,6 +714,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_text_batch_senders: Dict[str, tuple[str, ...] | None] = {}
         self._drop_delayed_deliveries = False
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
@@ -864,21 +871,22 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+        if normalized_chat_type == "private":
+            normalized_chat_type = "dm"
+        elif normalized_chat_type == "supergroup":
+            normalized_chat_type = "forum" if thread_id is not None else "group"
+        normalized_chat_id = str(chat_id or normalized_user_id)
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
                 from gateway.session import SessionSource
 
-                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
-                if normalized_chat_type == "private":
-                    normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
-
                 source = SessionSource(
                     platform=Platform.TELEGRAM,
-                    chat_id=str(chat_id or normalized_user_id),
+                    chat_id=normalized_chat_id,
                     chat_type=normalized_chat_type,
                     user_id=normalized_user_id,
                     user_name=str(user_name).strip() if user_name else None,
@@ -887,10 +895,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 return bool(auth_fn(source))
             except Exception:
                 logger.debug(
-                    "[Telegram] Falling back to env-only callback auth for user %s",
+                    "[Telegram] Gateway callback auth failed for user %s; denying",
                     normalized_user_id,
                     exc_info=True,
                 )
+                return False
+
+        # Secondary handlers are closures (not bound GatewayRunner methods),
+        # so ``handler.__self__`` cannot recover their profile. Normal startup
+        # installs a profile-bound callback on every adapter; use it when there
+        # is no bound primary runner. A callback exception/unknown is a hard
+        # deny instead of a fallthrough to the primary process environment.
+        if getattr(self, "_authorization_check", None) is not None:
+            return (
+                self._is_sender_authorized(
+                    normalized_user_id,
+                    normalized_chat_type,
+                    normalized_chat_id,
+                )
+                is True
+            )
+
+        if getattr(self, "_profile_routes_enabled", True) is False:
+            # A secondary adapter without its startup-installed profile callback
+            # has no safe authorization source. Never inherit primary env vars.
+            return False
 
         allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
         if not allowed_csv:
@@ -3797,10 +3826,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._media_group_tasks.clear()
         self._media_group_events.clear()
+        getattr(self, "_media_group_senders", {}).clear()
+        getattr(self, "_media_group_ids", {}).clear()
         self._pending_photo_batch_tasks.clear()
         self._pending_photo_batches.clear()
+        getattr(self, "_pending_photo_batch_senders", {}).clear()
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
+        getattr(self, "_pending_text_batch_senders", {}).clear()
         if getattr(self, "_polling_error_task", None) is not current_task:
             self._polling_error_task = None
         if getattr(self, "_polling_progress_verifier_task", None) is not current_task:
@@ -8070,10 +8103,17 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        # Capture identity before observe-mode replaces the public source with
+        # a deliberately unattributed chat/topic source.  This tuple remains
+        # private batch state and is never attached to the dispatched event.
+        batch_sender_identity = _message_event_sender_identity(event)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
-        self._enqueue_text_event(event)
+        await self._enqueue_text_event(
+            event,
+            batch_sender_identity=batch_sender_identity,
+        )
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -8155,7 +8195,12 @@ class TelegramAdapter(BasePlatformAdapter):
         coalesce on (and dispatch to) the recovered lane rather than the
         raw inbound ``message_thread_id`` Telegram may have attached.
         """
+        return self._session_batch_key(event)
+
+    def _session_batch_key(self, event: MessageEvent) -> str:
+        """Return the recovered runtime session lane without sender sharding."""
         from gateway.session import build_session_key
+
         self._apply_topic_recovery(event)
         return build_session_key(
             event.source,
@@ -8164,7 +8209,18 @@ class TelegramAdapter(BasePlatformAdapter):
             profile=event.source.profile,
         )
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    def _media_group_batch_key(
+        self, event: MessageEvent, media_group_id: str,
+    ) -> str:
+        """Return one ordered media-group lane for the runtime session."""
+        return f"{self._session_batch_key(event)}:media-group"
+
+    async def _enqueue_text_event(
+        self,
+        event: MessageEvent,
+        *,
+        batch_sender_identity: tuple[str, ...] | None = None,
+    ) -> None:
         """Buffer a text event and reset the flush timer.
 
         When Telegram splits a long user message into multiple updates,
@@ -8177,11 +8233,43 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         key = self._text_batch_key(event)
+        async with _pending_batch_lock(
+            self, key, store_attr="_pending_text_batch_locks",
+        ):
+            await self._enqueue_text_event_for_key(
+                key,
+                event,
+                batch_sender_identity=batch_sender_identity,
+            )
+
+    async def _enqueue_text_event_for_key(
+        self,
+        key: str,
+        event: MessageEvent,
+        *,
+        batch_sender_identity: tuple[str, ...] | None,
+    ) -> None:
+        if batch_sender_identity is None:
+            batch_sender_identity = _message_event_sender_identity(event)
+        sender_map = getattr(self, "_pending_text_batch_senders", None)
+        if sender_map is None:
+            sender_map = {}
+            self._pending_text_batch_senders = sender_map
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
+        if existing is not None:
+            await _cancel_pending_batch_task(self._pending_text_batch_tasks, key)
+            existing_sender = sender_map.get(key)
+            if (
+                batch_sender_identity is None
+                or existing_sender != batch_sender_identity
+            ):
+                await self._flush_text_batch_now(key)
+                existing = None
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
+            sender_map[key] = batch_sender_identity
         else:
             # Append text from the follow-up chunk
             if event.text:
@@ -8192,10 +8280,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
 
-        # Cancel any pending flush and restart the timer
-        prior_task = self._pending_text_batch_tasks.get(key)
-        if prior_task and not prior_task.done():
-            prior_task.cancel()
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
@@ -8232,20 +8316,27 @@ class TelegramAdapter(BasePlatformAdapter):
             else:
                 delay = self._text_batch_delay_seconds
             await asyncio.sleep(delay)
-            event = self._pending_text_batches.pop(key, None)
-            if not event:
+            if self._pending_text_batch_tasks.get(key) is not current_task:
                 return
-            if self._should_drop_delayed_delivery():
-                logger.debug("[Telegram] Dropping text batch flush after disconnect started")
-                return
-            logger.info(
-                "[Telegram] Flushing text batch %s (%d chars)",
-                key, len(event.text or ""),
-            )
-            await self.handle_message(event)
+            await self._flush_text_batch_now(key)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
+
+    async def _flush_text_batch_now(self, key: str) -> None:
+        """Dispatch the oldest contiguous sender burst immediately."""
+        event = self._pending_text_batches.pop(key, None)
+        getattr(self, "_pending_text_batch_senders", {}).pop(key, None)
+        if not event:
+            return
+        if self._should_drop_delayed_delivery():
+            logger.debug("[Telegram] Dropping text batch flush after disconnect started")
+            return
+        logger.info(
+            "[Telegram] Flushing text batch %s (%d chars)",
+            key, len(event.text or ""),
+        )
+        await self.handle_message(event)
 
     # ------------------------------------------------------------------
     # Photo batching
@@ -8253,15 +8344,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
         """Return a batching key for Telegram photos/albums."""
-        from gateway.session import build_session_key
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
-            return f"{session_key}:album:{media_group_id}"
+            return self._media_group_batch_key(event, str(media_group_id))
+        session_key = self._session_batch_key(event)
         return f"{session_key}:photo-burst"
 
     async def _flush_photo_batch(self, batch_key: str) -> None:
@@ -8269,38 +8355,84 @@ class TelegramAdapter(BasePlatformAdapter):
         current_task = asyncio.current_task()
         try:
             await asyncio.sleep(self._media_batch_delay_seconds)
-            event = self._pending_photo_batches.pop(batch_key, None)
-            if not event:
+            if self._pending_photo_batch_tasks.get(batch_key) is not current_task:
                 return
-            if self._should_drop_delayed_delivery():
-                logger.debug("[Telegram] Dropping photo batch flush after disconnect started")
-                return
-            logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
-            await self.handle_message(event)
+            await self._flush_photo_batch_now(batch_key)
         finally:
             if self._pending_photo_batch_tasks.get(batch_key) is current_task:
                 self._pending_photo_batch_tasks.pop(batch_key, None)
 
-    def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
+    async def _enqueue_photo_event(
+        self,
+        batch_key: str,
+        event: MessageEvent,
+        *,
+        batch_sender_identity: tuple[str, ...] | None = None,
+    ) -> None:
         """Merge photo events into a pending batch and schedule flush."""
         if self._should_drop_delayed_delivery():
             logger.debug("[Telegram] Dropping photo batch enqueue after disconnect started")
             return
 
+        async with _pending_batch_lock(
+            self, batch_key, store_attr="_pending_photo_batch_locks",
+        ):
+            await self._enqueue_photo_event_for_key(
+                batch_key,
+                event,
+                batch_sender_identity=batch_sender_identity,
+            )
+
+    async def _enqueue_photo_event_for_key(
+        self,
+        batch_key: str,
+        event: MessageEvent,
+        *,
+        batch_sender_identity: tuple[str, ...] | None,
+    ) -> None:
+        if batch_sender_identity is None:
+            batch_sender_identity = _message_event_sender_identity(event)
+        sender_map = getattr(self, "_pending_photo_batch_senders", None)
+        if sender_map is None:
+            sender_map = {}
+            self._pending_photo_batch_senders = sender_map
+
         existing = self._pending_photo_batches.get(batch_key)
+        if existing is not None:
+            await _cancel_pending_batch_task(
+                self._pending_photo_batch_tasks, batch_key,
+            )
+            if (
+                batch_sender_identity is None
+                or sender_map.get(batch_key) != batch_sender_identity
+            ):
+                await self._flush_photo_batch_now(batch_key)
+                existing = None
         if existing is None:
             self._pending_photo_batches[batch_key] = event
+            sender_map[batch_key] = batch_sender_identity
         else:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
 
-        prior_task = self._pending_photo_batch_tasks.get(batch_key)
-        if prior_task and not prior_task.done():
-            prior_task.cancel()
-
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
+
+    async def _flush_photo_batch_now(self, batch_key: str) -> None:
+        event = self._pending_photo_batches.pop(batch_key, None)
+        getattr(self, "_pending_photo_batch_senders", {}).pop(batch_key, None)
+        if not event:
+            return
+        if self._should_drop_delayed_delivery():
+            logger.debug("[Telegram] Dropping photo batch flush after disconnect started")
+            return
+        logger.info(
+            "[Telegram] Flushing photo batch %s with %d image(s)",
+            batch_key,
+            len(event.media_urls),
+        )
+        await self.handle_message(event)
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
@@ -8331,6 +8463,10 @@ class TelegramAdapter(BasePlatformAdapter):
         msg_type = self._media_message_type(msg)
 
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        # Observe-mode strips public sender fields before delayed delivery.
+        # Keep the proven identity only in private batch state so adjacent
+        # chunks coalesce without leaking attribution downstream.
+        batch_sender_identity = _message_event_sender_identity(event)
         
         # Add caption as text
         if msg.caption:
@@ -8370,10 +8506,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
                 media_group_id = getattr(msg, "media_group_id", None)
                 if media_group_id:
-                    await self._queue_media_group_event(str(media_group_id), event)
+                    await self._queue_media_group_event(
+                        str(media_group_id),
+                        event,
+                        batch_sender_identity=batch_sender_identity,
+                    )
                 else:
                     batch_key = self._photo_batch_key(event, msg)
-                    self._enqueue_photo_event(batch_key, event)
+                    await self._enqueue_photo_event(
+                        batch_key,
+                        event,
+                        batch_sender_identity=batch_sender_identity,
+                    )
                 return
 
             except Exception as e:
@@ -8499,10 +8643,18 @@ class TelegramAdapter(BasePlatformAdapter):
 
                     media_group_id = getattr(msg, "media_group_id", None)
                     if media_group_id:
-                        await self._queue_media_group_event(str(media_group_id), event)
+                        await self._queue_media_group_event(
+                            str(media_group_id),
+                            event,
+                            batch_sender_identity=batch_sender_identity,
+                        )
                     else:
                         batch_key = self._photo_batch_key(event, msg)
-                        self._enqueue_photo_event(batch_key, event)
+                        await self._enqueue_photo_event(
+                            batch_key,
+                            event,
+                            batch_sender_identity=batch_sender_identity,
+                        )
                     return
 
                 if not ext and doc.mime_type:
@@ -8578,12 +8730,22 @@ class TelegramAdapter(BasePlatformAdapter):
 
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
-            await self._queue_media_group_event(str(media_group_id), event)
+            await self._queue_media_group_event(
+                str(media_group_id),
+                event,
+                batch_sender_identity=batch_sender_identity,
+            )
             return
 
         await self.handle_message(event)
 
-    async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
+    async def _queue_media_group_event(
+        self,
+        media_group_id: str,
+        event: MessageEvent,
+        *,
+        batch_sender_identity: tuple[str, ...] | None = None,
+    ) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
 
         Telegram delivers albums as multiple updates with a shared media_group_id.
@@ -8595,38 +8757,82 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[Telegram] Dropping media group enqueue after disconnect started")
             return
 
-        existing = self._media_group_events.get(media_group_id)
+        batch_key = self._media_group_batch_key(event, media_group_id)
+        async with _pending_batch_lock(
+            self, batch_key, store_attr="_media_group_batch_locks",
+        ):
+            await self._queue_media_group_event_for_key(
+                batch_key,
+                media_group_id,
+                event,
+                batch_sender_identity=batch_sender_identity,
+            )
+
+    async def _queue_media_group_event_for_key(
+        self,
+        batch_key: str,
+        media_group_id: str,
+        event: MessageEvent,
+        *,
+        batch_sender_identity: tuple[str, ...] | None,
+    ) -> None:
+        if batch_sender_identity is None:
+            batch_sender_identity = _message_event_sender_identity(event)
+        sender_map = getattr(self, "_media_group_senders", None)
+        if sender_map is None:
+            sender_map = {}
+            self._media_group_senders = sender_map
+        group_id_map = getattr(self, "_media_group_ids", None)
+        if group_id_map is None:
+            group_id_map = {}
+            self._media_group_ids = group_id_map
+        existing = self._media_group_events.get(batch_key)
+        if existing is not None:
+            await _cancel_pending_batch_task(self._media_group_tasks, batch_key)
+            if (
+                batch_sender_identity is None
+                or sender_map.get(batch_key) != batch_sender_identity
+                or group_id_map.get(batch_key) != media_group_id
+            ):
+                await self._flush_media_group_event_now(batch_key)
+                existing = None
         if existing is None:
-            self._media_group_events[media_group_id] = event
+            self._media_group_events[batch_key] = event
+            sender_map[batch_key] = batch_sender_identity
+            group_id_map[batch_key] = media_group_id
         else:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
 
-        prior_task = self._media_group_tasks.get(media_group_id)
-        if prior_task:
-            prior_task.cancel()
-
-        self._media_group_tasks[media_group_id] = asyncio.create_task(
-            self._flush_media_group_event(media_group_id)
+        self._media_group_tasks[batch_key] = asyncio.create_task(
+            self._flush_media_group_event(batch_key)
         )
 
-    async def _flush_media_group_event(self, media_group_id: str) -> None:
+    async def _flush_media_group_event(self, batch_key: str) -> None:
         current_task = asyncio.current_task()
         try:
             await asyncio.sleep(self.MEDIA_GROUP_WAIT_SECONDS)
-            event = self._media_group_events.pop(media_group_id, None)
-            if event is not None:
-                if self._should_drop_delayed_delivery():
-                    logger.debug("[Telegram] Dropping media group flush after disconnect started")
-                    return
-                await self.handle_message(event)
+            if self._media_group_tasks.get(batch_key) is not current_task:
+                return
+            await self._flush_media_group_event_now(batch_key)
         except asyncio.CancelledError:
             return
         finally:
-            if self._media_group_tasks.get(media_group_id) is current_task:
-                self._media_group_tasks.pop(media_group_id, None)
+            if self._media_group_tasks.get(batch_key) is current_task:
+                self._media_group_tasks.pop(batch_key, None)
+
+    async def _flush_media_group_event_now(self, batch_key: str) -> None:
+        event = self._media_group_events.pop(batch_key, None)
+        getattr(self, "_media_group_senders", {}).pop(batch_key, None)
+        getattr(self, "_media_group_ids", {}).pop(batch_key, None)
+        if event is None:
+            return
+        if self._should_drop_delayed_delivery():
+            logger.debug("[Telegram] Dropping media group flush after disconnect started")
+            return
+        await self.handle_message(event)
 
     async def _handle_sticker(self, msg: Message, event: "MessageEvent") -> None:
         """

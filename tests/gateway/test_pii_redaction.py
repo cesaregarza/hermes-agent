@@ -123,6 +123,69 @@ class TestBuildSessionContextPromptRedaction:
         prompt = build_session_context_prompt(ctx, redact_pii=False)
         assert "99999" in prompt
 
+    def test_whatsapp_cloud_home_phone_fallback_name_is_redacted(self):
+        wa_id = "15551234567"
+        hc = {
+            Platform.WHATSAPP_CLOUD: HomeChannel(
+                platform=Platform.WHATSAPP_CLOUD,
+                chat_id=wa_id,
+                name=wa_id,
+            )
+        }
+        ctx = _make_context(
+            user_id=wa_id,
+            chat_id=wa_id,
+            chat_name=wa_id,
+            platform=Platform.WHATSAPP_CLOUD,
+            home_channels=hc,
+        )
+
+        prompt = build_session_context_prompt(ctx, redact_pii=True)
+
+        assert wa_id not in prompt
+        assert _hash_chat_id(wa_id) in prompt
+
+    def test_ineligible_source_still_redacts_eligible_home_channel(self):
+        phone = "15551234567"
+        ctx = _make_context(
+            user_id="discord-user-123",
+            chat_id="discord-channel-456",
+            platform=Platform.DISCORD,
+            home_channels={
+                Platform.WHATSAPP_CLOUD: HomeChannel(
+                    platform=Platform.WHATSAPP_CLOUD,
+                    chat_id=phone,
+                    name=phone,
+                )
+            },
+        )
+
+        prompt = build_session_context_prompt(ctx, redact_pii=True)
+
+        assert "discord-user-123" in prompt
+        assert phone not in prompt
+        assert _hash_chat_id(phone) in prompt
+
+    def test_eligible_source_keeps_ineligible_home_channel_raw(self):
+        discord_id = "discord-channel-456"
+        ctx = _make_context(
+            user_id="telegram-user-123",
+            chat_id="telegram-chat-789",
+            platform=Platform.TELEGRAM,
+            home_channels={
+                Platform.DISCORD: HomeChannel(
+                    platform=Platform.DISCORD,
+                    chat_id=discord_id,
+                    name=discord_id,
+                )
+            },
+        )
+
+        prompt = build_session_context_prompt(ctx, redact_pii=True)
+
+        assert "telegram-user-123" not in prompt
+        assert discord_id in prompt
+
     def test_redaction_is_deterministic(self):
         ctx = _make_context(user_id="+15551234567")
         prompt1 = build_session_context_prompt(ctx, redact_pii=True)

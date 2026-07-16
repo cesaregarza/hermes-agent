@@ -1,16 +1,17 @@
 """Tests for GatewayRunner._resolve_profile_home_for_source — profile resolution logic."""
 
+import asyncio
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionSource, SessionStore, build_session_key
 from gateway.run import GatewayRunner
 from gateway.profile_routing import ProfileRoute
-from gateway.config import Platform
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent
 
 
 @pytest.fixture
@@ -22,6 +23,25 @@ def mock_runner():
     runner._profile_name_for_source = GatewayRunner._profile_name_for_source.__get__(runner)
     runner._resolve_profile_home_for_source = GatewayRunner._resolve_profile_home_for_source.__get__(runner)
     return runner
+
+
+@pytest.fixture
+def profile_env(tmp_path, monkeypatch):
+    """Isolate both profile roots and HERMES_HOME for profile E2E tests."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+@pytest.fixture
+def inline_to_thread(monkeypatch):
+    """Keep adapter-key tests deterministic without a lingering executor."""
+    async def _run_inline(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _run_inline)
 
 
 @pytest.fixture
@@ -419,6 +439,258 @@ class TestAdapterToSessionKeyIntegration:
         assert source.profile is None
         key = build_session_key(source, profile=source.profile)
         assert key.startswith("agent:main:"), key
+
+    def test_primary_route_separates_runtime_from_transport_owner(self):
+        """A shared primary bot may route runtime without changing egress bot."""
+        from gateway.config import GatewayConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.config.profile_routes = [
+            ProfileRoute(
+                name="ops-chat",
+                platform="telegram",
+                profile="ops",
+                chat_id="shared-chat",
+            )
+        ]
+        runner._primary_profile_name = "default"
+        runner._profile_adapters = {}
+
+        primary = _stub_adapter(Platform.TELEGRAM, runner)
+        primary._profile_name = "default"
+        primary._profile_routes_enabled = True
+        runner.adapters = {Platform.TELEGRAM: primary}
+
+        source = primary.build_source(
+            chat_id="shared-chat",
+            chat_type="group",
+            user_id="operator",
+        )
+
+        assert source.profile == "ops"
+        assert source.transport_profile == "default"
+        assert runner._adapter_for_source(source) is primary
+        assert build_session_key(source, profile=source.profile).startswith(
+            "agent:ops:"
+        )
+
+    def test_secondary_owner_disables_shared_bot_routes(self):
+        """A credential-specific adapter pins both runtime and transport owner."""
+        from gateway.config import GatewayConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.config.profile_routes = [
+            ProfileRoute(
+                name="ops-chat",
+                platform="telegram",
+                profile="ops",
+                chat_id="shared-chat",
+            )
+        ]
+        runner._primary_profile_name = "default"
+        runner.adapters = {Platform.TELEGRAM: object()}
+
+        secondary = _stub_adapter(Platform.TELEGRAM, runner)
+        secondary._profile_name = "coder"
+        secondary._profile_routes_enabled = False
+        runner._profile_adapters = {
+            "coder": {Platform.TELEGRAM: secondary},
+        }
+
+        source = secondary.build_source(
+            chat_id="shared-chat",
+            chat_type="group",
+            user_id="developer",
+        )
+
+        assert source.profile == "coder"
+        assert source.transport_profile == "coder"
+        assert runner._adapter_for_source(source) is secondary
+        assert build_session_key(source, profile=source.profile).startswith(
+            "agent:coder:"
+        )
+
+    @staticmethod
+    def _active_guard_adapter(*, owning_profile: str | None = None):
+        adapter = _stub_adapter(Platform.TELEGRAM, runner=None)
+        adapter.config = PlatformConfig(enabled=True, token="test")
+        adapter._profile_name = owning_profile
+        adapter._message_handler = AsyncMock(return_value=None)
+        adapter._topic_recovery_fn = None
+        adapter._active_sessions = {}
+        adapter._session_tasks = {}
+        adapter._pending_messages = {}
+        adapter._text_debounce = {}
+        adapter._text_debounce_overflow = {}
+        started: list[str] = []
+        busy: list[tuple[MessageEvent, str]] = []
+
+        def _start(event, session_key, *, interrupt_event=None):
+            started.append(session_key)
+            adapter._active_sessions[session_key] = interrupt_event or asyncio.Event()
+            return True
+
+        async def _busy(event, session_key):
+            busy.append((event, session_key))
+            return True
+
+        adapter._start_session_processing = _start
+        adapter._busy_session_handler = _busy
+        return adapter, started, busy
+
+    @pytest.mark.asyncio
+    async def test_active_guard_isolated_by_stamped_profile(self, inline_to_thread):
+        adapter, started, busy = self._active_guard_adapter()
+        alpha = MessageEvent(
+            text="alpha",
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="shared-chat",
+                user_id="same-user",
+                profile="alpha",
+            ),
+        )
+        beta = MessageEvent(
+            text="beta",
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="shared-chat",
+                user_id="same-user",
+                profile="beta",
+            ),
+        )
+
+        await adapter.handle_message(alpha)
+        await adapter.handle_message(beta)
+
+        assert started == [
+            "agent:alpha:telegram:dm:shared-chat",
+            "agent:beta:telegram:dm:shared-chat",
+        ]
+        assert busy == []
+
+    @pytest.mark.asyncio
+    async def test_secondary_owner_profile_stamped_before_busy_guard(
+        self,
+        inline_to_thread,
+    ):
+        adapter, started, busy = self._active_guard_adapter(owning_profile="coder")
+
+        def _event(text: str) -> MessageEvent:
+            return MessageEvent(
+                text=text,
+                source=SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id="secondary-chat",
+                    user_id="same-user",
+                ),
+            )
+
+        first = _event("first")
+        followup = _event("followup")
+        await adapter.handle_message(first)
+        await adapter.handle_message(followup)
+
+        key = "agent:coder:telegram:dm:secondary-chat"
+        assert first.source.profile == "coder"
+        assert followup.source.profile == "coder"
+        assert first.source.transport_profile == "coder"
+        assert followup.source.transport_profile == "coder"
+        assert started == [key]
+        assert busy == [(followup, key)]
+
+    def test_secondary_owner_profile_stamped_by_build_source(self):
+        adapter = _stub_adapter(Platform.TELEGRAM, runner=None)
+        adapter._profile_name = "coder"
+
+        source = adapter.build_source(
+            chat_id="secondary-chat", chat_type="dm", user_id="same-user",
+        )
+
+        assert source.profile == "coder"
+        assert source.transport_profile == "coder"
+        assert build_session_key(source, profile=source.profile).startswith(
+            "agent:coder:"
+        )
+
+    @pytest.mark.asyncio
+    async def test_named_active_primary_guard_matches_session_store_key(
+        self,
+        inline_to_thread,
+    ):
+        """No-route traffic uses the named active profile end to end."""
+        from gateway.config import GatewayConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._profile_name_for_source = (
+            GatewayRunner._profile_name_for_source.__get__(runner)
+        )
+        store = SessionStore.__new__(SessionStore)
+        store.config = runner.config
+        runner.session_store = store
+        adapter, started, busy = self._active_guard_adapter()
+        adapter.gateway_runner = runner
+        runner._create_adapter = lambda _platform, _config: adapter
+
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="coder",
+        ):
+            primary = runner._create_primary_adapter(
+                Platform.TELEGRAM,
+                adapter.config,
+            )
+            source = primary.build_source(
+                chat_id="active-chat",
+                chat_type="dm",
+                user_id="same-user",
+            )
+            expected_key = store._generate_session_key(source)
+            await primary.handle_message(
+                MessageEvent(text="hello", source=source)
+            )
+
+        assert source.profile == "coder"
+        assert source.transport_profile == "coder"
+        assert expected_key == "agent:coder:telegram:dm:active-chat"
+        assert started == [expected_key]
+        assert busy == []
+
+
+class TestStrictMultiplexProfileResolution:
+    @pytest.mark.asyncio
+    async def test_unknown_explicit_profile_never_enters_agent(
+        self,
+        profile_env,
+    ):
+        """An unknown routed namespace cannot inherit primary credentials."""
+        from gateway.config import GatewayConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._run_agent_inner = AsyncMock(return_value={"final_response": "unsafe"})
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="unknown-profile-chat",
+            user_id="attacker",
+            profile="does-not-exist",
+            transport_profile="default",
+        )
+
+        with pytest.raises(LookupError, match="does-not-exist"):
+            await runner._run_agent(
+                "hello",
+                "context",
+                [],
+                source,
+                "session-unknown",
+                session_key="agent:does-not-exist:telegram:dm:unknown-profile-chat",
+            )
+
+        runner._run_agent_inner.assert_not_awaited()
 
 
 class TestMultiplexGate:

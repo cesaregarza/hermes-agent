@@ -65,6 +65,9 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    _cancel_pending_batch_task,
+    _message_events_same_sender,
+    _pending_batch_lock,
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
@@ -563,7 +566,7 @@ class WeComAdapter(BasePlatformAdapter):
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the WeCom client.
         if message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
-            self._enqueue_text_event(event)
+            await self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
 
@@ -574,14 +577,15 @@ class WeComAdapter(BasePlatformAdapter):
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text message batching."""
         from gateway.session import build_session_key
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=event.source.profile,
         )
+        return session_key
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    async def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
         When WeCom splits a long user message at 4000 chars, the chunks
@@ -589,8 +593,21 @@ class WeComAdapter(BasePlatformAdapter):
         a single event before dispatching.
         """
         key = self._text_batch_key(event)
+        async with _pending_batch_lock(
+            self, key, store_attr="_pending_text_batch_locks",
+        ):
+            await self._enqueue_text_event_for_key(key, event)
+
+    async def _enqueue_text_event_for_key(
+        self, key: str, event: MessageEvent,
+    ) -> None:
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
+        if existing is not None:
+            await _cancel_pending_batch_task(self._pending_text_batch_tasks, key)
+            if not _message_events_same_sender(existing, event):
+                await self._flush_text_batch_now(key)
+                existing = None
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
@@ -603,10 +620,6 @@ class WeComAdapter(BasePlatformAdapter):
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
 
-        # Cancel any pending flush and restart the timer
-        prior_task = self._pending_text_batch_tasks.get(key)
-        if prior_task and not prior_task.done():
-            prior_task.cancel()
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
@@ -638,17 +651,21 @@ class WeComAdapter(BasePlatformAdapter):
             # in between.
             if self._pending_text_batch_tasks.get(key) is not current_task:
                 return
-            event = self._pending_text_batches.pop(key, None)
-            if not event:
-                return
-            logger.info(
-                "[WeCom] Flushing text batch %s (%d chars)",
-                key, len(event.text or ""),
-            )
-            await self.handle_message(event)
+            await self._flush_text_batch_now(key)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
+
+    async def _flush_text_batch_now(self, key: str) -> None:
+        """Dispatch the oldest contiguous sender burst immediately."""
+        event = self._pending_text_batches.pop(key, None)
+        if not event:
+            return
+        logger.info(
+            "[WeCom] Flushing text batch %s (%d chars)",
+            key, len(event.text or ""),
+        )
+        await self.handle_message(event)
 
     @staticmethod
     def _extract_text(body: Dict[str, Any]) -> Tuple[str, Optional[str]]:
