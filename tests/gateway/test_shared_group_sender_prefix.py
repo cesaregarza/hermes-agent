@@ -110,6 +110,7 @@ async def test_profile_scoped_shared_phone_fallback_never_reaches_agent(
     )
 
     assert result == f"[{_hash_sender_id(phone)}] hello"
+    assert result is not None
     assert phone not in result
 
 
@@ -166,4 +167,6 @@ async def test_shared_sender_attribution_is_omitted_if_eligibility_lookup_fails(
     )
 
     assert result == "hello"
+    assert result is not None
+    assert source.user_name is not None
     assert source.user_name not in result
