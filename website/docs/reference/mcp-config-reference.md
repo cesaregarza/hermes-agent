@@ -70,9 +70,8 @@ mcp_servers:
 receive chat, user, or session identifiers through this channel unless you
 explicitly enable it for that server.
 
-When enabled and a complete session context is bound, Hermes attaches
-host-authored request `_meta` to MCP `tools/call` requests using these
-reverse-DNS keys:
+When enabled, Hermes can attach host-authored request `_meta` to MCP
+`tools/call` requests using exactly these reverse-DNS keys:
 
 - `com.nousresearch.hermes/platform`
 - `com.nousresearch.hermes/session_id`
@@ -82,16 +81,41 @@ reverse-DNS keys:
 - `com.nousresearch.hermes/user_id`
 - `com.nousresearch.hermes/message_id`
 
-If no complete session context is bound, the entire session-context meta block
-is omitted. Resource and prompt operations do not carry this identity; the
-setting applies only to `tools/call`.
+All seven gateway identity `ContextVar` values must be bound. An individual
+bound value may be empty, but Hermes omits the entire session-context meta block
+if any required value is unbound, all seven values are empty, the routed
+profile's privacy policy is unavailable, or privacy eligibility or
+pseudonymization cannot be evaluated safely. Configuration read, parse,
+managed-policy, and profile-resolution failures make that policy unavailable.
+A missing configuration file or an absent `privacy.redact_pii` setting is a
+valid false policy and retains raw values. The values come only from the
+current turn's task-local context; process environment variables are never an
+MCP metadata fallback. MCP resource, prompt, and discovery operations do not
+carry this identity.
 
-On platforms eligible for PII redaction, enabling `privacy.redact_pii`
-replaces `chat_id`, `thread_id`, and `user_id` with the gateway's existing
-deterministic pseudonyms. `session_key` becomes a stable `session_<hash>`
-pseudonym so it cannot reveal an identifier embedded in the original key.
-This is pseudonymization, not anonymity. With redaction disabled, or on other
-platforms, the raw-value policy is unchanged.
+When the routed profile has `privacy.redact_pii: true` and the platform is
+eligible, Hermes pseudonymizes `chat_id`, `user_id`, `session_key`, the entire
+`thread_id`, and `message_id` in the outgoing copy. Message IDs include
+WhatsApp Cloud WAMIDs, which can encode a phone number. `platform` and
+`session_id` remain raw. Built-in eligible platforms are WhatsApp, WhatsApp
+Cloud, Signal, Telegram, and BlueBubbles; plugin platforms opt in through their
+`pii_safe` capability. With redaction disabled or on an ineligible platform,
+all seven values retain their raw form. Pseudonymization reuses the gateway's
+ID hashing helpers and changes only the outgoing MCP copy; task-local routing
+values remain raw. User, thread, message, and session pseudonyms use
+`user_<12hex>`, `thread_<12hex>`, `message_<12hex>`, and `session_<12hex>`;
+`chat_id` uses the existing gateway chat hash.
+
+The hashes are deterministic, stable, and linkable: they are pseudonyms, not
+anonymity. Non-empty event-level triggering message IDs take precedence at
+message ingress, while adapters that supply only a source-level message ID
+remain supported. Synthetic goal continuations clear the prior triggering ID
+instead of reusing it. Queued follow-ups rebind the sender, triggering message
+ID, and routed profile privacy policy before the next tool call.
+
+`HERMES_UI_SESSION_ID` is intentionally excluded. It identifies an in-process
+frontend return path, not the durable gateway invocation identity attested to
+an MCP server.
 
 :::caution
 Enable session context forwarding only for a server you trust with the
@@ -100,7 +124,8 @@ resulting identifiers or pseudonyms.
 
 Separately, binding a gateway session ID makes `HERMES_SESSION_ID` visible to
 gateway-spawned subprocesses through the existing environment bridge. That
-subprocess behavior is independent of the per-server MCP opt-in.
+subprocess behavior is independent of the per-server MCP opt-in, and the
+environment value is never read as a source for MCP request `_meta`.
 
 ## `tools` policy keys
 
