@@ -819,6 +819,28 @@ class TestProfileScopedStorage:
         assert global_store.is_approved("weixin", "global_user") is True
         assert global_store.is_approved("weixin", "yangyang_user") is False
 
+    def test_unfiltered_listing_discovers_only_profile_local_platforms(
+        self, tmp_path, monkeypatch
+    ):
+        """Secondary stores enumerate their own directory, not the primary one."""
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        global_dir = tmp_path / "platforms" / "pairing"
+        with patch("gateway.pairing.PAIRING_DIR", global_dir):
+            global_store = PairingStore()
+            profile_store = PairingStore(profile="yangyang")
+
+        global_store._approve_user("telegram", "primary-user", "Primary")
+        profile_store._approve_user("slack", "secondary-user", "Secondary")
+
+        assert {
+            (entry["platform"], entry["user_id"])
+            for entry in global_store.list_approved()
+        } == {("telegram", "primary-user")}
+        assert {
+            (entry["platform"], entry["user_id"])
+            for entry in profile_store.list_approved()
+        } == {("slack", "secondary-user")}
+
     def test_profile_uses_distinct_rate_limit_file(self, tmp_path, monkeypatch):
         """Rate-limit state is per-profile, not shared globally — otherwise
         one profile's flood would lock out the other profile's users."""

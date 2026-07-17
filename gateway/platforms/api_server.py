@@ -2345,6 +2345,12 @@ class APIServerAdapter(BasePlatformAdapter):
             model=source.get("model"),
             system_prompt=source.get("system_prompt"),
             parent_session_id=source_id,
+            session_key=source.get("session_key"),
+            user_id=source.get("user_id"),
+            chat_id=source.get("chat_id"),
+            chat_type=source.get("chat_type"),
+            thread_id=source.get("thread_id"),
+            profile_name=source.get("profile_name"),
         )
         messages = db.get_messages(source_id)
         db.replace_messages(fork_id, messages)
@@ -2352,7 +2358,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if title is None:
             base = source.get("title") or "fork"
             try:
-                title = db.get_next_title_in_lineage(base)
+                title = db.get_next_title_in_lineage(
+                    base,
+                    profile_name=source.get("profile_name"),
+                )
             except Exception:
                 title = f"{base} fork"
         try:

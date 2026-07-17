@@ -4009,6 +4009,7 @@ class SlackAdapter(BasePlatformAdapter):
                     normalized_user_id,
                     normalized_chat_type,
                     normalized_channel_id,
+                    scope_id=str(team_id) if team_id else None,
                 )
                 is True
             )
@@ -4427,7 +4428,11 @@ class SlackAdapter(BasePlatformAdapter):
                 trust_tag = ""
                 if not is_bot and msg_user:
                     is_authorized = self._is_sender_authorized(
-                        msg_user, chat_type="thread", chat_id=channel_id,
+                        msg_user,
+                        chat_type="thread",
+                        chat_id=channel_id,
+                        scope_id=team_id or None,
+                        thread_id=thread_ts or None,
                     )
                     if is_authorized is False:
                         trust_tag = "[unverified] "

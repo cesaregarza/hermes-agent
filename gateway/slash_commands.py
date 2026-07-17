@@ -722,10 +722,113 @@ class GatewaySlashCommandsMixin:
                 return getattr(entry, "origin", None)
         return None
 
-    @staticmethod
-    def _same_matrix_room(current: SessionSource, origin: Optional[SessionSource]) -> bool:
+    def _multiplex_resume_profile(self, source: Optional[SessionSource]) -> Optional[str]:
+        """Return a validated runtime profile for resume isolation.
+
+        A profile is an authorization boundary when multiplexing is enabled.
+        Inbound sources are expected to be stamped before slash dispatch; a
+        missing or invalid stamp cannot prove ownership and therefore fails
+        closed. Single-profile gateways keep their legacy behavior unchanged.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return None
+        raw = str(getattr(source, "profile", "") or "").strip()
+        if not raw:
+            return None
+        try:
+            from hermes_cli.profiles import (
+                normalize_profile_name,
+                validate_profile_name,
+            )
+
+            profile = normalize_profile_name(raw)
+            validate_profile_name(profile)
+            if profile == "main":
+                return None
+            return profile
+        except (ImportError, TypeError, ValueError):
+            return None
+
+    def _same_resume_profile(
+        self,
+        current: Optional[SessionSource],
+        origin: Optional[SessionSource],
+    ) -> bool:
+        """Whether two sources belong to the same runtime-profile boundary."""
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return True
+        current_profile = self._multiplex_resume_profile(current)
+        origin_profile = self._multiplex_resume_profile(origin)
+        return bool(
+            current_profile
+            and origin_profile
+            and current_profile == origin_profile
+        )
+
+    def _resume_row_profile_matches(self, source: SessionSource, row: dict) -> bool:
+        """Whether a persisted session row belongs to ``source``'s profile."""
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return True
+        current_profile = self._multiplex_resume_profile(source)
+        raw = str(row.get("profile_name") or "").strip()
+        if not current_profile:
+            return False
+        # Sessions created before multiplexing have NULL profile_name and are
+        # part of the default namespace. This matches the database's unique
+        # title index and session-key ``agent:main`` compatibility mapping.
+        if not raw:
+            raw = "default"
+        try:
+            from hermes_cli.profiles import (
+                normalize_profile_name,
+                validate_profile_name,
+            )
+
+            row_profile = normalize_profile_name(raw)
+            validate_profile_name(row_profile)
+            if row_profile == "main":
+                return False
+        except (ImportError, TypeError, ValueError):
+            return False
+        return row_profile == current_profile
+
+    async def _resume_target_profile_allowed(
+        self,
+        source: SessionSource,
+        target_id: str,
+        *,
+        row: Optional[dict] = None,
+    ) -> bool:
+        """Fail closed when a resume target crosses a multiplex profile."""
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return True
+        try:
+            origin = self._gateway_session_origin_for_id(target_id)
+        except Exception:
+            origin = None
+        if isinstance(origin, SessionSource):
+            if not self._same_resume_profile(source, origin):
+                return False
+            # When a listing already supplied persisted metadata, require it
+            # to agree with the trusted live origin if it names a profile.
+            if row is not None and str(row.get("profile_name") or "").strip():
+                return self._resume_row_profile_matches(source, row)
+            return True
+        if row is None:
+            try:
+                row = await self._session_db.get_session(target_id) or {}
+            except Exception:
+                return False
+        return self._resume_row_profile_matches(source, row)
+
+    def _same_matrix_room(
+        self,
+        current: SessionSource,
+        origin: Optional[SessionSource],
+    ) -> bool:
         return (
-            origin is not None
+            self._same_resume_profile(current, origin)
+            and origin is not None
             and origin.platform == Platform.MATRIX
             and current.platform == Platform.MATRIX
             and origin.chat_id == current.chat_id
@@ -754,6 +857,8 @@ class GatewaySlashCommandsMixin:
         contract via ``is_shared_multi_user_session``.
         """
         if origin is None or current is None:
+            return False
+        if not self._same_resume_profile(current, origin):
             return False
         if origin.platform != current.platform:
             return False
@@ -838,8 +943,6 @@ class GatewaySlashCommandsMixin:
         the row PROVES the same owner; a row that lacks enough ownership data
         fails closed. An explicit admin ``--all`` override bypasses scoping.
         """
-        if allow_override and self._resume_caller_is_admin(source):
-            return True
         # Use the live origin only when it resolves to a real SessionSource; a
         # store that can't resolve it (or an unexpected lookup error) must not
         # silently allow/deny — fall through to the deterministic DB scoping.
@@ -848,12 +951,20 @@ class GatewaySlashCommandsMixin:
         except Exception:
             origin = None
         if isinstance(origin, SessionSource):
+            if not self._same_resume_profile(source, origin):
+                return False
+            if allow_override and self._resume_caller_is_admin(source):
+                return True
             return self._same_origin_chat(source, origin)
         # Inactive/persisted-only: best-effort scope by DB row source + user.
         try:
             row = await self._session_db.get_session(target_id) or {}
         except Exception:
             return False
+        if not self._resume_row_profile_matches(source, row):
+            return False
+        if allow_override and self._resume_caller_is_admin(source):
+            return True
         caller_src = source.platform.value if source.platform else None
         row_src = row.get("source")
         if row_src and caller_src and str(row_src) != str(caller_src):
@@ -979,6 +1090,8 @@ class GatewaySlashCommandsMixin:
         unless an admin passes ``--all``.
         """
         sid = str(row.get("id") or "")
+        if not await self._resume_target_profile_allowed(source, sid, row=row):
+            return False
         if source.platform == Platform.MATRIX:
             # Cross-room enumeration is cross-ORIGIN data access: gate the
             # ``--all`` short-circuit behind a real configured admin, exactly
@@ -3662,6 +3775,7 @@ class GatewaySlashCommandsMixin:
     async def _handle_title_command(self, event: MessageEvent) -> str:
         """Handle /title command — set or show the current session's title."""
         source = event.source
+        session_key = self._session_key_for_source(source)
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_id = session_entry.session_id
 
@@ -3685,6 +3799,16 @@ class GatewaySlashCommandsMixin:
                     chat_id=source.chat_id,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
+                    session_key=session_key,
+                    profile_name=(
+                        self._multiplex_resume_profile(source)
+                        if getattr(
+                            getattr(self, "config", None),
+                            "multiplex_profiles",
+                            False,
+                        )
+                        else None
+                    ),
                 )
             except Exception:
                 pass  # Session might already exist, ignore errors
@@ -3739,6 +3863,10 @@ class GatewaySlashCommandsMixin:
 
         source = event.source
         session_key = self._session_key_for_source(source)
+        multiplexed = bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        )
+        resume_profile = self._multiplex_resume_profile(source)
         raw_args = event.get_command_args().strip()
         try:
             parts = shlex.split(raw_args)
@@ -3759,8 +3887,13 @@ class GatewaySlashCommandsMixin:
             name = name[1:-1].strip()
 
         async def _list_titled_sessions() -> list[dict]:
+            if multiplexed and not resume_profile:
+                return []
             user_source = source.platform.value if source.platform else None
-            sessions = await self._session_db.list_sessions_rich(source=user_source, limit=10)
+            kwargs: dict[str, Any] = {"source": user_source, "limit": 10}
+            if multiplexed:
+                kwargs["profile_name"] = resume_profile
+            sessions = await self._session_db.list_sessions_rich(**kwargs)
             return [s for s in sessions if s.get("title")][:10]
 
         if not name:
@@ -3814,6 +3947,13 @@ class GatewaySlashCommandsMixin:
             session = await self._session_db.get_session(name)
             if session:
                 target_id = session["id"]
+            elif multiplexed and not resume_profile:
+                target_id = None
+            elif multiplexed:
+                target_id = await self._session_db.resolve_session_by_title(
+                    name,
+                    profile_name=resume_profile,
+                )
             else:
                 target_id = await self._session_db.resolve_session_by_title(name)
         if not target_id:
@@ -3826,6 +3966,11 @@ class GatewaySlashCommandsMixin:
             logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
 
         if source.platform == Platform.MATRIX:
+            # ``--cross-room`` is an origin override, not a cross-profile
+            # capability. Runtime profiles remain an absolute isolation
+            # boundary even for an explicitly configured admin.
+            if not await self._resume_target_profile_allowed(source, target_id):
+                return t("gateway.resume.blocked_not_owner", name=name)
             target_origin = self._gateway_session_origin_for_id(target_id)
             if not self._same_matrix_room(source, target_origin) and not allow_cross_room:
                 if target_origin is None:
@@ -3942,19 +4087,27 @@ class GatewaySlashCommandsMixin:
         # previews / sources — the enumeration half of the /resume IDOR.
         cross_origin = include_all and self._resume_caller_is_admin(source)
         current_entry = await self.async_session_store.get_or_create_session(source)
-        rows = await asyncio.to_thread(
-            query_session_listing,
-            getattr(self._session_db, "_db", self._session_db),
-            source=source.platform.value if source.platform else None,
-            current_session_id=current_entry.session_id,
-            include_all_sources=cross_origin,
-            include_unnamed=include_unnamed,
-            search_query=search_query,
-            # Search filters at SQL level, so over-fetch before the visibility
-            # cut: origin-invisible matches would otherwise consume the page.
-            limit=50 if search_query else 10,
-            exclude_sources=["tool"],
+        multiplexed = bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
         )
+        resume_profile = self._multiplex_resume_profile(source)
+        if multiplexed and not resume_profile:
+            rows = []
+        else:
+            rows = await asyncio.to_thread(
+                query_session_listing,
+                getattr(self._session_db, "_db", self._session_db),
+                source=source.platform.value if source.platform else None,
+                current_session_id=current_entry.session_id,
+                include_all_sources=cross_origin,
+                include_unnamed=include_unnamed,
+                search_query=search_query,
+                # Search filters at SQL level, so over-fetch before the visibility
+                # cut: origin-invisible matches would otherwise consume the page.
+                limit=50 if search_query else 10,
+                exclude_sources=["tool"],
+                profile_name=resume_profile if multiplexed else None,
+            )
         if not cross_origin:
             # Scope the listing to the caller's own origin on every adapter so
             # session ids/previews from other users/rooms aren't enumerable.
@@ -4010,7 +4163,13 @@ class GatewaySlashCommandsMixin:
         else:
             current_title = await self._session_db.get_session_title(current_entry.session_id)
             base = current_title or "branch"
-            branch_title = await self._session_db.get_next_title_in_lineage(base)
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                branch_title = await self._session_db.get_next_title_in_lineage(
+                    base,
+                    profile_name=self._multiplex_resume_profile(source),
+                )
+            else:
+                branch_title = await self._session_db.get_next_title_in_lineage(base)
 
         parent_session_id = current_entry.session_id
 
@@ -4026,6 +4185,20 @@ class GatewaySlashCommandsMixin:
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
                 model_config={"_branched_from": parent_session_id},
                 parent_session_id=parent_session_id,
+                session_key=session_key,
+                user_id=source.user_id,
+                chat_id=source.chat_id,
+                chat_type=source.chat_type,
+                thread_id=source.thread_id,
+                profile_name=(
+                    self._multiplex_resume_profile(source)
+                    if getattr(
+                        getattr(self, "config", None),
+                        "multiplex_profiles",
+                        False,
+                    )
+                    else None
+                ),
             )
         except Exception as e:
             logger.error("Failed to create branch session: %s", e)

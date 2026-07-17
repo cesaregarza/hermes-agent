@@ -2,6 +2,7 @@ from hermes_state import AsyncSessionDB
 """Regression tests for approval-state cleanup on session boundaries."""
 
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -223,6 +224,30 @@ async def test_branch_preserves_persisted_assistant_metadata():
     assert assistant_kwargs["reasoning_details"] == [{"type": "summary", "text": "step"}]
     assert assistant_kwargs["codex_reasoning_items"] == [{"id": "r1", "type": "reasoning"}]
     assert assistant_kwargs["codex_message_items"] == [{"id": "m1", "type": "message"}]
+
+
+@pytest.mark.asyncio
+async def test_multiplex_branch_persists_profile_and_origin_metadata():
+    runner, _session_key = _make_branch_runner()
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    source = _make_source()
+    source.profile = "coder"
+    event = MessageEvent(text="/branch", source=source, message_id="m1")
+
+    result = await runner._handle_branch_command(event)
+
+    assert "Branched to" in result
+    kwargs = runner._session_db._db.create_session.call_args.kwargs
+    assert kwargs["session_key"].startswith("agent:coder:")
+    assert kwargs["profile_name"] == "coder"
+    assert kwargs["user_id"] == "u1"
+    assert kwargs["chat_id"] == "c1"
+    assert kwargs["chat_type"] == "dm"
+    assert kwargs["thread_id"] is None
+    runner._session_db._db.get_next_title_in_lineage.assert_called_once_with(
+        "Current Work",
+        profile_name="coder",
+    )
 
 
 def test_clear_session_boundary_security_state_is_scoped():

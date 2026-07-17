@@ -1826,12 +1826,15 @@ from gateway.config import (
 )
 from gateway.session import (
     AsyncSessionStore,
+    InvalidGatewayProfileError,
     SessionStore,
     SessionSource,
     SessionContext,
     build_session_context,
     build_session_context_prompt,
     build_session_key,
+    canonicalize_gateway_profile_name,
+    canonicalize_session_source_profiles,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
     _is_pii_redaction_eligible,
@@ -3695,6 +3698,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
+        canonicalize_session_source_profiles(source)
         if hasattr(self, "session_store") and self.session_store is not None:
             try:
                 session_key = self.session_store._generate_session_key(source)
@@ -7966,7 +7970,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ends the prior session in SQLite and reopens the CLI session under
         # the new key. The CLI's transcript becomes the active one for the
         # gateway from this moment on.
-        switched = await self.async_session_store.switch_session(session_key, cli_session_id)
+        switched = await self.async_session_store.switch_session(
+            session_key,
+            cli_session_id,
+            allow_unscoped_target=True,
+        )
         if switched is None:
             raise RuntimeError(
                 f"could not switch session key {session_key} → {cli_session_id}"
@@ -8234,11 +8242,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Create an active-profile adapter with its owner stamped up front."""
         adapter = self._create_adapter(platform, platform_config)
         if adapter is not None:
+            # All adapters consume this generic back-reference for inbound
+            # profile routing and cross-platform delivery.  Plugin factories
+            # and a few HTTP adapters already set it, but built-ins such as
+            # Signal do not pass through those branches.
+            adapter.gateway_runner = self
             if getattr(self.config, "multiplex_profiles", False):
-                owner = str(
+                owner = canonicalize_gateway_profile_name(
                     getattr(self, "_primary_profile_name", "")
-                    or self._active_profile_name()
+                    or self._active_profile_name(),
+                    field_name="primary adapter profile",
                 )
+                if owner is None:
+                    raise ValueError("Primary adapter profile cannot be empty")
                 self._primary_profile_name = owner
                 adapter._profile_name = owner
                 adapter._profile_routes_enabled = True
@@ -8946,18 +8962,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # was created in ``__init__``. Each secondary gets an explicit
         # canonical profile store; a construction failure leaves no map entry
         # and therefore denies instead of inheriting the primary approvals.
+        pairing_stores = getattr(self, "pairing_stores", None)
+        if pairing_stores is None:
+            pairing_stores = {}
+            self.pairing_stores = pairing_stores
         primary_store = getattr(self, "pairing_store", None)
         if primary_store is not None:
-            self.pairing_stores[active] = primary_store
+            pairing_stores[active] = primary_store
         else:
-            self.pairing_stores.pop(active, None)
+            pairing_stores.pop(active, None)
         for profile_name, _profile_home in served_profiles:
-            if profile_name == active or profile_name in self.pairing_stores:
+            if profile_name == active or profile_name in pairing_stores:
                 continue
             try:
-                self.pairing_stores[profile_name] = PairingStore(profile=profile_name)
+                pairing_stores[profile_name] = PairingStore(profile=profile_name)
             except Exception:
-                self.pairing_stores.pop(profile_name, None)
+                pairing_stores.pop(profile_name, None)
                 logger.error(
                     "Failed to initialize pairing store for profile '%s'; "
                     "pairing authorization will fail closed for that profile",
@@ -9011,6 +9031,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> int:
         """Create+connect one profile's adapters under its runtime scope."""
         from gateway.config import load_gateway_config
+
+        profile_name = canonicalize_gateway_profile_name(
+            profile_name,
+            field_name="secondary adapter profile",
+        )
+        if profile_name is None:
+            raise MultiplexConfigError("Secondary adapter profile cannot be empty")
 
         with _profile_runtime_scope(profile_home):
             profile_cfg = load_gateway_config()
@@ -9075,6 +9102,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Stamp the owning profile before any adapter-side batching or
             # BasePlatformAdapter active-session keying. The message-handler
             # wrapper below remains a final defense at runner dispatch time.
+            adapter.gateway_runner = self
             adapter._profile_name = profile_name
             adapter._profile_routes_enabled = False
 
@@ -9132,6 +9160,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profile's ``.env`` are visible to ``get_secret`` / authz.
         """
         from hermes_cli.profiles import get_profile_dir
+
+        profile_name = canonicalize_gateway_profile_name(
+            profile_name,
+            field_name="secondary message-handler profile",
+        )
+        if profile_name is None:
+            raise ValueError("Secondary message-handler profile cannot be empty")
 
         try:
             profile_home = get_profile_dir(profile_name)
@@ -9329,7 +9364,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         platform: Platform,
         profile_name: Optional[str] = None,
-    ) -> Callable[[str, Optional[str], Optional[str]], bool]:
+    ) -> Callable[..., bool]:
         """Build a platform-bound auth callback for adapter use.
 
         Adapters that fetch external context (e.g. Slack
@@ -9350,6 +9385,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id: str,
             chat_type: Optional[str] = None,
             chat_id: Optional[str] = None,
+            *,
+            scope_id: Optional[str] = None,
+            thread_id: Optional[str] = None,
+            parent_chat_id: Optional[str] = None,
         ) -> bool:
             if not user_id:
                 return False
@@ -9365,6 +9404,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=chat_id or "",
                 chat_type=chat_type or "group",
                 user_id=user_id,
+                scope_id=scope_id,
+                thread_id=thread_id,
+                parent_chat_id=parent_chat_id,
                 transport_profile=transport_owner,
             )
             if multiplex:
@@ -9449,6 +9491,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         6. Run agent conversation
         7. Return response
         """
+        try:
+            canonicalize_session_source_profiles(event.source)
+        except ValueError as exc:
+            # This boundary is reached by HTTP callbacks and tests that bypass
+            # BasePlatformAdapter.handle_message().  Reject before hooks, auth,
+            # session keying, provider construction, or any profile-home read.
+            logger.warning("Rejecting inbound message with invalid profile identity: %s", exc)
+            return None
         source = self._source_with_trigger_message_id(event)
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
@@ -11419,6 +11469,114 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _switch_to_live_pinned_session(
+        self,
+        session_entry,
+        pinned_session_id: str,
+    ):
+        """Return the verified spawning session for an async completion.
+
+        A missing/ended target or a central profile-invariant rejection is a
+        hard drop. Returning the peer's current session in either case would
+        inject the completion into a conversation that did not spawn it.
+        """
+        pinned_row = None
+        try:
+            if self._session_db is not None:
+                # AsyncSessionDB already offloads to a thread.
+                pinned_row = await self._session_db.get_session(pinned_session_id)
+        except Exception:
+            pinned_row = None
+        if pinned_row is None or pinned_row.get("ended_at"):
+            logger.warning(
+                "Async-delegation completion pinned to session %s, which is "
+                "%s — dropping injection instead of resurrecting it "
+                "(#55578 fail-closed; result remains in the delegation records).",
+                pinned_session_id,
+                "unknown" if pinned_row is None else "ended",
+            )
+            return None
+
+        prior_session_id = session_entry.session_id
+        switched = await self.async_session_store.switch_session(
+            session_entry.session_key,
+            pinned_session_id,
+        )
+        if switched is None:
+            logger.warning(
+                "Async-delegation completion target %s was rejected for routing "
+                "key %s — dropping injection instead of rerouting it to current "
+                "session %s",
+                pinned_session_id,
+                session_entry.session_key,
+                prior_session_id,
+            )
+            return None
+
+        logger.info(
+            "Pinned async-delegation completion to spawning session %s "
+            "(was %s) for routing key %s (#57498)",
+            pinned_session_id,
+            prior_session_id,
+            session_entry.session_key,
+        )
+        return switched
+
+    async def _apply_telegram_topic_binding(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        session_entry,
+        binding: Dict[str, Any],
+    ):
+        """Apply one durable Telegram topic binding without crossing profiles."""
+        original_bound_session_id = str(binding.get("session_id") or "")
+        bound_session_id = original_bound_session_id
+        # Heal bindings that point at a pre-compression parent: walk the
+        # continuation chain to its tip before rebinding the live lane.
+        if bound_session_id and self._session_db is not None:
+            try:
+                canonical_session_id = await self._session_db.get_compression_tip(
+                    bound_session_id,
+                )
+            except Exception:
+                logger.debug(
+                    "compression-tip lookup failed for %s",
+                    bound_session_id,
+                    exc_info=True,
+                )
+                canonical_session_id = bound_session_id
+            if canonical_session_id and canonical_session_id != bound_session_id:
+                bound_session_id = canonical_session_id
+
+        if bound_session_id and bound_session_id != session_entry.session_id:
+            # SessionStore is the central profile/lineage invariant and also
+            # persists the key rebind. A foreign profile's globally-keyed topic
+            # row is ignored, never attached to this runtime transcript.
+            switched = await self.async_session_store.switch_session(
+                session_key,
+                bound_session_id,
+            )
+            if switched is None:
+                logger.warning(
+                    "Ignoring Telegram topic binding target %s rejected for "
+                    "routing key %s",
+                    bound_session_id,
+                    session_key,
+                )
+                return session_entry
+            session_entry = switched
+
+        if bound_session_id and bound_session_id != original_bound_session_id:
+            await asyncio.to_thread(
+                self._sync_telegram_topic_binding,
+                source,
+                session_entry,
+                reason="compression-tip-walk",
+            )
+        return session_entry
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -11482,34 +11640,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the ws_orphan_reap loop (#60609). A completion whose spawning
             # session is dead is dropped from injection; the subagent's
             # output remains in the delegation records.
-            pinned_row = None
-            try:
-                if self._session_db is not None:
-                    # AsyncSessionDB already offloads to a thread.
-                    pinned_row = await self._session_db.get_session(pinned_session_id)
-            except Exception:
-                pinned_row = None
-            if pinned_row is None or pinned_row.get("ended_at"):
-                logger.warning(
-                    "Async-delegation completion pinned to session %s, which is "
-                    "%s — dropping injection instead of resurrecting it "
-                    "(#55578 fail-closed; result remains in the delegation "
-                    "records).",
-                    pinned_session_id,
-                    "unknown" if pinned_row is None else "ended",
-                )
+            switched = await self._switch_to_live_pinned_session(
+                session_entry,
+                pinned_session_id,
+            )
+            if switched is None:
                 return
-            prior_session_id = session_entry.session_id
-            switched = await self.async_session_store.switch_session(session_key, pinned_session_id)
-            if switched is not None:
-                session_entry = switched
-                logger.info(
-                    "Pinned async-delegation completion to spawning session %s "
-                    "(was %s) for routing key %s (#57498)",
-                    pinned_session_id,
-                    prior_session_id,
-                    session_key,
-                )
+            session_entry = switched
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
@@ -11521,48 +11658,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Failed to read Telegram topic binding", exc_info=True)
                 binding = None
             if binding:
-                bound_session_id = str(binding.get("session_id") or "")
-                # Heal bindings that point at a pre-compression parent: walk
-                # the compression-continuation chain forward to its tip so the
-                # next message resumes the compressed child instead of
-                # reloading the oversized parent transcript (#20470/#29712/
-                # #33414). Returns the input unchanged when the session isn't
-                # a compression parent, so this is cheap and safe.
-                if bound_session_id and self._session_db is not None:
-                    try:
-                        canonical_session_id = await self._session_db.get_compression_tip(
-                            bound_session_id,
-                        )
-                    except Exception:
-                        logger.debug(
-                            "compression-tip lookup failed for %s",
-                            bound_session_id, exc_info=True,
-                        )
-                        canonical_session_id = bound_session_id
-                    if (
-                        canonical_session_id
-                        and canonical_session_id != bound_session_id
-                    ):
-                        bound_session_id = canonical_session_id
-                if bound_session_id and bound_session_id != session_entry.session_id:
-                    # Route the override through SessionStore so the session_key
-                    # → session_id mapping is persisted to disk and the previous
-                    # lane session is ended cleanly. Mutating session_entry in
-                    # place here created a split-brain state where the JSON
-                    # index pointed at one id but code downstream used another.
-                    switched = await self.async_session_store.switch_session(session_key, bound_session_id)
-                    if switched is not None:
-                        session_entry = switched
-                # If the stored binding pointed at a parent, rewrite it to the
-                # canonical descendant now that we've followed the chain.
-                if (
-                    bound_session_id
-                    and bound_session_id != str(binding.get("session_id") or "")
-                ):
-                    await asyncio.to_thread(
-                        self._sync_telegram_topic_binding,
-                        source, session_entry, reason="compression-tip-walk",
-                    )
+                session_entry = await self._apply_telegram_topic_binding(
+                    source=source,
+                    session_key=session_key,
+                    session_entry=session_entry,
+                    binding=binding,
+                )
             else:
                 try:
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
@@ -14147,7 +14248,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prompt, source, task_id, event_message_id, media_urls, media_types,
             )
 
-        profile_home = self._resolve_profile_home_for_source(source)
+        # Background work is as credential-sensitive as an interactive turn.
+        # An explicit unknown/invalid profile must never fall back to the
+        # process-global home and primary secrets.
+        profile_home = self._resolve_profile_home_for_source(source, strict=True)
         with _profile_runtime_scope(profile_home):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
@@ -16325,7 +16429,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from gateway.session import SessionSource
 
+        multiplex = bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        )
         session_key = str(evt.get("session_key") or "").strip()
+
+        def _validated_candidate(candidate: SessionSource, provenance: str):
+            try:
+                canonicalize_session_source_profiles(candidate)
+            except ValueError as exc:
+                logger.warning(
+                    "Synthetic process-event %s provenance is invalid for %s: %s",
+                    provenance,
+                    session_key,
+                    exc,
+                )
+                return None
+            if (
+                multiplex
+                and not getattr(candidate, "transport_profile", None)
+                and getattr(candidate, "delivered_via_upstream_relay", False) is not True
+            ):
+                logger.warning(
+                    "Synthetic process-event %s provenance for multiplexed "
+                    "session %r has no transport owner or relay marker; dropping",
+                    provenance,
+                    session_key,
+                )
+                return None
+            return candidate
+
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
@@ -16336,7 +16469,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source = self.session_store.routing_source_snapshot(session_key)
                 if isinstance(source, SessionSource):
                     event_user_id = str(evt.get("user_id") or "").strip()
-                    return dataclasses.replace(
+                    candidate = dataclasses.replace(
                         source,
                         user_id=event_user_id or source.user_id,
                         user_name=(
@@ -16354,6 +16487,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ) if event_user_id else source.user_id_alt,
                         message_id=None,
                     )
+                    return _validated_candidate(candidate, "store")
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -16364,7 +16498,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
                 event_user_id = str(evt.get("user_id") or "").strip()
-                return dataclasses.replace(
+                candidate = dataclasses.replace(
                     cached_source,
                     user_id=event_user_id or cached_source.user_id,
                     user_name=(
@@ -16382,6 +16516,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ) if event_user_id else cached_source.user_id_alt,
                     message_id=None,
                 )
+                return _validated_candidate(candidate, "cached")
 
             _parsed = _parse_session_key(session_key)
             if _parsed:
@@ -16394,6 +16529,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
         chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
         profile_name = str(evt.get("profile") or derived_profile or "").strip()
+        transport_profile_name = str(evt.get("transport_profile") or "").strip()
         if not platform_name or not chat_type or not chat_id:
             logger.warning(
                 "Synthetic event source unresolvable: "
@@ -16423,19 +16559,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
-        if profile_name:
-            try:
-                from hermes_cli.profiles import validate_profile_name
+        try:
+            profile_name = canonicalize_gateway_profile_name(
+                profile_name,
+                field_name="synthetic process-event profile",
+            )
+            transport_profile_name = canonicalize_gateway_profile_name(
+                transport_profile_name,
+                field_name="synthetic process-event transport_profile",
+            )
+        except ValueError as exc:
+            logger.warning("Synthetic process event has invalid profile metadata: %s", exc)
+            return None
 
-                validate_profile_name(profile_name)
-            except (ImportError, ValueError):
-                logger.warning(
-                    "Synthetic process event has invalid profile metadata: %r",
-                    profile_name,
-                )
-                return None
+        if (
+            multiplex
+            and not transport_profile_name
+        ):
+            # A named session namespace identifies runtime config, not the bot
+            # credential that received the turn.  It cannot distinguish a
+            # shared-primary route from a per-profile adapter, and it carries no
+            # authenticated relay marker.  Without the durable/local snapshot
+            # above, selecting an adapter from ``profile`` can send through the
+            # wrong bot.  Fail closed until coherent transport provenance is
+            # available.
+            logger.warning(
+                "Synthetic process event for multiplexed session %r has no "
+                "trusted transport provenance; dropping notification",
+                session_key,
+            )
+            return None
 
-        return SessionSource(
+        source = SessionSource(
             platform=platform,
             chat_id=chat_id,
             chat_type=chat_type,
@@ -16443,7 +16598,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
             profile=profile_name or None,
+            transport_profile=transport_profile_name or None,
         )
+        return _validated_candidate(source, "event")
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
@@ -18130,6 +18287,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         off would namespace batch/session keys by profile while the agent
         still runs in ``agent:main``, splitting the two out of agreement.
         """
+        canonicalize_session_source_profiles(source)
         config = getattr(self, "config", None)
         if not getattr(config, "multiplex_profiles", False):
             return None
@@ -18163,7 +18321,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
         if matched:
-            return matched.profile
+            return canonicalize_gateway_profile_name(
+                matched.profile,
+                field_name="matched profile route",
+            )
         logger.debug(
             "No profile route matched: platform=%s chat_id=%s thread_id=%s parent_chat_id=%s",
             source.platform.value, source.chat_id,
@@ -18192,6 +18353,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_exists,
         )
         from hermes_constants import get_hermes_home
+
+        # Invalid profile identities are never a reason to fall back to the
+        # global home.  Canonicalize before the legacy non-strict recovery path
+        # so traversal and namespace-conflicting values fail closed everywhere.
+        canonicalize_session_source_profiles(source)
         
         # Track whether a profile was explicitly requested (vs. falling back to default)
         explicit_profile = None
@@ -18205,6 +18371,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     explicit_profile = name  # Routing explicitly set this profile
             if not name:
                 name = get_active_profile_name() or "default"
+            name = canonicalize_gateway_profile_name(
+                name,
+                field_name="resolved runtime profile",
+            )
+            if name is None:
+                raise InvalidGatewayProfileError(
+                    "Resolved runtime profile cannot be empty"
+                )
             
             profile_dir = get_profile_dir(name)
             # Warn if an explicit profile doesn't exist on disk
@@ -18224,6 +18398,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return get_hermes_home()
             return profile_dir
+        except InvalidGatewayProfileError:
+            raise
         except Exception:
             # Catch normalization errors, path errors, etc.
             if strict:

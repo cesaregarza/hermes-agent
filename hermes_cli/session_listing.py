@@ -52,6 +52,7 @@ def query_session_listing(
     search_query: str | None = None,
     limit: int = 10,
     exclude_sources: list[str] | None = None,
+    profile_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return session rows for interactive listing surfaces.
 
@@ -71,6 +72,7 @@ def query_session_listing(
         limit=fetch_limit,
         search_query=search or None,
         order_by_last_active=bool(search),
+        profile_name=profile_name,
     )
     result: list[dict[str, Any]] = []
     for row in rows:

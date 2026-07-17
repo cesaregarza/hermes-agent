@@ -569,7 +569,11 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    canonicalize_session_source_profiles,
+)
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
 
@@ -2537,7 +2541,7 @@ class BasePlatformAdapter(ABC):
         # mark senders not on the allowlist as unverified in LLM context,
         # mitigating indirect prompt injection from third parties in a shared
         # thread/channel.
-        self._authorization_check: Optional[Callable[[str, Optional[str], Optional[str]], bool]] = None
+        self._authorization_check: Optional[Callable[..., bool]] = None
         # Auto-TTS on voice input: ``_auto_tts_default`` is the global default
         # (``voice.auto_tts`` in config.yaml, pushed by GatewayRunner on connect).
         # Per-chat overrides live in two sets populated from ``_voice_mode``:
@@ -2972,11 +2976,14 @@ class BasePlatformAdapter(ABC):
 
     def set_authorization_check(
         self,
-        callback: Optional[Callable[[str, Optional[str], Optional[str]], bool]],
+        callback: Optional[Callable[..., bool]],
     ) -> None:
         """Register a platform-bound authorization check.
 
-        The callback signature is ``(user_id, chat_type, chat_id) -> bool``.
+        The callback signature is ``(user_id, chat_type, chat_id, **context) ->
+        bool``. Optional context includes ``scope_id``, ``thread_id``, and
+        ``parent_chat_id`` so multiplex profile routing sees the same source
+        dimensions as the inbound message path.
         It is used by adapters that pull external context (e.g. Slack thread
         replies via ``conversations.replies``) to flag messages from senders
         that are not on the configured allowlist, so the LLM can treat them
@@ -2989,6 +2996,10 @@ class BasePlatformAdapter(ABC):
         user_id: Optional[str],
         chat_type: Optional[str] = None,
         chat_id: Optional[str] = None,
+        *,
+        scope_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        parent_chat_id: Optional[str] = None,
     ) -> Optional[bool]:
         """Return whether ``user_id`` is on the allowlist, if a check is configured.
 
@@ -3000,7 +3011,18 @@ class BasePlatformAdapter(ABC):
         if not user_id or self._authorization_check is None:
             return None
         try:
-            return bool(self._authorization_check(user_id, chat_type, chat_id))
+            context = {
+                name: value
+                for name, value in (
+                    ("scope_id", scope_id),
+                    ("thread_id", thread_id),
+                    ("parent_chat_id", parent_chat_id),
+                )
+                if value is not None
+            }
+            return bool(
+                self._authorization_check(user_id, chat_type, chat_id, **context)
+            )
         except Exception:
             logger.warning(
                 "[%s] Authorization check raised for user %s; treating as unknown",
@@ -4839,6 +4861,15 @@ class BasePlatformAdapter(ABC):
             if runner is not None:
                 try:
                     source.profile = runner._profile_name_for_source(source)
+                except ValueError:
+                    logger.warning(
+                        "[%s] Rejecting invalid profile identity for %s/%s",
+                        self.name,
+                        self.platform,
+                        source.chat_id,
+                        exc_info=True,
+                    )
+                    return
                 except Exception:
                     logger.warning(
                         "[%s] Profile resolution failed for %s/%s",
@@ -4849,6 +4880,19 @@ class BasePlatformAdapter(ABC):
                     )
             if not source.profile:
                 source.profile = owning_profile
+
+        if source is not None:
+            try:
+                canonicalize_session_source_profiles(source)
+            except ValueError:
+                logger.warning(
+                    "[%s] Rejecting message with invalid profile identity for %s/%s",
+                    self.name,
+                    self.platform,
+                    getattr(source, "chat_id", ""),
+                    exc_info=True,
+                )
+                return
 
         session_key = build_session_key(
             event.source,
@@ -5743,12 +5787,14 @@ class BasePlatformAdapter(ABC):
                         transport_profile=owning_profile,
                     )
                 ) or owning_profile
+            except ValueError:
+                raise
             except Exception:
                 logger.warning(
                     "Profile resolution failed for %s/%s, defaulting to active profile",
                     self.platform, chat_id, exc_info=True,
                 )
-        return SessionSource(
+        source = SessionSource(
             platform=self.platform,
             chat_id=str(chat_id),
             chat_name=chat_name,
@@ -5770,6 +5816,7 @@ class BasePlatformAdapter(ABC):
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
         )
+        return canonicalize_session_source_profiles(source)
     
     @abstractmethod
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:

@@ -750,6 +750,28 @@ class TestLoadTranscriptDBOnly:
 class TestSessionStoreSwitchSession:
     """Regression coverage for gateway /resume session switching semantics."""
 
+    @staticmethod
+    def _multiplex_store(tmp_path, profile="ops"):
+        from hermes_state import SessionDB
+
+        config = GatewayConfig(multiplex_profiles=True)
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        if store._db is not None:
+            store._db.close()
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=f"chat-{profile}",
+            chat_type="dm",
+            user_id="user-1",
+            profile=profile,
+        )
+        current = store.get_or_create_session(source)
+        return store, db, current
+
     def test_switch_session_reopens_target_session_in_db(self, tmp_path):
         from hermes_state import SessionDB
 
@@ -783,6 +805,106 @@ class TestSessionStoreSwitchSession:
         resumed = db.get_session(target_session_id)
         assert resumed["ended_at"] is None
         assert resumed["end_reason"] is None
+        db.close()
+
+    def test_multiplex_switch_accepts_matching_profile_evidence(self, tmp_path):
+        store, db, current = self._multiplex_store(tmp_path)
+        target_id = "ops-session"
+        db.create_session(
+            target_id,
+            source="telegram",
+            session_key="agent:ops:telegram:dm:other",
+            profile_name="ops",
+        )
+
+        switched = store.switch_session(current.session_key, target_id)
+
+        assert switched is not None
+        assert switched.session_id == target_id
+        db.close()
+
+    def test_multiplex_switch_rejects_sibling_profile_without_mutation(self, tmp_path):
+        store, db, current = self._multiplex_store(tmp_path)
+        target_id = "default-session"
+        db.create_session(
+            target_id,
+            source="telegram",
+            session_key="agent:main:telegram:dm:other",
+            profile_name="default",
+        )
+
+        switched = store.switch_session(current.session_key, target_id)
+
+        assert switched is None
+        assert store.peek_session_id(current.session_key) == current.session_id
+        assert db.get_session(current.session_id)["ended_at"] is None
+        db.close()
+
+    def test_multiplex_switch_rejects_conflicting_target_evidence(self, tmp_path):
+        store, db, current = self._multiplex_store(tmp_path)
+        target_id = "contaminated-session"
+        db.create_session(
+            target_id,
+            source="telegram",
+            session_key="agent:ops:telegram:dm:other",
+            profile_name="default",
+        )
+
+        assert store.switch_session(current.session_key, target_id) is None
+        assert store.peek_session_id(current.session_key) == current.session_id
+        db.close()
+
+    def test_multiplex_switch_accepts_unscoped_direct_branch_child(self, tmp_path):
+        store, db, current = self._multiplex_store(tmp_path)
+        target_id = "new-branch-child"
+        db.create_session(
+            target_id,
+            source="telegram",
+            parent_session_id=current.session_id,
+        )
+
+        switched = store.switch_session(current.session_key, target_id)
+
+        assert switched is not None
+        assert switched.session_id == target_id
+        db.close()
+
+    def test_multiplex_default_accepts_legacy_unscoped_session(self, tmp_path):
+        store, db, current = self._multiplex_store(tmp_path, profile="default")
+        legacy_id = "legacy-default-session"
+        db.create_session(legacy_id, source="telegram")
+
+        switched = store.switch_session(current.session_key, legacy_id)
+
+        assert switched is not None
+        assert switched.session_id == legacy_id
+        db.close()
+
+    def test_trusted_unscoped_exception_never_overrides_mismatch(self, tmp_path):
+        store, db, current = self._multiplex_store(tmp_path)
+        legacy_cli_id = "legacy-cli-session"
+        db.create_session(legacy_cli_id, source="cli")
+
+        assert store.switch_session(current.session_key, legacy_cli_id) is None
+        switched = store.switch_session(
+            current.session_key,
+            legacy_cli_id,
+            allow_unscoped_target=True,
+        )
+        assert switched is not None
+
+        mismatch_id = "default-cli-session"
+        db.create_session(
+            mismatch_id,
+            source="cli",
+            profile_name="default",
+        )
+        assert store.switch_session(
+            current.session_key,
+            mismatch_id,
+            allow_unscoped_target=True,
+        ) is None
+        assert store.peek_session_id(current.session_key) == legacy_cli_id
         db.close()
 
 

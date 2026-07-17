@@ -266,7 +266,7 @@ class TestPrimaryAdapterOwnership:
 
         callback = runner._make_adapter_auth_check(
             Platform.TELEGRAM,
-            profile="default",
+            profile_name="default",
         )
 
         assert callback("user-1", "group", "chat-1") is True
@@ -294,7 +294,7 @@ class TestPrimaryAdapterOwnership:
 
         callback = runner._make_adapter_auth_check(
             Platform.TELEGRAM,
-            profile="coder",
+            profile_name="coder",
         )
 
         assert callback("user-1", "group", "chat-1") is True
@@ -565,6 +565,7 @@ class TestSecondaryProfileConfigHandling:
         assert runner._profile_adapters["reviewer"] == {
             Platform.TELEGRAM: direct,
         }
+        assert direct.gateway_runner is runner
         assert direct._profile_name == "reviewer"
 
     @pytest.mark.asyncio

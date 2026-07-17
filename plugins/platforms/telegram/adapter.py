@@ -912,6 +912,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     normalized_user_id,
                     normalized_chat_type,
                     normalized_chat_id,
+                    thread_id=str(thread_id) if thread_id is not None else None,
                 )
                 is True
             )
@@ -3698,12 +3699,23 @@ class TelegramAdapter(BasePlatformAdapter):
                         self._background_tasks.add(self._polling_error_task)
                         self._polling_error_task.add_done_callback(self._background_tasks.discard)
                     elif self._looks_like_network_error(error):
-                        logger.warning("[%s] Telegram network _redact_telegram_error_text(error), scheduling reconnect: %s", self.name, error)
+                        safe_error = _redact_telegram_error_text(error)
+                        logger.warning(
+                            "[%s] Telegram network error, scheduling reconnect: %s",
+                            self.name,
+                            safe_error,
+                        )
                         self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
                         self._background_tasks.add(self._polling_error_task)
                         self._polling_error_task.add_done_callback(self._background_tasks.discard)
                     else:
-                        logger.error("[%s] Telegram polling _redact_telegram_error_text(error): %s", self.name, error, exc_info=True)
+                        safe_error = _redact_telegram_error_text(error)
+                        logger.error(
+                            "[%s] Telegram polling error: %s",
+                            self.name,
+                            safe_error,
+                            exc_info=True,
+                        )
 
                 # Store reference for retry use in _handle_polling_conflict
                 self._polling_error_callback_ref = _polling_error_callback

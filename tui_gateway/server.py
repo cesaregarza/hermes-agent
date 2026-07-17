@@ -5915,7 +5915,10 @@ def _(rid, params: dict) -> dict:
 
     found = db.get_session(target)
     if not found:
-        found = db.get_session_by_title(target)
+        if profile:
+            found = db.get_session_by_title(target, profile_name=profile)
+        else:
+            found = db.get_session_by_title(target)
         if found:
             target = found["id"]
         elif is_truthy_value(params.get("lazy", False)) and _child_run_active(target):

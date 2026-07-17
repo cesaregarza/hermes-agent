@@ -16,6 +16,21 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
+class _ImmediateAsyncSessionStore:
+    """Test facade that preserves sync mocks without executor shutdown threads."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def __getattr__(self, name):
+        operation = getattr(self._store, name)
+
+        async def invoke(*args, **kwargs):
+            return operation(*args, **kwargs)
+
+        return invoke
+
+
 def _make_source(*, thread_id: str | None = None) -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
@@ -115,6 +130,7 @@ def _make_runner(session_db=None):
             origin=None,
         )
     runner.session_store.switch_session = MagicMock(side_effect=_switch_session)
+    runner._async_session_store = _ImmediateAsyncSessionStore(runner.session_store)
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._pending_messages = {}
@@ -539,6 +555,69 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
     )
     assert refreshed is not None
     assert refreshed["session_id"] == "child-session"
+
+
+@pytest.mark.asyncio
+async def test_topic_binding_rejection_keeps_current_lane_and_does_not_rewrite(tmp_path):
+    """A profile-invariant rejection must not attach or bless a foreign row."""
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.create_session(
+        session_id="foreign-parent",
+        source="telegram",
+        user_id="208214988",
+    )
+    session_db.end_session("foreign-parent", end_reason="compression")
+    session_db.create_session(
+        session_id="foreign-child",
+        source="telegram",
+        user_id="208214988",
+        parent_session_id="foreign-parent",
+    )
+    topic_source = _make_source(thread_id="17585")
+    topic_key = build_session_key(topic_source)
+    session_db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=topic_key,
+        session_id="foreign-parent",
+    )
+    binding = session_db.get_telegram_topic_binding(
+        chat_id="208214988",
+        thread_id="17585",
+    )
+    current_entry = SessionEntry(
+        session_key=topic_key,
+        session_id="current-profile-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=topic_source,
+    )
+    runner = _make_runner(session_db=session_db)
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        switch_session=AsyncMock(return_value=None),
+    )
+
+    resolved = await runner._apply_telegram_topic_binding(
+        source=topic_source,
+        session_key=topic_key,
+        session_entry=current_entry,
+        binding=binding,
+    )
+
+    assert resolved is current_entry
+    runner._async_session_store.switch_session.assert_awaited_once_with(
+        topic_key,
+        "foreign-child",
+    )
+    persisted = session_db.get_telegram_topic_binding(
+        chat_id="208214988",
+        thread_id="17585",
+    )
+    assert persisted["session_id"] == "foreign-parent"
 
 
 @pytest.mark.asyncio

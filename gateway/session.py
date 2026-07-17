@@ -255,6 +255,7 @@ class SessionSource:
         return ", ".join(parts)
     
     def to_dict(self) -> Dict[str, Any]:
+        canonicalize_session_source_profiles(self)
         d = {
             "platform": self.platform.value,
             "chat_id": self.chat_id,
@@ -291,7 +292,7 @@ class SessionSource:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionSource":
-        return cls(
+        source = cls(
             platform=Platform(data["platform"]),
             chat_id=str(data["chat_id"]),
             chat_name=data.get("chat_name"),
@@ -311,7 +312,68 @@ class SessionSource:
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
         )
+        return canonicalize_session_source_profiles(source)
     
+
+_RESERVED_SESSION_PROFILE_NAMES = frozenset({"main"})
+"""Profile names reserved by the gateway's colon-delimited wire namespace."""
+
+
+class InvalidGatewayProfileError(ValueError):
+    """A runtime or transport profile is unsafe for gateway routing."""
+
+
+def canonicalize_gateway_profile_name(
+    value: Any,
+    *,
+    field_name: str = "profile",
+) -> Optional[str]:
+    """Return a canonical safe gateway profile name, or ``None`` when absent.
+
+    Gateway session keys reserve ``agent:main`` for the built-in default
+    profile.  Accepting a named profile literally called ``main`` would collapse
+    that profile into the default namespace, so reject it at every ingress even
+    though it is otherwise a valid CLI profile identifier.
+
+    The helper is deliberately used for both the runtime ``profile`` and the
+    wire-invisible ``transport_profile``.  Neither field may contain traversal,
+    mixed-case aliases, reserved system names, or a namespace-conflicting wire
+    literal before it participates in auth, adapter selection, session keying,
+    or profile-home resolution.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    try:
+        canonical = normalize_profile_name(raw)
+        validate_profile_name(canonical)
+    except ValueError as exc:
+        raise InvalidGatewayProfileError(str(exc)) from exc
+    if canonical in _RESERVED_SESSION_PROFILE_NAMES:
+        raise InvalidGatewayProfileError(
+            f"Invalid {field_name} {raw!r}: {canonical!r} is reserved by "
+            "the gateway session wire namespace"
+        )
+    return canonical
+
+
+def canonicalize_session_source_profiles(source: SessionSource) -> SessionSource:
+    """Canonicalize and validate both profile identities on ``source`` in place."""
+    source.profile = canonicalize_gateway_profile_name(
+        getattr(source, "profile", None),
+        field_name="source.profile",
+    )
+    source.transport_profile = canonicalize_gateway_profile_name(
+        getattr(source, "transport_profile", None),
+        field_name="source.transport_profile",
+    )
+    return source
+
 
 
 @dataclass
@@ -832,6 +894,7 @@ def _routing_origin_from_source(source: SessionSource) -> SessionSource:
     and transport-owner markers -- are retained for live routing; their own
     serializers remain responsible for keeping wire-invisible fields off disk.
     """
+    canonicalize_session_source_profiles(source)
     return dataclasses.replace(source, message_id=None)
 
 
@@ -842,8 +905,10 @@ def _routing_transport_from_source(source: SessionSource) -> Optional[str]:
 
 def _routing_transport_profile_from_source(source: SessionSource) -> Optional[str]:
     """Return the trusted local credential owner for a routing origin."""
-    owner = str(getattr(source, "transport_profile", "") or "").strip()
-    return owner or None
+    return canonicalize_gateway_profile_name(
+        getattr(source, "transport_profile", None),
+        field_name="source.transport_profile",
+    )
 
 
 @dataclass
@@ -984,8 +1049,9 @@ class SessionEntry:
         origin_transport = (
             "relay" if data.get("origin_transport") == "relay" else None
         )
-        origin_transport_profile = (
-            str(data.get("origin_transport_profile") or "").strip() or None
+        origin_transport_profile = canonicalize_gateway_profile_name(
+            data.get("origin_transport_profile"),
+            field_name="origin_transport_profile",
         )
         if origin is not None and origin_transport == "relay":
             origin = dataclasses.replace(
@@ -997,6 +1063,7 @@ class SessionEntry:
                 origin,
                 transport_profile=origin_transport_profile,
             )
+            canonicalize_session_source_profiles(origin)
         
         platform = None
         if data.get("platform"):
@@ -1100,6 +1167,10 @@ def _session_key_namespace(profile: Optional[str]) -> str:
       layout, just a different namespace, so two profiles serving the same
       platform/chat never collide.
     """
+    profile = canonicalize_gateway_profile_name(
+        profile,
+        field_name="session profile",
+    )
     if not profile or profile == "default":
         return "agent:main"
     return f"agent:{profile}"
@@ -1543,6 +1614,8 @@ class SessionStore:
         to (``source.profile`` — set by the /p/<profile>/ URL prefix or
         per-credential adapter), falling back to the active profile name.
         """
+        if source is not None:
+            canonicalize_session_source_profiles(source)
         if not getattr(self.config, "multiplex_profiles", False):
             return None
         if source is not None and source.profile:
@@ -2667,7 +2740,210 @@ class SessionStore:
 
         return new_entry
 
-    def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
+    def _multiplex_switch_target_allowed(
+        self,
+        *,
+        session_key: str,
+        target_session_id: str,
+        current_session_id: str,
+        allow_unscoped_target: bool,
+    ) -> bool:
+        """Prove that a switch target belongs to ``session_key``'s profile.
+
+        A multiplex gateway shares one state database across every runtime
+        profile.  Session IDs are therefore not an authorization boundary on
+        their own: every central rebind path (resume, branch, async completion,
+        Telegram topic binding, and CLI handoff) must agree with the profile
+        namespace encoded in the destination key before it can attach a
+        transcript.
+
+        Legacy CLI sessions may have no gateway metadata at all.  The one
+        trusted caller that imports such a session can opt in via
+        ``allow_unscoped_target``; that exception only applies when *all*
+        profile evidence is absent and can never override conflicting evidence.
+        A newly-created, metadata-free branch child is also safe when its DB
+        parent is the session currently bound to this key.
+        """
+        if not getattr(self.config, "multiplex_profiles", False):
+            return True
+
+        requested_profile = self._profile_from_session_key(session_key)
+        try:
+            requested_profile = canonicalize_gateway_profile_name(
+                requested_profile,
+                field_name="switch session-key profile",
+            )
+        except ValueError as exc:
+            logger.warning(
+                "Rejecting multiplex session switch to %s: invalid destination "
+                "profile namespace in %s (%s)",
+                target_session_id,
+                session_key,
+                exc,
+            )
+            return False
+        if requested_profile is None:
+            logger.warning(
+                "Rejecting multiplex session switch to %s: destination key %s "
+                "has no profile namespace",
+                target_session_id,
+                session_key,
+            )
+            return False
+
+        db = getattr(self, "_db", None)
+        getter = getattr(db, "get_session", None) if db is not None else None
+        if not callable(getter):
+            logger.warning(
+                "Rejecting multiplex session switch to %s: target profile "
+                "cannot be verified without the session database",
+                target_session_id,
+            )
+            return False
+        try:
+            target_row = getter(target_session_id)
+        except Exception as exc:
+            logger.warning(
+                "Rejecting multiplex session switch to %s: target lookup failed "
+                "(%s)",
+                target_session_id,
+                exc,
+            )
+            return False
+        if not target_row:
+            logger.warning(
+                "Rejecting multiplex session switch to unknown target %s",
+                target_session_id,
+            )
+            return False
+
+        evidence: Dict[str, str] = {}
+        persisted_key = str(target_row.get("session_key") or "").strip()
+        if persisted_key:
+            persisted_key_profile = self._profile_from_session_key(persisted_key)
+            if persisted_key_profile is None:
+                logger.warning(
+                    "Rejecting multiplex session switch to %s: persisted target "
+                    "key %s has no gateway profile namespace",
+                    target_session_id,
+                    persisted_key,
+                )
+                return False
+            try:
+                evidence["session_key"] = canonicalize_gateway_profile_name(
+                    persisted_key_profile,
+                    field_name="target session-key profile",
+                ) or ""
+            except ValueError as exc:
+                logger.warning(
+                    "Rejecting multiplex session switch to %s: invalid target "
+                    "session-key profile (%s)",
+                    target_session_id,
+                    exc,
+                )
+                return False
+
+        persisted_profile = target_row.get("profile_name")
+        if persisted_profile is not None and str(persisted_profile).strip():
+            try:
+                evidence["profile_name"] = canonicalize_gateway_profile_name(
+                    persisted_profile,
+                    field_name="target profile_name",
+                ) or ""
+            except ValueError as exc:
+                logger.warning(
+                    "Rejecting multiplex session switch to %s: invalid target "
+                    "profile_name (%s)",
+                    target_session_id,
+                    exc,
+                )
+                return False
+
+        persisted_origin = target_row.get("origin_json")
+        if persisted_origin is not None and str(persisted_origin).strip():
+            try:
+                origin_data = (
+                    persisted_origin
+                    if isinstance(persisted_origin, dict)
+                    else json.loads(str(persisted_origin))
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "Rejecting multiplex session switch to %s: malformed target "
+                    "origin metadata (%s)",
+                    target_session_id,
+                    exc,
+                )
+                return False
+            if not isinstance(origin_data, dict):
+                logger.warning(
+                    "Rejecting multiplex session switch to %s: target origin "
+                    "metadata is not an object",
+                    target_session_id,
+                )
+                return False
+            origin_profile = origin_data.get("profile")
+            if origin_profile is not None and str(origin_profile).strip():
+                try:
+                    evidence["origin.profile"] = canonicalize_gateway_profile_name(
+                        origin_profile,
+                        field_name="target origin profile",
+                    ) or ""
+                except ValueError as exc:
+                    logger.warning(
+                        "Rejecting multiplex session switch to %s: invalid target "
+                        "origin profile (%s)",
+                        target_session_id,
+                        exc,
+                    )
+                    return False
+
+        mismatches = {
+            field: value
+            for field, value in evidence.items()
+            if value != requested_profile
+        }
+        if mismatches:
+            logger.warning(
+                "Rejecting multiplex session switch to %s: target profile "
+                "evidence %s does not match destination profile %s",
+                target_session_id,
+                mismatches,
+                requested_profile,
+            )
+            return False
+        if evidence:
+            return True
+
+        # Before multiplexing, gateway/CLI rows carried no profile_name and
+        # often no session_key. Those rows belong to the historical default
+        # namespace (``agent:main``), never to a named profile. Preserve their
+        # resumability for default while still rejecting the same unscoped
+        # target from every named runtime.
+        if requested_profile == "default":
+            return True
+
+        parent_session_id = str(target_row.get("parent_session_id") or "").strip()
+        if parent_session_id == current_session_id:
+            return True
+        if allow_unscoped_target:
+            return True
+
+        logger.warning(
+            "Rejecting multiplex session switch to %s: target has no profile "
+            "evidence or direct lineage from current session %s",
+            target_session_id,
+            current_session_id,
+        )
+        return False
+
+    def switch_session(
+        self,
+        session_key: str,
+        target_session_id: str,
+        *,
+        allow_unscoped_target: bool = False,
+    ) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 
         Used by ``/resume`` to restore a previously-named session.
@@ -2675,6 +2951,11 @@ class SessionStore:
         generating a fresh session ID, re-uses ``target_session_id`` so the
         old transcript is loaded on the next message. If the target session was
         previously ended, re-open it so gateway resume semantics match the CLI.
+
+        When profile multiplexing is enabled, the target's durable profile
+        evidence must agree with the destination key. ``allow_unscoped_target``
+        is reserved for the trusted CLI handoff path and does not bypass an
+        explicit mismatch.
         """
         db_end_session_id = None
         new_entry = None
@@ -2686,6 +2967,14 @@ class SessionStore:
                 return None
 
             old_entry = self._entries[session_key]
+
+            if not self._multiplex_switch_target_allowed(
+                session_key=session_key,
+                target_session_id=target_session_id,
+                current_session_id=old_entry.session_id,
+                allow_unscoped_target=allow_unscoped_target,
+            ):
+                return None
 
             # Don't switch if already on that session
             if old_entry.session_id == target_session_id:

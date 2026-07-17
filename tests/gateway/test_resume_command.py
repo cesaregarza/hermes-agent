@@ -1001,3 +1001,253 @@ class TestSameMatrixRoomThreadScoping:
         row = {"id": "sid_thread_b"}
         caller_thread_a = self._msrc(thread_id="thread-a")
         assert await runner._resume_row_visible(caller_thread_a, row, allow_all=False) is False
+
+
+class TestResumeMultiplexProfileIsolation:
+    """Runtime profiles are an absolute transcript/session boundary."""
+
+    @staticmethod
+    def _src(
+        profile,
+        *,
+        platform=Platform.TELEGRAM,
+        chat_id="chat-a",
+        user_id="alice",
+    ):
+        return SessionSource(
+            platform=platform,
+            chat_id=chat_id,
+            chat_type="group",
+            user_id=user_id,
+            profile=profile,
+        )
+
+    @staticmethod
+    def _multiplex_runner(**kwargs):
+        runner = _make_runner(**kwargs)
+        runner.config.multiplex_profiles = True
+        return runner
+
+    def test_live_origin_requires_exact_profile(self):
+        runner = self._multiplex_runner()
+        caller = self._src("default")
+
+        assert runner._same_origin_chat(caller, self._src("default")) is True
+        assert runner._same_origin_chat(caller, self._src("coder")) is False
+
+    def test_matrix_room_match_requires_exact_profile(self):
+        runner = self._multiplex_runner()
+        caller = self._src("default", platform=Platform.MATRIX)
+
+        assert runner._same_matrix_room(
+            caller,
+            self._src("default", platform=Platform.MATRIX),
+        ) is True
+        assert runner._same_matrix_room(
+            caller,
+            self._src("coder", platform=Platform.MATRIX),
+        ) is False
+
+    @pytest.mark.asyncio
+    async def test_persisted_target_requires_exact_profile(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(
+            "default_row",
+            "telegram",
+            user_id="alice",
+            chat_id="chat-a",
+            chat_type="group",
+            profile_name="default",
+        )
+        db.create_session(
+            "coder_row",
+            "telegram",
+            user_id="alice",
+            chat_id="chat-a",
+            chat_type="group",
+            profile_name="coder",
+        )
+        db.create_session(
+            "legacy_default_row",
+            "telegram",
+            user_id="alice",
+            chat_id="chat-a",
+            chat_type="group",
+        )
+        runner = self._multiplex_runner(session_db=db)
+        runner._gateway_session_origin_for_id = lambda _sid: None
+        caller = self._src("default")
+
+        assert await runner._resume_target_allowed(
+            caller,
+            "default_row",
+            allow_override=False,
+        ) is True
+        assert await runner._resume_target_allowed(
+            caller,
+            "coder_row",
+            allow_override=False,
+        ) is False
+        assert await runner._resume_target_allowed(
+            caller,
+            "legacy_default_row",
+            allow_override=False,
+        ) is True
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_title_resolution_stays_in_caller_profile(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        for session_id, profile_name in (
+            ("default_project", None),
+            ("coder_project", "coder"),
+        ):
+            db.create_session(
+                session_id,
+                "telegram",
+                user_id="alice",
+                chat_id="chat-a",
+                chat_type="group",
+                profile_name=profile_name,
+            )
+            db.set_session_title(session_id, "Shared Project")
+        assert db.resolve_session_by_title("Shared Project") == "default_project"
+        assert db.get_session_by_title("Shared Project")["id"] == "default_project"
+        assert [
+            row["id"] for row in db.list_sessions_rich(profile_name="default")
+        ] == ["default_project"]
+        event = _make_event(
+            text="/resume Shared Project",
+            user_id="alice",
+            chat_id="chat-a",
+        )
+        event.source.chat_type = "group"
+        event.source.profile = "default"
+        runner = self._multiplex_runner(session_db=db, event=event)
+        runner._gateway_session_origin_for_id = lambda _sid: None
+
+        result = await runner._handle_resume_command(event)
+
+        assert "Resumed" in result
+        runner.session_store.switch_session.assert_called_once_with(
+            build_session_key(event.source),
+            "default_project",
+        )
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_admin_override_cannot_cross_profile(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(
+            "coder_row",
+            "telegram",
+            user_id="alice",
+            chat_id="chat-a",
+            chat_type="group",
+            profile_name="coder",
+        )
+        runner = self._multiplex_runner(session_db=db)
+        runner._gateway_session_origin_for_id = lambda _sid: None
+        runner._resume_caller_is_admin = lambda _source: True
+
+        assert await runner._resume_target_allowed(
+            self._src("default"),
+            "coder_row",
+            allow_override=True,
+        ) is False
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_listing_hides_other_profile(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(
+            "default_row",
+            "telegram",
+            user_id="alice",
+            chat_id="chat-a",
+            chat_type="group",
+            profile_name="default",
+        )
+        db.create_session(
+            "coder_row",
+            "telegram",
+            user_id="alice",
+            chat_id="chat-a",
+            chat_type="group",
+            profile_name="coder",
+        )
+        runner = self._multiplex_runner(session_db=db)
+        runner._gateway_session_origin_for_id = lambda _sid: None
+        caller = self._src("default")
+
+        assert await runner._resume_row_visible(
+            caller,
+            {"id": "default_row", "profile_name": "default"},
+            allow_all=False,
+        ) is True
+        assert await runner._resume_row_visible(
+            caller,
+            {"id": "coder_row", "profile_name": "coder"},
+            allow_all=False,
+        ) is False
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_cross_room_flag_cannot_cross_profile(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(
+            "coder_matrix",
+            "matrix",
+            user_id="@alice:hs",
+            chat_id="!room-b:hs",
+            chat_type="group",
+            profile_name="coder",
+        )
+        db.set_session_title("coder_matrix", "Coder Work")
+        event = _make_event(
+            text="/resume --cross-room Coder Work",
+            platform=Platform.MATRIX,
+            user_id="@alice:hs",
+            chat_id="!room-a:hs",
+        )
+        event.source.chat_type = "group"
+        event.source.profile = "default"
+        runner = self._multiplex_runner(session_db=db, event=event)
+        runner._gateway_session_origin_for_id = lambda _sid: self._src(
+            "coder",
+            platform=Platform.MATRIX,
+            chat_id="!room-b:hs",
+            user_id="@alice:hs",
+        )
+
+        result = await runner._handle_resume_command(event)
+
+        assert "Resumed" not in result
+        runner.session_store.switch_session.assert_not_called()
+        db.close()
+
+    def test_invalid_profile_stamp_fails_closed(self):
+        runner = self._multiplex_runner()
+
+        assert runner._same_origin_chat(
+            self._src("../coder"),
+            self._src("../coder"),
+        ) is False
+        assert runner._same_origin_chat(
+            self._src("root"),
+            self._src("root"),
+        ) is False
+        assert runner._same_origin_chat(
+            self._src("main"),
+            self._src("main"),
+        ) is False

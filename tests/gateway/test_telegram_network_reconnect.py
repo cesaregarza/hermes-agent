@@ -876,6 +876,41 @@ def test_polling_error_callback_uses_shared_network_classifier():
     assert _calls_shared_network_classifier(callbacks[0])
 
 
+def test_polling_error_callback_redacts_errors_before_logging():
+    source = Path(TelegramAdapter.connect.__code__.co_filename).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    callback = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_polling_error_callback"
+    )
+
+    redacted_assignments = [
+        node
+        for node in ast.walk(callback)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "_redact_telegram_error_text"
+    ]
+    assert len(redacted_assignments) == 2
+
+    log_calls = [
+        node
+        for node in ast.walk(callback)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "logger"
+    ]
+    assert len(log_calls) == 2
+    assert all(
+        not any(isinstance(arg, ast.Name) and arg.id == "error" for arg in call.args)
+        for call in log_calls
+    )
+
+
 def test_connect_initialize_retry_uses_shared_network_classifier():
     source = Path(TelegramAdapter.connect.__code__.co_filename).read_text(encoding="utf-8")
     tree = ast.parse(source)

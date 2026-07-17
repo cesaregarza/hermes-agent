@@ -3844,6 +3844,41 @@ class TestTitleUniqueness:
         # Should not raise — it's the same session
         assert db.set_session_title("s1", "my project") is True
 
+    def test_same_title_isolated_by_profile(self, db, monkeypatch):
+        db.create_session("default", "cli")
+        db.create_session("coder", "cli", profile_name="coder")
+        db.set_session_title("default", "my project")
+        db.set_session_title("coder", "my project")
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "coder",
+        )
+        assert db.get_session_by_title("my project")["id"] == "coder"
+        assert db.resolve_session_by_title("my project") == "coder"
+        assert db.get_session_by_title(
+            "my project",
+            profile_name="default",
+        )["id"] == "default"
+
+    def test_legacy_null_and_explicit_default_share_title_namespace(self, db):
+        db.create_session("legacy", "cli")
+        db.create_session("explicit", "cli", profile_name="default")
+        db.set_session_title("legacy", "my project")
+
+        with pytest.raises(ValueError, match="already in use"):
+            db.set_session_title("explicit", "my project")
+
+    def test_omitted_profile_metadata_is_filled_for_named_home(self, db, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "coder",
+        )
+
+        db.create_session("named", "cli")
+
+        assert db.get_session("named")["profile_name"] == "coder"
+
     def test_null_titles_not_unique(self, db):
         """Multiple sessions can have NULL titles (no constraint violation)."""
         db.create_session("s1", "cli")

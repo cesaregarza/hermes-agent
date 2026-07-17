@@ -439,8 +439,8 @@ def test_adapter_auth_check_stamps_secondary_profile(monkeypatch):
     assert captured["profile"] == "coder"
 
 
-def test_adapter_auth_check_defaults_to_active_profile(monkeypatch):
-    """Primary-adapter callbacks (no profile_name) still resolve the active profile."""
+def test_adapter_auth_check_defaults_to_primary_profile(monkeypatch):
+    """Primary callbacks pin their runtime when no route overrides it."""
     from gateway.run import GatewayRunner
 
     _clear_auth_env(monkeypatch)
@@ -458,7 +458,7 @@ def test_adapter_auth_check_defaults_to_active_profile(monkeypatch):
 
     check = runner._make_adapter_auth_check(Platform.WECOM)
     assert check("some-user", "dm", "dm-chat") is True
-    assert captured["profile"] is None
+    assert captured["profile"] == "default"
 
 
 def test_secondary_open_policy_fails_startup_guard(monkeypatch):

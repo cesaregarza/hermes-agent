@@ -5119,6 +5119,14 @@ class DiscordAdapter(BasePlatformAdapter):
                         author_id,
                         chat_type="thread" if is_thread_channel else "group",
                         chat_id=channel_id,
+                        scope_id=(
+                            str(getattr(getattr(channel, "guild", None), "id", ""))
+                            or None
+                        ),
+                        thread_id=channel_id if is_thread_channel else None,
+                        parent_chat_id=(
+                            str(getattr(channel, "parent_id", "") or "") or None
+                        ) if is_thread_channel else None,
                     )
                     if is_authorized is False:
                         trust_tag = "[unverified] "

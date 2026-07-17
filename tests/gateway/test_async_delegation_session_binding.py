@@ -9,6 +9,7 @@ Three invariants on the messaging-gateway surface, mirroring the TUI rules:
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -77,46 +78,43 @@ class TestGatewayPinningFailsClosed:
         entry.session_id = "sess_current"
         runner.session_store = MagicMock()
         runner.session_store.get_or_create_session.return_value = entry
-        runner.session_store.switch_session.return_value = entry
+        runner._async_session_store = SimpleNamespace(
+            _store=runner.session_store,
+            switch_session=AsyncMock(return_value=entry),
+        )
         return runner, entry
 
-    def _run_pinning_prefix(self, runner, pinned_session_id):
-        """Execute the pinning guard logic exactly as _handle_message does."""
-
-        async def _go():
-            event = MagicMock()
-            event.metadata = {"gateway_session_id": pinned_session_id}
-            session_entry = runner.session_store.get_or_create_session(MagicMock())
-            pinned = str((getattr(event, "metadata", None) or {}).get("gateway_session_id") or "").strip()
-            if pinned and pinned != session_entry.session_id:
-                pinned_row = None
-                try:
-                    if runner._session_db is not None:
-                        pinned_row = await runner._session_db.get_session(pinned)
-                except Exception:
-                    pinned_row = None
-                if pinned_row is None or pinned_row.get("ended_at"):
-                    return "dropped"
-                switched = runner.session_store.switch_session(session_entry.session_key, pinned)
-                if switched is not None:
-                    return "pinned"
-            return "default"
-
-        return asyncio.run(_go())
+    @staticmethod
+    def _run_pinning_guard(runner, entry, pinned_session_id):
+        return asyncio.run(
+            runner._switch_to_live_pinned_session(entry, pinned_session_id)
+        )
 
     def test_live_spawning_session_pins(self):
-        runner, _ = self._make_runner({"id": "sess_old", "ended_at": None})
-        assert self._run_pinning_prefix(runner, "sess_old") == "pinned"
+        runner, entry = self._make_runner({"id": "sess_old", "ended_at": None})
+        assert self._run_pinning_guard(runner, entry, "sess_old") is entry
 
     def test_ended_spawning_session_drops(self):
-        runner, _ = self._make_runner({"id": "sess_old", "ended_at": "2026-07-08T00:00:00"})
-        assert self._run_pinning_prefix(runner, "sess_old") == "dropped"
-        runner.session_store.switch_session.assert_not_called()
+        runner, entry = self._make_runner(
+            {"id": "sess_old", "ended_at": "2026-07-08T00:00:00"}
+        )
+        assert self._run_pinning_guard(runner, entry, "sess_old") is None
+        runner._async_session_store.switch_session.assert_not_awaited()
 
     def test_unknown_spawning_session_drops(self):
-        runner, _ = self._make_runner(None)
-        assert self._run_pinning_prefix(runner, "sess_gone") == "dropped"
-        runner.session_store.switch_session.assert_not_called()
+        runner, entry = self._make_runner(None)
+        assert self._run_pinning_guard(runner, entry, "sess_gone") is None
+        runner._async_session_store.switch_session.assert_not_awaited()
+
+    def test_profile_invariant_rejection_drops_instead_of_rerouting(self):
+        runner, entry = self._make_runner({"id": "sess_other", "ended_at": None})
+        runner._async_session_store.switch_session.return_value = None
+
+        assert self._run_pinning_guard(runner, entry, "sess_other") is None
+        runner._async_session_store.switch_session.assert_awaited_once_with(
+            entry.session_key,
+            "sess_other",
+        )
 
 
 class TestResetHandlerInterruptsDelegations:

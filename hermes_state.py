@@ -1777,12 +1777,24 @@ class SessionDB:
                     (SCHEMA_VERSION,),
                 )
 
-        # Unique title index — always ensure it exists. Older databases may
-        # contain duplicate aliases from before the constraint was enforced;
-        # preserve every session while letting the newest one retain the alias.
+        # Session titles are unique within one runtime profile. Multiplexed
+        # profiles share this database, so a global title constraint would let
+        # one profile reserve names in every other profile. NULL is the legacy
+        # spelling of the default profile and must collide with explicit
+        # ``default`` rows to preserve single-profile behavior.
+        existing_title_index = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_sessions_title_unique'"
+        ).fetchone()
+        if (
+            existing_title_index
+            and "COALESCE(profile_name" not in str(existing_title_index["sql"] or "")
+        ):
+            cursor.execute("DROP INDEX idx_sessions_title_unique")
         title_index_sql = (
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
-            "ON sessions(title) WHERE title IS NOT NULL"
+            "ON sessions(title, COALESCE(profile_name, 'default')) "
+            "WHERE title IS NOT NULL"
         )
         try:
             cursor.execute(title_index_sql)
@@ -1797,6 +1809,8 @@ class SessionDB:
                          AND EXISTS (
                              SELECT 1 FROM sessions AS newer
                              WHERE newer.title = older.title
+                               AND COALESCE(newer.profile_name, 'default') =
+                                   COALESCE(older.profile_name, 'default')
                                AND newer.rowid > older.rowid
                          )"""
                 )
@@ -1874,6 +1888,21 @@ class SessionDB:
         switching to it (IDOR scoping — without them the ``sessions`` table has
         no chat/thread to compare).
         """
+        # Older call sites predate the profile_name column (compression/branch
+        # helpers in particular). A named profile's HERMES_HOME is authoritative
+        # local context, so fill that metadata centrally when omitted. Keep the
+        # default profile as NULL for on-disk backward compatibility; reads
+        # consistently interpret NULL as ``default``.
+        if profile_name is None:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                active_profile = get_active_profile_name()
+                if active_profile and active_profile != "default":
+                    profile_name = active_profile
+            except Exception:
+                pass
+
         def _do(conn):
             conn.execute(
                 """INSERT INTO sessions (
@@ -3233,9 +3262,18 @@ class SessionDB:
         title = self.sanitize_title(title)
         def _do(conn):
             if title:
-                # Check uniqueness (allow the same session to keep its own title)
+                # Check uniqueness within the target session's runtime profile
+                # (allow the same session to keep its own title). Legacy NULL
+                # profile rows share the explicit ``default`` namespace.
                 cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
+                    """SELECT other.id
+                       FROM sessions AS target
+                       JOIN sessions AS other
+                         ON other.title = ?
+                        AND other.id != target.id
+                        AND COALESCE(other.profile_name, 'default') =
+                            COALESCE(target.profile_name, 'default')
+                       WHERE target.id = ?""",
                     (title, session_id),
                 )
                 conflict = cursor.fetchone()
@@ -3279,6 +3317,24 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return row["title"] if row else None
+
+    @staticmethod
+    def _title_profile_scope(profile_name: str = None) -> str:
+        """Return the profile boundary for title-based operations.
+
+        Once titles are unique per profile, an unscoped lookup is ambiguous.
+        Existing CLI/TUI/tool callers omit the optional argument, so bind that
+        compatibility path to the current HERMES_HOME profile rather than
+        silently searching every multiplex runtime.
+        """
+        if profile_name is not None and str(profile_name).strip():
+            return str(profile_name).strip()
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            return get_active_profile_name() or "default"
+        except Exception:
+            return "default"
 
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
         """Archive or unarchive a session.
@@ -3330,35 +3386,58 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
+    def get_session_by_title(
+        self,
+        title: str,
+        profile_name: str = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up an exact title in one profile (the active profile by default)."""
+        profile_scope = self._title_profile_scope(profile_name)
+        query = (
+            "SELECT * FROM sessions WHERE title = ? "
+            "AND COALESCE(profile_name, 'default') = COALESCE(?, 'default')"
+        )
+        params: tuple[Any, ...] = (title, profile_scope)
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE title = ?", (title,)
-            )
+            cursor = self._conn.execute(query, params)
             row = cursor.fetchone()
         return dict(row) if row else None
 
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
+    def resolve_session_by_title(
+        self,
+        title: str,
+        profile_name: str = None,
+    ) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.
 
         If the exact title exists, returns that session's ID.
         If not, searches for "title #N" variants and returns the latest one.
         If the exact title exists AND numbered variants exist, returns the
         latest numbered variant (the most recent continuation).
+
+        ``profile_name`` restricts both lookups to one multiplex runtime so an
+        identically titled session in another profile cannot shadow the
+        caller's own conversation.
         """
         # First try exact match
-        exact = self.get_session_by_title(title)
+        profile_scope = self._title_profile_scope(profile_name)
+        exact = self.get_session_by_title(title, profile_name=profile_scope)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        query = (
+            "SELECT id, title, started_at FROM sessions "
+            "WHERE title LIKE ? ESCAPE '\\'"
+        )
+        query += (
+            " AND COALESCE(profile_name, 'default') = "
+            "COALESCE(?, 'default')"
+        )
+        params: tuple[Any, ...] = (f"{escaped} #%", profile_scope)
+        query += " ORDER BY started_at DESC"
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
-            )
+            cursor = self._conn.execute(query, params)
             numbered = cursor.fetchall()
 
         if numbered:
@@ -3368,11 +3447,16 @@ class SessionDB:
             return exact["id"]
         return None
 
-    def get_next_title_in_lineage(self, base_title: str) -> str:
+    def get_next_title_in_lineage(
+        self,
+        base_title: str,
+        profile_name: str = None,
+    ) -> str:
         """Generate the next title in a lineage (e.g., "my session" → "my session #2").
 
         Strips any existing " #N" suffix to find the base name, then finds
-        the highest existing number and increments.
+        the highest existing number and increments. When ``profile_name`` is
+        provided, names in other multiplex runtimes do not consume suffixes.
         """
         # Strip existing #N suffix to find the true base
         match = re.match(r'^(.*?) #(\d+)$', base_title)
@@ -3384,11 +3468,18 @@ class SessionDB:
         # Find all existing numbered variants
         # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
         escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        query = (
+            "SELECT title FROM sessions "
+            "WHERE (title = ? OR title LIKE ? ESCAPE '\\')"
+        )
+        profile_scope = self._title_profile_scope(profile_name)
+        query += (
+            " AND COALESCE(profile_name, 'default') = "
+            "COALESCE(?, 'default')"
+        )
+        params: tuple[Any, ...] = (base, f"{escaped} #%", profile_scope)
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
-                (base, f"{escaped} #%"),
-            )
+            cursor = self._conn.execute(query, params)
             existing = [row["title"] for row in cursor.fetchall()]
 
         if not existing:
@@ -3530,6 +3621,7 @@ class SessionDB:
         id_query: str = None,
         search_query: str = None,
         compact_rows: bool = False,
+        profile_name: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -3594,6 +3686,11 @@ class SessionDB:
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
+        if profile_name is not None:
+            where_clauses.append(
+                "COALESCE(s.profile_name, 'default') = COALESCE(?, 'default')"
+            )
+            params.append(profile_name)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")

@@ -354,6 +354,42 @@ class TestGatewayRunnerInjection:
         assert hasattr(_ToyAdapter, "gateway_runner")
         assert _ToyAdapter.gateway_runner is None
 
+    def test_real_signal_primary_receives_runner_and_applies_profile_route(self):
+        """Built-in adapters bypass the plugin injection branch but still route."""
+        from gateway.config import GatewayConfig
+        from gateway.platforms.signal import SignalAdapter
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.config.profile_routes = [
+            ProfileRoute(
+                name="signal-ops",
+                platform="signal",
+                profile="ops",
+                chat_id="signal-chat",
+            )
+        ]
+        runner._primary_profile_name = "default"
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "http_url": "http://127.0.0.1:8080",
+                "account": "+15551234567",
+            },
+        )
+
+        adapter = runner._create_primary_adapter(Platform.SIGNAL, config)
+        source = adapter.build_source(
+            chat_id="signal-chat",
+            chat_type="dm",
+            user_id="signal-user",
+        )
+
+        assert isinstance(adapter, SignalAdapter)
+        assert adapter.gateway_runner is runner
+        assert source.profile == "ops"
+        assert source.transport_profile == "default"
+
 
 # A concrete adapter we can instantiate without the full platform stack.
 # ``build_source`` only reads ``self.platform`` and ``self.gateway_runner``, so a
@@ -691,6 +727,147 @@ class TestStrictMultiplexProfileResolution:
             )
 
         runner._run_agent_inner.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unknown_background_profile_never_enters_agent(
+        self,
+        profile_env,
+    ):
+        from gateway.config import GatewayConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._run_background_task_inner = AsyncMock()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="unknown-background-profile",
+            user_id="attacker",
+            profile="does-not-exist",
+            transport_profile="default",
+        )
+
+        with pytest.raises(LookupError, match="does-not-exist"):
+            await runner._run_background_task(
+                "background prompt",
+                source,
+                "task-unknown",
+            )
+
+        runner._run_background_task_inner.assert_not_awaited()
+
+
+class TestProfileIdentityValidationBoundary:
+    def test_wire_source_profile_is_canonicalized(self):
+        source = SessionSource.from_dict(
+            {
+                "platform": "telegram",
+                "chat_id": "wire-profile",
+                "profile": "Coder",
+            }
+        )
+
+        assert source.profile == "coder"
+
+    @pytest.mark.parametrize("profile", ["main", "../escape", "root"])
+    def test_wire_source_rejects_reserved_or_unsafe_profile(self, profile):
+        with pytest.raises(ValueError):
+            SessionSource.from_dict(
+                {
+                    "platform": "telegram",
+                    "chat_id": "wire-profile",
+                    "profile": profile,
+                }
+            )
+
+    @pytest.mark.asyncio
+    async def test_base_adapter_rejects_invalid_profile_before_session_guard(
+        self,
+        inline_to_thread,
+    ):
+        adapter, started, busy = (
+            TestAdapterToSessionKeyIntegration._active_guard_adapter()
+        )
+        event = MessageEvent(
+            text="unsafe",
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="profile-boundary",
+                user_id="user-1",
+                profile="../../escape",
+            ),
+        )
+
+        await adapter.handle_message(event)
+
+        assert started == []
+        assert busy == []
+        adapter._message_handler.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("profile", "../escape"),
+            ("profile", "main"),
+            ("transport_profile", "root"),
+            ("transport_profile", "../../primary"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_runner_rejects_invalid_profile_before_authorization(
+        self,
+        field,
+        value,
+    ):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._is_user_authorized = MagicMock(return_value=True)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="profile-boundary",
+            user_id="user-1",
+        )
+        setattr(source, field, value)
+
+        result = await runner._handle_message(
+            MessageEvent(text="hello", source=source)
+        )
+
+        assert result is None
+        runner._is_user_authorized.assert_not_called()
+
+    def test_session_key_boundary_canonicalizes_both_profile_identities(self):
+        from gateway.config import GatewayConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="canonical-profile",
+            user_id="user-1",
+            profile="Coder",
+            transport_profile="Default",
+        )
+
+        key = runner._session_key_for_source(source)
+
+        assert key == "agent:coder:telegram:dm:canonical-profile"
+        assert source.profile == "coder"
+        assert source.transport_profile == "default"
+
+    @pytest.mark.parametrize("profile", ["main", "../coder", "root"])
+    def test_session_key_boundary_rejects_reserved_or_unsafe_profile(self, profile):
+        from gateway.config import GatewayConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="invalid-profile",
+            user_id="user-1",
+            profile=profile,
+        )
+
+        with pytest.raises(ValueError):
+            runner._session_key_for_source(source)
 
 
 class TestMultiplexGate:

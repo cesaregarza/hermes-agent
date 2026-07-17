@@ -571,6 +571,81 @@ def test_build_process_event_source_uses_coherent_store_provenance_snapshot(
     assert source.delivered_via_upstream_relay is True
 
 
+@pytest.mark.asyncio
+async def test_multiplex_process_fallback_without_transport_provenance_fails_closed(
+    monkeypatch,
+    tmp_path,
+):
+    """A runtime namespace cannot identify which bot received the parent turn."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.config.multiplex_profiles = True
+    runner._primary_profile_name = "default"
+    primary = SimpleNamespace(handle_message=AsyncMock())
+    secondary = SimpleNamespace(handle_message=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: primary}
+    runner._profile_adapters = {
+        "coder": {Platform.TELEGRAM: secondary},
+    }
+
+    accepted = await runner._inject_watch_notification(
+        "[SYSTEM: ambiguous completion]",
+        {
+            "session_id": "proc-ambiguous",
+            "session_key": "agent:coder:telegram:dm:shared-chat",
+        },
+    )
+
+    assert accepted is None
+    primary.handle_message.assert_not_awaited()
+    secondary.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shared_primary_routed_completion_uses_durable_transport_owner(
+    monkeypatch,
+    tmp_path,
+):
+    """Runtime coder traffic received by the shared bot must reply via that bot."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.config.multiplex_profiles = True
+    runner._primary_profile_name = "default"
+    primary = SimpleNamespace(handle_message=AsyncMock())
+    secondary = SimpleNamespace(handle_message=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: primary}
+    runner._profile_adapters = {
+        "coder": {Platform.TELEGRAM: secondary},
+    }
+    monkeypatch.setattr(
+        runner.session_store,
+        "routing_source_snapshot",
+        lambda _key: SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="shared-chat",
+            chat_type="dm",
+            user_id="operator",
+            profile="coder",
+            transport_profile="default",
+        ),
+    )
+
+    accepted = await runner._inject_watch_notification(
+        "[SYSTEM: routed completion]",
+        {
+            "session_id": "proc-shared-primary",
+            "session_key": "agent:coder:telegram:dm:shared-chat",
+        },
+    )
+
+    assert accepted is True
+    primary.handle_message.assert_awaited_once()
+    secondary.handle_message.assert_not_awaited()
+    event = primary.handle_message.await_args.args[0]
+    assert event.source.profile == "coder"
+    assert event.source.transport_profile == "default"
+
+
 def test_process_event_preserves_alt_id_for_same_signal_sender(monkeypatch, tmp_path):
     """A watcher overlay must not move a Signal turn out of its UUID lane."""
     from gateway.session import SessionSource

@@ -191,7 +191,16 @@ async def test_session_messages_follow_compression_tip(adapter, session_db):
 
 @pytest.mark.asyncio
 async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, session_db):
-    source_id = session_db.create_session("source-session", "api_server", model="test-model")
+    source_id = session_db.create_session(
+        "source-session",
+        "api_server",
+        model="test-model",
+        session_key="agent:coder:api:dm:chat-1",
+        user_id="alice",
+        chat_id="chat-1",
+        chat_type="dm",
+        profile_name="coder",
+    )
     session_db.set_session_title(source_id, "Original")
     session_db.append_message(source_id, "user", "first path")
     session_db.append_message(source_id, "assistant", "answer")
@@ -207,6 +216,11 @@ async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, se
     assert fork["id"] != source_id
     assert fork["parent_session_id"] == source_id
     assert fork["title"] == "Alternative"
+    fork_row = session_db.get_session(fork["id"])
+    assert fork_row["profile_name"] == "coder"
+    assert fork_row["session_key"] == "agent:coder:api:dm:chat-1"
+    assert fork_row["user_id"] == "alice"
+    assert fork_row["chat_id"] == "chat-1"
     assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path", "answer"]
     assert session_db.get_session(source_id)["end_reason"] == "branched"
 
