@@ -16,6 +16,7 @@ from gateway.session import (
     canonical_whatsapp_identifier,
     neutralize_untrusted_inline_text,
 )
+from session_profile_evidence import QUARANTINED_SESSION_PROFILE
 
 # Legacy name preserved for these tests; product renamed the function to
 # canonical_whatsapp_identifier.  Keep the tests referencing the old name
@@ -759,7 +760,11 @@ class TestSessionStoreSwitchSession:
             store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
         if store._db is not None:
             store._db.close()
-        db = SessionDB(db_path=tmp_path / "state.db")
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value=profile,
+        ):
+            db = SessionDB(db_path=tmp_path / "state.db")
         store._db = db
         store._loaded = True
         source = SessionSource(
@@ -823,6 +828,87 @@ class TestSessionStoreSwitchSession:
         assert switched.session_id == target_id
         db.close()
 
+    def test_multiplex_switch_preserves_explicit_evidence_on_null_profile(
+        self,
+        tmp_path,
+    ):
+        store, db, current = self._multiplex_store(tmp_path)
+        db._conn.execute(
+            "INSERT INTO sessions "
+            "(id, source, session_key, profile_name, started_at) "
+            "VALUES ('key-evidence', 'telegram', "
+            "'agent:ops:telegram:dm:other', NULL, 1)"
+        )
+        db._conn.execute(
+            "INSERT INTO sessions "
+            "(id, source, origin_json, profile_name, started_at) "
+            "VALUES ('origin-evidence', 'telegram', ?, NULL, 2)",
+            (json.dumps({"profile": "ops"}),),
+        )
+
+        by_key = store.switch_session(current.session_key, "key-evidence")
+        assert by_key is not None
+        assert by_key.session_id == "key-evidence"
+
+        by_origin = store.switch_session(current.session_key, "origin-evidence")
+        assert by_origin is not None
+        assert by_origin.session_id == "origin-evidence"
+        db.close()
+
+    def test_multiplex_switch_uses_reopened_profile_evidence_classification(
+        self,
+        tmp_path,
+    ):
+        store, db, current = self._multiplex_store(tmp_path)
+        db._conn.executemany(
+            "INSERT INTO sessions "
+            "(id, source, session_key, origin_json, profile_name, started_at) "
+            "VALUES (?, 'telegram', ?, ?, NULL, 1)",
+            (
+                ("legacy-main", "agent:main:telegram:dm:a", None),
+                (
+                    "secondary",
+                    "agent:coder:telegram:dm:b",
+                    json.dumps({"profile": "coder"}),
+                ),
+                (
+                    "conflicting",
+                    "agent:coder:telegram:dm:c",
+                    json.dumps({"profile": "writer"}),
+                ),
+            ),
+        )
+        db.close()
+        with patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="ops",
+        ):
+            from hermes_state import SessionDB
+
+            reopened = SessionDB(db_path=tmp_path / "state.db")
+        store._db = reopened
+
+        resumed_primary = store.switch_session(current.session_key, "legacy-main")
+        assert resumed_primary is not None
+        assert resumed_primary.session_id == "legacy-main"
+
+        coder = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="chat-coder",
+                chat_type="dm",
+                user_id="user-1",
+                profile="coder",
+            )
+        )
+        resumed_secondary = store.switch_session(coder.session_key, "secondary")
+        assert resumed_secondary is not None
+        assert resumed_secondary.session_id == "secondary"
+
+        assert store.switch_session(coder.session_key, "conflicting") is None
+        assert store.switch_session(current.session_key, "conflicting") is None
+        reopened.close()
+
     def test_multiplex_switch_rejects_sibling_profile_without_mutation(self, tmp_path):
         store, db, current = self._multiplex_store(tmp_path)
         target_id = "default-session"
@@ -854,13 +940,40 @@ class TestSessionStoreSwitchSession:
         assert store.peek_session_id(current.session_key) == current.session_id
         db.close()
 
-    def test_multiplex_switch_accepts_unscoped_direct_branch_child(self, tmp_path):
+    @pytest.mark.parametrize(
+        "malformed_key",
+        (
+            "agent::telegram:dm:other",
+            "agent:default:telegram:dm:other",
+            "agent:Ops:telegram:dm:other",
+        ),
+    )
+    def test_multiplex_switch_rejects_noncanonical_session_key_evidence(
+        self,
+        tmp_path,
+        malformed_key,
+    ):
         store, db, current = self._multiplex_store(tmp_path)
-        target_id = "new-branch-child"
+        target_id = "malformed-key-session"
         db.create_session(
             target_id,
             source="telegram",
-            parent_session_id=current.session_id,
+            session_key=malformed_key,
+            profile_name="ops",
+        )
+
+        assert store.switch_session(current.session_key, target_id) is None
+        assert store.peek_session_id(current.session_key) == current.session_id
+        db.close()
+
+    def test_multiplex_switch_accepts_unscoped_direct_branch_child(self, tmp_path):
+        store, db, current = self._multiplex_store(tmp_path)
+        target_id = "new-branch-child"
+        db._conn.execute(
+            "INSERT INTO sessions "
+            "(id, source, parent_session_id, profile_name, started_at) "
+            "VALUES (?, 'telegram', ?, NULL, 1)",
+            (target_id, current.session_id),
         )
 
         switched = store.switch_session(current.session_key, target_id)
@@ -880,18 +993,54 @@ class TestSessionStoreSwitchSession:
         assert switched.session_id == legacy_id
         db.close()
 
-    def test_trusted_unscoped_exception_never_overrides_mismatch(self, tmp_path):
+    def test_named_primary_owns_legacy_target_and_other_profiles_cannot_switch(
+        self,
+        tmp_path,
+    ):
         store, db, current = self._multiplex_store(tmp_path)
         legacy_cli_id = "legacy-cli-session"
-        db.create_session(legacy_cli_id, source="cli")
+        db._conn.execute(
+            "INSERT INTO sessions (id, source, profile_name, started_at) "
+            "VALUES (?, 'cli', NULL, 1)",
+            (legacy_cli_id,),
+        )
 
-        assert store.switch_session(current.session_key, legacy_cli_id) is None
+        default_entry = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="chat-default",
+                chat_type="dm",
+                user_id="user-1",
+                profile="default",
+            )
+        )
+        other_entry = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="chat-other",
+                chat_type="dm",
+                user_id="user-1",
+                profile="other",
+            )
+        )
+
         switched = store.switch_session(
             current.session_key,
             legacy_cli_id,
-            allow_unscoped_target=True,
         )
         assert switched is not None
+        assert store.switch_session(
+            default_entry.session_key,
+            legacy_cli_id,
+            allow_unscoped_target=True,
+        ) is None
+        assert store.switch_session(
+            other_entry.session_key,
+            legacy_cli_id,
+            allow_unscoped_target=True,
+        ) is None
+        assert store.peek_session_id(default_entry.session_key) == default_entry.session_id
+        assert store.peek_session_id(other_entry.session_key) == other_entry.session_id
 
         mismatch_id = "default-cli-session"
         db.create_session(
@@ -1784,6 +1933,34 @@ class TestRewriteTranscriptPreservesReasoning:
 
 
 class TestGatewaySessionDbRecovery:
+    @staticmethod
+    def _multiplex_store(tmp_path, monkeypatch, *, primary="ops"):
+        import hermes_state
+
+        monkeypatch.setattr(
+            hermes_state,
+            "DEFAULT_DB_PATH",
+            tmp_path / "state.db",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: primary,
+        )
+        return SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(multiplex_profiles=True),
+        )
+
+    @staticmethod
+    def _multiplex_source(profile):
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+            profile=profile,
+        )
+
     def test_new_session_records_gateway_peer_fields(self, tmp_path):
         store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
         source = SessionSource(
@@ -1824,6 +2001,112 @@ class TestGatewaySessionDbRecovery:
         assert recovered.session_id == entry.session_id
         assert recovered.session_key == entry.session_key
         assert recovered_store.load_transcript(recovered.session_id)[0]["content"] == "before restart"
+
+    def test_multiplex_exact_key_recovery_rejects_quarantined_conflict(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        store = self._multiplex_store(tmp_path, monkeypatch)
+        source = self._multiplex_source("ops")
+        session_key = store._generate_session_key(source)
+        store._db._conn.execute(
+            """INSERT INTO sessions (
+                   id, source, user_id, session_key, chat_id, chat_type,
+                   origin_json, profile_name, started_at, message_count
+               ) VALUES (
+                   'conflicting-exact', 'telegram', 'user-1', ?, 'chat-1',
+                   'dm', ?, NULL, 1, 1
+               )""",
+            (session_key, json.dumps({"profile": "writer"})),
+        )
+        store._db.close()
+        (tmp_path / "sessions.json").unlink(missing_ok=True)
+
+        recovered_store = self._multiplex_store(tmp_path, monkeypatch)
+        recovered = recovered_store.get_or_create_session(source)
+
+        assert recovered.session_id != "conflicting-exact"
+        assert (
+            recovered_store._db.get_session("conflicting-exact")["profile_name"]
+            == QUARANTINED_SESSION_PROFILE
+        )
+        recovered_store._db.close()
+
+    def test_multiplex_tuple_recovery_rejects_quarantined_conflict(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        store = self._multiplex_store(tmp_path, monkeypatch)
+        source = self._multiplex_source("ops")
+        store._db._conn.execute(
+            """INSERT INTO sessions (
+                   id, source, user_id, session_key, chat_id, chat_type,
+                   origin_json, profile_name, started_at, message_count
+               ) VALUES (
+                   'conflicting-tuple', 'telegram', 'user-1',
+                   'agent:coder:telegram:dm:chat-1', 'chat-1', 'dm', ?,
+                   NULL, 1, 1
+               )""",
+            (json.dumps({"profile": "writer"}),),
+        )
+        store._db.close()
+        (tmp_path / "sessions.json").unlink(missing_ok=True)
+
+        recovered_store = self._multiplex_store(tmp_path, monkeypatch)
+        recovered = recovered_store.get_or_create_session(source)
+
+        assert recovered.session_id != "conflicting-tuple"
+        assert (
+            recovered_store._db.get_session("conflicting-tuple")["profile_name"]
+            == QUARANTINED_SESSION_PROFILE
+        )
+        recovered_store._db.close()
+
+    def test_named_primary_legacy_main_recovers_only_for_owner(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        store = self._multiplex_store(tmp_path, monkeypatch)
+        source = self._multiplex_source("ops")
+        store._db._conn.execute(
+            """INSERT INTO sessions (
+                   id, source, user_id, session_key, chat_id, chat_type,
+                   profile_name, started_at, message_count
+               ) VALUES (
+                   'legacy-main', 'telegram', 'user-1',
+                   'agent:main:telegram:dm:chat-1', 'chat-1', 'dm',
+                   NULL, 1, 1
+               )"""
+        )
+        store._db.close()
+        (tmp_path / "sessions.json").unlink(missing_ok=True)
+
+        recovered_store = self._multiplex_store(tmp_path, monkeypatch)
+        row = recovered_store._db.get_session("legacy-main")
+        assert row["profile_name"] == "ops"
+        assert recovered_store._recovered_row_allowed_for_active_profile(
+            requested_session_key=recovered_store._generate_session_key(source),
+            recovered=row,
+        ) is True
+        assert recovered_store._recovered_row_allowed_for_active_profile(
+            requested_session_key=recovered_store._generate_session_key(
+                self._multiplex_source("default")
+            ),
+            recovered=row,
+        ) is False
+        assert recovered_store._recovered_row_allowed_for_active_profile(
+            requested_session_key=recovered_store._generate_session_key(
+                self._multiplex_source("coder")
+            ),
+            recovered=row,
+        ) is False
+
+        recovered = recovered_store.get_or_create_session(source)
+        assert recovered.session_id == "legacy-main"
+        recovered_store._db.close()
 
     def test_agent_close_rows_are_recoverable_but_explicit_resets_are_not(self, tmp_path):
         config = GatewayConfig()

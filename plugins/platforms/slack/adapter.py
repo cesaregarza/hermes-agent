@@ -3966,6 +3966,8 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id: str = "",
         user_name: Optional[str] = None,
         team_id: str = "",
+        thread_id: str = "",
+        session_key: str = "",
     ) -> bool:
         """Return whether a Slack interactive caller may perform gated actions."""
         normalized_user_id = str(user_id or "").strip()
@@ -3975,20 +3977,112 @@ class SlackAdapter(BasePlatformAdapter):
         normalized_channel_id = str(channel_id or normalized_user_id)
         normalized_chat_type = "dm" if str(channel_id or "").startswith("D") else "group"
 
-        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
-        auth_fn = getattr(runner, "_is_user_authorized", None)
+        from gateway.session import (
+            SessionSource,
+            canonicalize_gateway_profile_name,
+        )
+
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id=normalized_channel_id,
+            chat_type=normalized_chat_type,
+            user_id=normalized_user_id,
+            user_name=str(user_name).strip() if user_name else None,
+            scope_id=str(team_id) if team_id else None,
+            thread_id=str(thread_id).strip() if thread_id else None,
+        )
+
+        bound_runner = getattr(
+            getattr(self, "_message_handler", None), "__self__", None
+        )
+        profile_runner = getattr(self, "gateway_runner", None) or bound_runner
+        auth_fn = getattr(bound_runner, "_is_user_authorized", None)
+
+        # Interactive callbacks bypass BasePlatformAdapter.handle_message(), so
+        # reconstruct the same runtime-profile decision before consulting the
+        # allowlist.  Otherwise a user authorized in the channel/default
+        # profile could approve an operation waiting in a more restrictive
+        # thread-routed profile.
+        adapter_profile = getattr(self, "_profile_name", None)
+        multiplex = bool(
+            getattr(
+                getattr(profile_runner, "config", None),
+                "multiplex_profiles",
+                False,
+            )
+            or adapter_profile
+        )
+        if multiplex:
+            try:
+                parts = str(session_key or "").split(":")
+                if (
+                    len(parts) < 5
+                    or parts[0] != "agent"
+                    or parts[2] != Platform.SLACK.value
+                ):
+                    raise ValueError("missing or malformed Slack session key")
+
+                namespace = parts[1]
+                if namespace == "main":
+                    pending_profile = "default"
+                else:
+                    if namespace == "default":
+                        raise ValueError(
+                            "default profile must use the main session namespace"
+                        )
+                    pending_profile = canonicalize_gateway_profile_name(
+                        namespace,
+                        field_name="Slack interactive session profile",
+                    )
+                    if pending_profile is None or pending_profile != namespace:
+                        raise ValueError("non-canonical Slack session profile")
+
+                owner_profile = canonicalize_gateway_profile_name(
+                    adapter_profile,
+                    field_name="Slack adapter profile",
+                )
+                source.transport_profile = owner_profile
+
+                routes_enabled = bool(
+                    getattr(self, "_profile_routes_enabled", True)
+                )
+                if routes_enabled:
+                    resolver = getattr(
+                        profile_runner, "_profile_name_for_source", None
+                    )
+                    if not callable(resolver):
+                        raise ValueError("interactive profile resolver unavailable")
+                    resolved_profile = resolver(source) or owner_profile
+                else:
+                    resolved_profile = owner_profile
+
+                if not resolved_profile and profile_runner is not None:
+                    primary_profile = getattr(
+                        profile_runner, "_primary_adapter_profile_name", None
+                    )
+                    if callable(primary_profile):
+                        resolved_profile = primary_profile()
+
+                resolved_profile = canonicalize_gateway_profile_name(
+                    resolved_profile,
+                    field_name="Slack interactive authorization profile",
+                )
+                if resolved_profile is None or resolved_profile != pending_profile:
+                    raise ValueError(
+                        "interactive authorization profile does not match "
+                        "the pending session"
+                    )
+                source.profile = resolved_profile
+            except Exception:
+                logger.warning(
+                    "[Slack] Interactive profile verification failed for user %s; "
+                    "denying",
+                    normalized_user_id,
+                )
+                return False
+
         if callable(auth_fn):
             try:
-                from gateway.session import SessionSource
-
-                source = SessionSource(
-                    platform=Platform.SLACK,
-                    chat_id=normalized_channel_id,
-                    chat_type=normalized_chat_type,
-                    user_id=normalized_user_id,
-                    user_name=str(user_name).strip() if user_name else None,
-                    scope_id=str(team_id) if team_id else None,
-                )
                 return bool(auth_fn(source))
             except Exception:
                 logger.debug(
@@ -4010,11 +4104,12 @@ class SlackAdapter(BasePlatformAdapter):
                     normalized_chat_type,
                     normalized_channel_id,
                     scope_id=str(team_id) if team_id else None,
+                    thread_id=str(thread_id) if thread_id else None,
                 )
                 is True
             )
 
-        if getattr(self, "_profile_routes_enabled", True) is False:
+        if multiplex or getattr(self, "_profile_routes_enabled", True) is False:
             # A secondary adapter missing its registered callback must not use
             # the primary process allowlist.
             return False
@@ -4061,11 +4156,22 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
+
+        # Parse session_key|confirm_id before authorization: the session-key
+        # namespace is required profile evidence for multiplexed callbacks.
+        if "|" not in value:
+            logger.warning("[Slack] Malformed slash-confirm value: %s", value)
+            return
+        session_key, confirm_id = value.split("|", 1)
+
+        thread_ts = message.get("thread_ts", "")
         if not self._is_interactive_user_authorized(
             user_id,
             channel_id=channel_id,
             user_name=user_name,
             team_id=team_id,
+            thread_id=thread_ts,
+            session_key=session_key,
         ):
             logger.warning(
                 "[Slack] Unauthorized slash-confirm click by %s (%s) - ignoring",
@@ -4084,12 +4190,6 @@ class SlackAdapter(BasePlatformAdapter):
                     user_id,
                 )
                 return
-
-        # Parse session_key|confirm_id back out
-        if "|" not in value:
-            logger.warning("[Slack] Malformed slash-confirm value: %s", value)
-            return
-        session_key, confirm_id = value.split("|", 1)
 
         choice_map = {
             "hermes_confirm_once": "once",
@@ -4199,12 +4299,15 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
+        thread_ts = message.get("thread_ts", "")
 
         if not self._is_interactive_user_authorized(
             user_id,
             channel_id=channel_id,
             user_name=user_name,
             team_id=team_id,
+            thread_id=thread_ts,
+            session_key=session_key,
         ):
             logger.warning(
                 "[Slack] Unauthorized approval click by %s (%s) - ignoring",

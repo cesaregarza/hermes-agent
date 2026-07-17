@@ -22,6 +22,8 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
+from session_profile_evidence import classify_session_profile_evidence
+
 logger = logging.getLogger(__name__)
 
 
@@ -359,6 +361,58 @@ def canonicalize_gateway_profile_name(
             f"Invalid {field_name} {raw!r}: {canonical!r} is reserved by "
             "the gateway session wire namespace"
         )
+    return canonical
+
+
+def resolve_legacy_session_profile(session_db: Any) -> Optional[str]:
+    """Return the primary profile that owns legacy unscoped session rows.
+
+    SessionDB persists this boundary when it first opens the state database.
+    Lightweight/fake DB implementations may not expose it, so compatibility
+    callers fall back to the active HERMES_HOME profile (and ultimately
+    ``default``). Invalid ownership metadata fails closed.
+    """
+    persisted = getattr(session_db, "legacy_profile_name", None)
+    if isinstance(persisted, str) and persisted.strip():
+        raw = persisted
+    else:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            raw = get_active_profile_name() or "default"
+        except Exception:
+            raw = "default"
+    try:
+        return canonicalize_gateway_profile_name(
+            raw,
+            field_name="legacy session profile owner",
+        )
+    except ValueError as exc:
+        logger.warning("Invalid legacy session profile owner: %s", exc)
+        return None
+
+
+def profile_from_session_key(session_key: Optional[str]) -> Optional[str]:
+    """Extract the profile namespace encoded in a gateway session key."""
+    if not session_key:
+        return None
+    parts = str(session_key).split(":")
+    if len(parts) < 2 or parts[0] != "agent" or not parts[1]:
+        return None
+    namespace = parts[1]
+    if namespace == "main":
+        return "default"
+    try:
+        canonical = canonicalize_gateway_profile_name(
+            namespace,
+            field_name="session-key profile",
+        )
+    except ValueError:
+        return None
+    # The built-in default profile has exactly one canonical wire spelling:
+    # ``agent:main``. Named namespaces must also be stored canonically.
+    if canonical == "default" or canonical != namespace:
+        return None
     return canonical
 
 
@@ -1629,13 +1683,7 @@ class SessionStore:
     @staticmethod
     def _profile_from_session_key(session_key: Optional[str]) -> Optional[str]:
         """Extract the profile namespace encoded in a gateway session key."""
-        if not session_key:
-            return None
-        parts = str(session_key).split(":")
-        if len(parts) < 2 or parts[0] != "agent":
-            return None
-        namespace = parts[1] or "main"
-        return "default" if namespace == "main" else namespace
+        return profile_from_session_key(session_key)
 
     @staticmethod
     def _active_profile_name() -> str:
@@ -1653,25 +1701,32 @@ class SessionStore:
     ) -> bool:
         """Prevent durable peer fallback from crossing profile namespaces."""
         recovered_key = str(recovered.get("session_key") or "")
+        requested_profile = self._profile_from_session_key(requested_session_key)
+
+        if getattr(self.config, "multiplex_profiles", False):
+            # Exact-key and peer-tuple recovery share one authorization gate.
+            # In particular, an exact key must not let a quarantined/conflicting
+            # origin bypass the evidence classifier, while legacy agent:main
+            # rows owned by a named primary must resolve to that primary rather
+            # than the wire namespace's modern ``default`` spelling.
+            classification = classify_session_profile_evidence(
+                recovered,
+                resolve_legacy_session_profile(self._db),
+            )
+            return bool(
+                requested_profile
+                and classification.coherent
+                and classification.profile == requested_profile
+            )
+
+        # Preserve pre-multiplex recovery behavior byte-for-byte: exact keys
+        # win, and older rows without profile metadata remain recoverable.
         if recovered_key == requested_session_key:
             return True
-
-        requested_profile = self._profile_from_session_key(requested_session_key)
         recovered_profile = self._profile_from_session_key(recovered_key)
         if recovered_profile is None:
             persisted_profile = str(recovered.get("profile_name") or "").strip()
             recovered_profile = persisted_profile or None
-
-        if getattr(self.config, "multiplex_profiles", False):
-            # Exact lookup already missed. Peer-tuple recovery is safe only
-            # inside the same explicit profile namespace; legacy rows without
-            # either key or profile_name are ambiguous and fail closed.
-            return bool(
-                requested_profile
-                and recovered_profile
-                and recovered_profile == requested_profile
-            )
-
         if not recovered_key and recovered_profile is None:
             return True
         if recovered_profile is None:
@@ -2757,12 +2812,11 @@ class SessionStore:
         namespace encoded in the destination key before it can attach a
         transcript.
 
-        Legacy CLI sessions may have no gateway metadata at all.  The one
-        trusted caller that imports such a session can opt in via
-        ``allow_unscoped_target``; that exception only applies when *all*
-        profile evidence is absent and can never override conflicting evidence.
-        A newly-created, metadata-free branch child is also safe when its DB
-        parent is the session currently bound to this key.
+        Legacy CLI sessions may have no gateway metadata at all. Such rows are
+        owned by the primary profile persisted on their state DB; this inferred
+        evidence is enforced exactly like an explicit profile and cannot be
+        bypassed by ``allow_unscoped_target``. A newly-created, metadata-free
+        branch child remains safe only inside that same primary boundary.
         """
         if not getattr(self.config, "multiplex_profiles", False):
             return True
@@ -2817,123 +2871,30 @@ class SessionStore:
             )
             return False
 
-        evidence: Dict[str, str] = {}
-        persisted_key = str(target_row.get("session_key") or "").strip()
-        if persisted_key:
-            persisted_key_profile = self._profile_from_session_key(persisted_key)
-            if persisted_key_profile is None:
-                logger.warning(
-                    "Rejecting multiplex session switch to %s: persisted target "
-                    "key %s has no gateway profile namespace",
-                    target_session_id,
-                    persisted_key,
-                )
-                return False
-            try:
-                evidence["session_key"] = canonicalize_gateway_profile_name(
-                    persisted_key_profile,
-                    field_name="target session-key profile",
-                ) or ""
-            except ValueError as exc:
-                logger.warning(
-                    "Rejecting multiplex session switch to %s: invalid target "
-                    "session-key profile (%s)",
-                    target_session_id,
-                    exc,
-                )
-                return False
-
-        persisted_profile = target_row.get("profile_name")
-        if persisted_profile is not None and str(persisted_profile).strip():
-            try:
-                evidence["profile_name"] = canonicalize_gateway_profile_name(
-                    persisted_profile,
-                    field_name="target profile_name",
-                ) or ""
-            except ValueError as exc:
-                logger.warning(
-                    "Rejecting multiplex session switch to %s: invalid target "
-                    "profile_name (%s)",
-                    target_session_id,
-                    exc,
-                )
-                return False
-
-        persisted_origin = target_row.get("origin_json")
-        if persisted_origin is not None and str(persisted_origin).strip():
-            try:
-                origin_data = (
-                    persisted_origin
-                    if isinstance(persisted_origin, dict)
-                    else json.loads(str(persisted_origin))
-                )
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                logger.warning(
-                    "Rejecting multiplex session switch to %s: malformed target "
-                    "origin metadata (%s)",
-                    target_session_id,
-                    exc,
-                )
-                return False
-            if not isinstance(origin_data, dict):
-                logger.warning(
-                    "Rejecting multiplex session switch to %s: target origin "
-                    "metadata is not an object",
-                    target_session_id,
-                )
-                return False
-            origin_profile = origin_data.get("profile")
-            if origin_profile is not None and str(origin_profile).strip():
-                try:
-                    evidence["origin.profile"] = canonicalize_gateway_profile_name(
-                        origin_profile,
-                        field_name="target origin profile",
-                    ) or ""
-                except ValueError as exc:
-                    logger.warning(
-                        "Rejecting multiplex session switch to %s: invalid target "
-                        "origin profile (%s)",
-                        target_session_id,
-                        exc,
-                    )
-                    return False
-
-        mismatches = {
-            field: value
-            for field, value in evidence.items()
-            if value != requested_profile
-        }
-        if mismatches:
+        legacy_profile = resolve_legacy_session_profile(db)
+        classification = classify_session_profile_evidence(
+            target_row,
+            legacy_profile,
+        )
+        if not classification.coherent:
             logger.warning(
-                "Rejecting multiplex session switch to %s: target profile "
-                "evidence %s does not match destination profile %s",
+                "Rejecting multiplex session switch to %s: %s",
                 target_session_id,
-                mismatches,
-                requested_profile,
+                classification.error or "target profile cannot be verified",
             )
             return False
-        if evidence:
-            return True
-
-        # Before multiplexing, gateway/CLI rows carried no profile_name and
-        # often no session_key. Those rows belong to the historical default
-        # namespace (``agent:main``), never to a named profile. Preserve their
-        # resumability for default while still rejecting the same unscoped
-        # target from every named runtime.
-        if requested_profile == "default":
-            return True
-
-        parent_session_id = str(target_row.get("parent_session_id") or "").strip()
-        if parent_session_id == current_session_id:
-            return True
-        if allow_unscoped_target:
+        if classification.profile == requested_profile:
             return True
 
         logger.warning(
-            "Rejecting multiplex session switch to %s: target has no profile "
-            "evidence or direct lineage from current session %s",
+            "Rejecting multiplex session switch to %s: resolved target profile "
+            "%s does not match destination profile %s (current session %s; "
+            "allow_unscoped_target=%s)",
             target_session_id,
+            classification.profile,
+            requested_profile,
             current_session_id,
+            allow_unscoped_target,
         )
         return False
 
@@ -2955,7 +2916,7 @@ class SessionStore:
         When profile multiplexing is enabled, the target's durable profile
         evidence must agree with the destination key. ``allow_unscoped_target``
         is reserved for the trusted CLI handoff path and does not bypass an
-        explicit mismatch.
+        explicit mismatch or the state DB's inferred legacy owner.
         """
         db_end_session_id = None
         new_entry = None

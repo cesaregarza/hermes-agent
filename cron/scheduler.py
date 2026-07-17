@@ -2012,6 +2012,25 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+def _bind_cron_session_search_profile(agent) -> Optional[str]:
+    """Constrain automated cron recall to the active Hermes profile."""
+    try:
+        from hermes_cli.profiles import (
+            get_active_profile_name,
+            normalize_profile_name,
+            validate_profile_name,
+        )
+
+        profile_name = normalize_profile_name(get_active_profile_name())
+        validate_profile_name(profile_name)
+    except Exception:
+        profile_name = None
+    # Presence with ``None`` is intentional: the shared boundary helper treats
+    # an unavailable server-selected profile as deny-all, never local access.
+    agent._gateway_session_search_profile = profile_name
+    return profile_name
+
+
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -3242,6 +3261,11 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        # Cron runs are automated work inside one profile, even though their
+        # platform is not a native gateway adapter. Mark the server-selected
+        # profile as authoritative so session_search cannot treat a cron agent
+        # as trusted local/TUI code and scan every profile in a shared DB.
+        _bind_cron_session_search_profile(agent)
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,

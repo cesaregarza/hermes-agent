@@ -264,6 +264,11 @@ class TestRunBackgroundTask:
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "Background task complete" in content
         assert "Hello from background!" in content
+        assert (
+            MockAgent.call_args.kwargs["gateway_session_key"]
+            == runner._session_key_for_source(source)
+        )
+        assert MockAgent.call_args.kwargs["gateway_session_key"]
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
@@ -399,6 +404,7 @@ class TestRunBackgroundTask:
             "telegram_dm_topic_reply_fallback": True,
             "direct_messages_topic_id": "20197",
             "telegram_reply_to_message_id": "463",
+            "runtime_profile": "default",
         }
 
     @pytest.mark.asyncio

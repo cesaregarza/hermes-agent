@@ -7,6 +7,10 @@ import pytest
 
 import hermes_state
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from session_profile_evidence import (
+    QUARANTINED_SESSION_PROFILE,
+    classify_session_profile_evidence,
+)
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -3461,7 +3465,7 @@ class TestSchemaInit:
         }
         assert "telegram_dm_topic_mode" in tables
         assert "telegram_dm_topic_bindings" in tables
-        assert db.get_meta("telegram_dm_topic_schema_version") == "2"
+        assert db.get_meta("telegram_dm_topic_schema_version") == "3"
         db.close()
 
     def test_telegram_topic_binding_roundtrip_requires_explicit_schema(self, tmp_path):
@@ -3489,7 +3493,7 @@ class TestSchemaInit:
         assert binding["user_id"] == "208214988"
         assert binding["session_key"] == "telegram:dm:208214988:thread:17585"
         assert binding["session_id"] == "topic-session"
-        assert db.get_meta("telegram_dm_topic_schema_version") == "2"
+        assert db.get_meta("telegram_dm_topic_schema_version") == "3"
         db.close()
 
     def test_telegram_topic_binding_refuses_to_relink_session_to_another_topic(self, tmp_path):
@@ -3878,6 +3882,293 @@ class TestTitleUniqueness:
         db.create_session("named", "cli")
 
         assert db.get_session("named")["profile_name"] == "coder"
+
+    def test_explicit_cross_profile_handle_owns_first_migration_and_writes(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A default backend opening ops/state.db must not stamp default."""
+        db_path = tmp_path / "profiles" / "ops" / "state.db"
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "default",
+        )
+
+        # Simulate a pre-owner-metadata DB containing a legacy agent:main row.
+        seeded = SessionDB(db_path=db_path)
+        seeded._conn.execute(
+            "INSERT INTO sessions "
+            "(id, source, session_key, profile_name, started_at) "
+            "VALUES ('legacy', 'telegram', "
+            "'agent:main:telegram:dm:a', NULL, 1)"
+        )
+        seeded._conn.execute(
+            "DELETE FROM state_meta WHERE key = ?",
+            (SessionDB._LEGACY_PROFILE_META_KEY,),
+        )
+        seeded.close()
+
+        db = SessionDB(db_path=db_path, profile_name="Ops")
+        try:
+            assert db.legacy_profile_name == "ops"
+            assert db.get_meta(SessionDB._LEGACY_PROFILE_META_KEY) == "ops"
+            assert db.get_session("legacy")["profile_name"] == "ops"
+
+            # The explicit handle scope also owns omitted writes and title
+            # lookups even though ambient process state remains default.
+            db.create_session("fresh", "cli")
+            db.set_session_title("fresh", "Operations")
+            assert db.get_session("fresh")["profile_name"] == "ops"
+            assert db.get_session_by_title("Operations")["id"] == "fresh"
+
+            imported = db.import_sessions(
+                [{"id": "imported", "source": "import", "messages": []}]
+            )
+            assert imported["ok"] is True
+            assert db.get_session("imported")["profile_name"] == "ops"
+        finally:
+            db.close()
+
+    def test_read_only_standard_profile_path_infers_fixed_owner(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hermes_cli import profiles as profiles_mod
+
+        default_home = tmp_path / "home"
+        ops_home = default_home / "profiles" / "ops"
+        db_path = ops_home / "state.db"
+        monkeypatch.setattr(
+            profiles_mod,
+            "get_profile_dir",
+            lambda name: default_home if name == "default" else default_home / "profiles" / name,
+        )
+        monkeypatch.setattr(
+            profiles_mod,
+            "get_active_profile_name",
+            lambda: "default",
+        )
+
+        seeded = SessionDB(db_path=db_path, profile_name="ops")
+        seeded._conn.execute(
+            "INSERT INTO sessions "
+            "(id, source, title, profile_name, started_at) "
+            "VALUES ('legacy', 'cli', 'Operations', NULL, 1)"
+        )
+        seeded._conn.execute(
+            "DELETE FROM state_meta WHERE key = ?",
+            (SessionDB._LEGACY_PROFILE_META_KEY,),
+        )
+        seeded.close()
+
+        read_only = SessionDB(db_path=db_path, read_only=True)
+        try:
+            assert read_only.legacy_profile_name == "ops"
+            assert read_only.get_session_by_title("Operations")["id"] == "legacy"
+            # Read-only owner discovery must never repair/write metadata.
+            assert read_only.get_meta(SessionDB._LEGACY_PROFILE_META_KEY) is None
+        finally:
+            read_only.close()
+
+    def test_explicit_cross_profile_owner_rejects_invalid_name(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "state.db"
+        with pytest.raises(ValueError, match="Invalid SessionDB profile owner"):
+            SessionDB(db_path=db_path, profile_name="../../ops")
+        assert not db_path.exists()
+
+    def test_named_primary_owns_post_init_null_rows_without_shadowing_secondary(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "ops",
+        )
+        db = SessionDB(db_path=tmp_path / "named-primary.db")
+        try:
+            assert db.legacy_profile_name == "ops"
+            # Simulate pre-profile/legacy writers after DB initialisation. Both
+            # NULL and blank spellings must continue to resolve to the stable
+            # DB primary, even though startup backfill has already run.
+            db._conn.execute(
+                "INSERT INTO sessions (id, source, profile_name, started_at) "
+                "VALUES ('legacy-null', 'cli', NULL, 1)"
+            )
+            db._conn.execute(
+                "INSERT INTO sessions (id, source, profile_name, started_at) "
+                "VALUES ('legacy-blank', 'cli', '  ', 2)"
+            )
+            db.set_session_title("legacy-null", "Shared Project")
+
+            # An omitted insert from a secondary runtime must be stamped with
+            # that runtime, not silently inherited by the primary fallback.
+            monkeypatch.setattr(
+                "hermes_cli.profiles.get_active_profile_name",
+                lambda: "default",
+            )
+            db.create_session("secondary", "cli")
+            assert db.get_session("secondary")["profile_name"] == "default"
+            db.set_session_title("secondary", "Shared Project")
+
+            # Omitted lookup scope remains the current runtime, while NULL-row
+            # interpretation remains the persisted primary owner.
+            assert db.get_session_by_title("Shared Project")["id"] == "secondary"
+            assert db.resolve_session_by_title("Shared Project") == "secondary"
+            assert db.get_session_by_title(
+                "Shared Project",
+                profile_name="ops",
+            )["id"] == "legacy-null"
+            assert db.get_session_by_title(
+                "Shared Project",
+                profile_name="other",
+            ) is None
+
+            assert {
+                row["id"] for row in db.list_sessions_rich(profile_name="ops")
+            } == {"legacy-null", "legacy-blank"}
+            assert {
+                row["id"] for row in db.list_sessions_rich(profile_name="default")
+            } == {"secondary"}
+
+            db.create_session("primary-conflict", "cli", profile_name="ops")
+            with pytest.raises(ValueError, match="already in use"):
+                db.set_session_title("primary-conflict", "Shared Project")
+        finally:
+            db.close()
+
+    def test_named_primary_backfills_preexisting_null_profile(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        db_path = tmp_path / "legacy-primary-migration.db"
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "default",
+        )
+        initial = SessionDB(db_path=db_path)
+        initial.create_session("legacy", "cli")
+        initial.close()
+
+        # Simulate a database created before legacy-owner metadata existed.
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "DELETE FROM state_meta WHERE key = ?",
+                (SessionDB._LEGACY_PROFILE_META_KEY,),
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "ops",
+        )
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened.legacy_profile_name == "ops"
+            assert reopened.get_session("legacy")["profile_name"] == "ops"
+            assert reopened.get_meta(SessionDB._LEGACY_PROFILE_META_KEY) == "ops"
+        finally:
+            reopened.close()
+
+    def test_profile_evidence_backfill_preserves_namespaces_and_rejects_conflicts(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "ops",
+        )
+        db_path = tmp_path / "profile-evidence.db"
+        db = SessionDB(db_path=db_path)
+        rows = (
+            ("legacy-main", "agent:main:telegram:dm:a", None),
+            (
+                "secondary",
+                "agent:coder:telegram:dm:b",
+                json.dumps({"profile": "coder"}),
+            ),
+            (
+                "main-with-origin",
+                "agent:main:telegram:dm:c",
+                json.dumps({"profile": "coder"}),
+            ),
+            (
+                "conflicting",
+                "agent:coder:telegram:dm:d",
+                json.dumps({"profile": "writer"}),
+            ),
+            ("malformed", "agent:coder:telegram:dm:e", "{"),
+        )
+        db._conn.executemany(
+            "INSERT INTO sessions "
+            "(id, source, session_key, origin_json, profile_name, started_at) "
+            "VALUES (?, 'telegram', ?, ?, NULL, 1)",
+            rows,
+        )
+        db.set_session_title("conflicting", "Conflict Project")
+        db.set_session_title("malformed", "Malformed Project")
+        db.close()
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened.get_session("legacy-main")["profile_name"] == "ops"
+            assert reopened.get_session("secondary")["profile_name"] == "coder"
+            assert reopened.get_session("main-with-origin")["profile_name"] == "coder"
+            assert (
+                reopened.get_session("conflicting")["profile_name"]
+                == QUARANTINED_SESSION_PROFILE
+            )
+            assert (
+                reopened.get_session("malformed")["profile_name"]
+                == QUARANTINED_SESSION_PROFILE
+            )
+            primary_ids = {
+                row["id"] for row in reopened.list_sessions_rich(profile_name="ops")
+            }
+            assert "conflicting" not in primary_ids
+            assert "malformed" not in primary_ids
+            assert reopened.get_session_by_title(
+                "Conflict Project",
+                profile_name="ops",
+            ) is None
+            assert reopened.get_session_by_title(
+                "Malformed Project",
+                profile_name="ops",
+            ) is None
+        finally:
+            reopened.close()
+
+    def test_default_primary_backfills_legacy_main_as_default(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "default",
+        )
+        db_path = tmp_path / "default-evidence.db"
+        db = SessionDB(db_path=db_path)
+        db._conn.execute(
+            "INSERT INTO sessions "
+            "(id, source, session_key, profile_name, started_at) "
+            "VALUES ('legacy-main', 'telegram', "
+            "'agent:main:telegram:dm:a', NULL, 1)"
+        )
+        db.close()
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened.legacy_profile_name == "default"
+            assert reopened.get_session("legacy-main")["profile_name"] == "default"
+        finally:
+            reopened.close()
 
     def test_null_titles_not_unique(self, db):
         """Multiple sessions can have NULL titles (no constraint violation)."""
@@ -6180,3 +6471,378 @@ class TestGetMessagesPagination:
         self._seed(db, n=5)
         rows = db.get_messages("s1", offset=3)
         assert [m["content"] for m in rows] == ["msg-3", "msg-4"]
+
+
+# =========================================================================
+# Profile-scoped mutation boundaries
+# =========================================================================
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_scoped_delete_rejects_foreign_child_edge_atomically(db, bulk):
+    owner = db.legacy_profile_name
+    db.create_session("owned-parent", "tui", profile_name=owner)
+    db.append_message("owned-parent", "user", "keep me")
+    db.create_session(
+        "foreign-child",
+        "telegram",
+        parent_session_id="owned-parent",
+        profile_name="coder",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="foreign-profile child edge",
+    ):
+        if bulk:
+            db.delete_sessions(
+                ["owned-parent"],
+                profile_name=owner,
+            )
+        else:
+            db.delete_session(
+                "owned-parent",
+                profile_name=owner,
+            )
+
+    assert db.get_session("owned-parent") is not None
+    assert db.get_messages("owned-parent")[0]["content"] == "keep me"
+    assert db.get_session("foreign-child")["parent_session_id"] == "owned-parent"
+
+
+def test_scoped_delete_cascades_only_owned_delegates(db):
+    owner = db.legacy_profile_name
+    db.create_session("owned-parent", "tui", profile_name=owner)
+    db.create_session(
+        "owned-delegate",
+        "tool",
+        model_config={"_delegate_from": "owned-parent"},
+        parent_session_id="owned-parent",
+        profile_name=owner,
+    )
+    db.create_session(
+        "foreign-marker-only",
+        "tool",
+        model_config={"_delegate_from": "owned-parent"},
+        profile_name="coder",
+    )
+
+    assert db.delete_session("owned-parent", profile_name=owner) is True
+    assert db.get_session("owned-parent") is None
+    assert db.get_session("owned-delegate") is None
+    assert db.get_session("foreign-marker-only") is not None
+
+
+def test_scoped_empty_delete_and_handoff_reject_foreign_target(db):
+    owner = db.legacy_profile_name
+    db.create_session("foreign", "tui", profile_name="coder")
+
+    assert (
+        db.delete_session_if_empty(
+            "foreign",
+            profile_name=owner,
+        )
+        is False
+    )
+    with pytest.raises(
+        ValueError,
+        match="profile boundary changed during handoff",
+    ):
+        db.request_handoff(
+            "foreign",
+            "telegram",
+            profile_name=owner,
+        )
+
+    row = db.get_session("foreign")
+    assert row["handoff_state"] is None
+    with pytest.raises(
+        ValueError,
+        match="profile boundary changed during finalization",
+    ):
+        db.end_session(
+            "foreign",
+            "complete",
+            profile_name=owner,
+        )
+    db.end_session("foreign", "complete", profile_name="coder")
+    ended_at = db.get_session("foreign")["ended_at"]
+    with pytest.raises(
+        ValueError,
+        match="profile boundary changed during resume",
+    ):
+        db.reopen_session("foreign", profile_name=owner)
+    assert db.get_session("foreign")["ended_at"] == ended_at
+
+
+def test_import_detaches_parent_owned_by_another_profile(db):
+    owner = db.legacy_profile_name
+    db.create_session("foreign-parent", "telegram", profile_name="coder")
+
+    result = db.import_sessions(
+        [
+            {
+                "id": "imported-child",
+                "source": "tui",
+                "parent_session_id": "foreign-parent",
+                "messages": [],
+            }
+        ]
+    )
+
+    assert result["ok"] is True
+    assert result["detached"] == 1
+    child = db.get_session("imported-child")
+    assert child["parent_session_id"] is None
+    classification = classify_session_profile_evidence(child, owner)
+    assert classification.coherent is True
+    assert classification.profile == owner
+
+
+def test_standard_primary_path_owner_beats_explicit_secondary_scope(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli import profiles
+
+    homes = {
+        "default": tmp_path / "root",
+        "coder": tmp_path / "root" / "profiles" / "coder",
+    }
+    for home in homes.values():
+        home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        profiles,
+        "get_profile_dir",
+        lambda name: homes[name],
+    )
+    monkeypatch.setattr(
+        profiles,
+        "get_active_profile_name",
+        lambda: "coder",
+    )
+
+    db_path = homes["default"] / "state.db"
+    scoped = SessionDB(db_path=db_path, profile_name="coder")
+    try:
+        assert scoped.legacy_profile_name == "default"
+        assert (
+            scoped.get_meta(SessionDB._LEGACY_PROFILE_META_KEY)
+            == "default"
+        )
+
+        scoped._conn.execute(
+            "INSERT INTO sessions (id, source, profile_name, started_at) "
+            "VALUES ('legacy-primary', 'cli', NULL, 1)"
+        )
+        scoped.create_session("secondary", "cli")
+
+        assert (
+            scoped.get_session("legacy-primary")["profile_name"]
+            is None
+        )
+        assert scoped.get_session("secondary")["profile_name"] == "coder"
+        assert {
+            row["id"]
+            for row in scoped.list_sessions_rich(profile_name="default")
+        } == {"legacy-primary"}
+        assert {
+            row["id"]
+            for row in scoped.list_sessions_rich(profile_name="coder")
+        } == {"secondary"}
+    finally:
+        scoped.close()
+
+
+def test_invalid_persisted_legacy_owner_fails_closed_without_reassignment(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name",
+        lambda: "default",
+    )
+    db_path = tmp_path / "invalid-owner.db"
+    initial = SessionDB(db_path=db_path)
+    initial._conn.execute(
+        "INSERT INTO sessions (id, source, profile_name, started_at) "
+        "VALUES ('legacy-null', 'cli', NULL, 1)"
+    )
+    initial.close()
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE state_meta SET value = ? WHERE key = ?",
+            ("../../coder", SessionDB._LEGACY_PROFILE_META_KEY),
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="Invalid persisted legacy session profile owner",
+    ):
+        SessionDB(db_path=db_path)
+    with pytest.raises(
+        ValueError,
+        match="Invalid persisted legacy session profile owner",
+    ):
+        SessionDB(db_path=db_path, read_only=True)
+
+    with sqlite3.connect(db_path) as conn:
+        meta = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (SessionDB._LEGACY_PROFILE_META_KEY,),
+        ).fetchone()[0]
+        profile = conn.execute(
+            "SELECT profile_name FROM sessions WHERE id = 'legacy-null'"
+        ).fetchone()[0]
+    assert meta == "../../coder"
+    assert profile is None
+
+
+def test_profile_scoped_compression_walk_rejects_foreign_and_conflicting_children(
+    db,
+):
+    owner = db.legacy_profile_name
+    foreign = "coder" if owner != "coder" else "default"
+
+    db.create_session("owned-root", "cli", profile_name=owner)
+    db.end_session("owned-root", "compression")
+    db.create_session(
+        "owned-tip",
+        "cli",
+        parent_session_id="owned-root",
+        profile_name=owner,
+    )
+    db.create_session(
+        "foreign-secret",
+        "cli",
+        parent_session_id="owned-root",
+        profile_name=foreign,
+        session_key=(
+            "agent:main:cli:foreign"
+            if foreign == "default"
+            else f"agent:{foreign}:cli:foreign"
+        ),
+    )
+    db.create_session(
+        "conflicting-secret",
+        "cli",
+        parent_session_id="owned-root",
+        profile_name=owner,
+        session_key=(
+            "agent:main:cli:conflict"
+            if foreign == "default"
+            else f"agent:{foreign}:cli:conflict"
+        ),
+    )
+    db._conn.execute(
+        "UPDATE sessions SET started_at = CASE id "
+        "WHEN 'owned-tip' THEN 10 "
+        "WHEN 'foreign-secret' THEN 20 "
+        "WHEN 'conflicting-secret' THEN 30 "
+        "ELSE started_at END"
+    )
+
+    # The unscoped legacy API still ranks every physical sibling. The scoped
+    # API must discard foreign/conflicting evidence before doing that ranking.
+    assert db.get_compression_tip("owned-root") == "conflicting-secret"
+    assert (
+        db.get_compression_tip("owned-root", profile_name=owner)
+        == "owned-tip"
+    )
+
+    rows = db.list_sessions_rich(
+        profile_name=owner,
+        order_by_last_active=True,
+    )
+    assert [row["id"] for row in rows] == ["owned-tip"]
+    assert db.list_sessions_rich(
+        profile_name=owner,
+        order_by_last_active=True,
+        id_query="foreign-secret",
+        project_compression_tips=False,
+    ) == []
+    assert db.list_sessions_rich(
+        profile_name=owner,
+        order_by_last_active=True,
+        id_query="conflicting-secret",
+        project_compression_tips=False,
+    ) == []
+
+    assert db.set_session_archived(
+        "owned-root",
+        True,
+        profile_name=owner,
+    )
+    assert db.get_session("owned-root")["archived"] == 1
+    assert db.get_session("owned-tip")["archived"] == 1
+    assert db.get_session("foreign-secret")["archived"] == 0
+    assert db.get_session("conflicting-secret")["archived"] == 0
+
+
+def test_profile_scoped_title_paths_reject_conflicting_evidence_and_lineage(
+    db,
+):
+    owner = db.legacy_profile_name
+    foreign = "coder" if owner != "coder" else "default"
+    foreign_key = (
+        "agent:main:cli:foreign"
+        if foreign == "default"
+        else f"agent:{foreign}:cli:foreign"
+    )
+
+    db.create_session(
+        "conflicting-title",
+        "cli",
+        profile_name=owner,
+        session_key=foreign_key,
+    )
+    db.set_session_title("conflicting-title", "Hidden Project")
+    assert db.get_session_by_title(
+        "Hidden Project",
+        profile_name=owner,
+    ) is None
+    assert db.resolve_session_by_title(
+        "Hidden Project",
+        profile_name=owner,
+    ) is None
+    assert (
+        db.get_next_title_in_lineage(
+            "Hidden Project",
+            profile_name=owner,
+        )
+        == "Hidden Project"
+    )
+
+    db.create_session("title-root", "cli", profile_name=owner)
+    db.set_session_title("title-root", "Shared Project")
+    db.end_session("title-root", "compression")
+    db.create_session(
+        "foreign-middle",
+        "cli",
+        parent_session_id="title-root",
+        profile_name=foreign,
+        session_key=foreign_key,
+    )
+    db.end_session("foreign-middle", "compression")
+    db.create_session(
+        "owned-descendant",
+        "cli",
+        parent_session_id="foreign-middle",
+        profile_name=owner,
+    )
+
+    with pytest.raises(ValueError, match="already in use"):
+        db.set_session_title(
+            "owned-descendant",
+            "Shared Project",
+            profile_name=owner,
+        )
+    assert db.get_session_title(
+        "title-root",
+        profile_name=owner,
+    ) == "Shared Project"
+    assert db.get_session_title(
+        "owned-descendant",
+        profile_name=owner,
+    ) is None

@@ -1827,7 +1827,37 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        # API-server memory keys are optional, client-controlled identifiers
+        # (for example ``webui:user-42``), not profile authorization evidence.
+        # Bind session_search separately to the server-selected request/runtime
+        # profile. The attribute's presence is also a fail-closed gateway-origin
+        # marker: a missing/invalid profile can never degrade to trusted-local
+        # cross-profile recall.
+        agent._gateway_session_search_profile = (
+            self._session_search_runtime_profile()
+        )
         return agent
+
+    @staticmethod
+    def _session_search_runtime_profile() -> Optional[str]:
+        """Return the canonical server-selected profile for this API request."""
+        try:
+            from hermes_cli.profiles import (
+                get_active_profile_name,
+                normalize_profile_name,
+                validate_profile_name,
+            )
+
+            raw_profile = _api_request_profile.get() or get_active_profile_name()
+            profile = normalize_profile_name(raw_profile or "default")
+            validate_profile_name(profile)
+            return profile
+        except (ImportError, TypeError, ValueError):
+            logger.warning(
+                "API server could not establish a session_search profile boundary",
+                exc_info=True,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # HTTP Handlers

@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -38,8 +39,10 @@ from gateway.session import (
     SessionSource,
     build_session_key,
     is_shared_multi_user_session,
+    resolve_legacy_session_profile,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
+from session_profile_evidence import classify_session_profile_evidence
 from utils import (
     atomic_json_write,
     base_url_host_matches,
@@ -770,27 +773,16 @@ class GatewaySlashCommandsMixin:
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return True
         current_profile = self._multiplex_resume_profile(source)
-        raw = str(row.get("profile_name") or "").strip()
         if not current_profile:
             return False
-        # Sessions created before multiplexing have NULL profile_name and are
-        # part of the default namespace. This matches the database's unique
-        # title index and session-key ``agent:main`` compatibility mapping.
-        if not raw:
-            raw = "default"
-        try:
-            from hermes_cli.profiles import (
-                normalize_profile_name,
-                validate_profile_name,
-            )
-
-            row_profile = normalize_profile_name(raw)
-            validate_profile_name(row_profile)
-            if row_profile == "main":
-                return False
-        except (ImportError, TypeError, ValueError):
-            return False
-        return row_profile == current_profile
+        classification = classify_session_profile_evidence(
+            row,
+            resolve_legacy_session_profile(self._session_db),
+        )
+        return bool(
+            classification.coherent
+            and classification.profile == current_profile
+        )
 
     async def _resume_target_profile_allowed(
         self,
@@ -809,9 +801,11 @@ class GatewaySlashCommandsMixin:
         if isinstance(origin, SessionSource):
             if not self._same_resume_profile(source, origin):
                 return False
-            # When a listing already supplied persisted metadata, require it
-            # to agree with the trusted live origin if it names a profile.
-            if row is not None and str(row.get("profile_name") or "").strip():
+            # When a listing supplied persisted metadata, require its explicit
+            # or DB-owner-inferred profile to agree with the trusted live
+            # origin. A blank profile is evidence for the primary, not absence
+            # of evidence.
+            if row is not None:
                 return self._resume_row_profile_matches(source, row)
             return True
         if row is None:
@@ -3738,6 +3732,7 @@ class GatewaySlashCommandsMixin:
                 user_id=str(source.user_id),
                 has_topics_enabled=capabilities.get("has_topics_enabled"),
                 allows_users_to_create_topics=capabilities.get("allows_users_to_create_topics"),
+                profile_name=self._runtime_profile_for_source(source),
             )
         except Exception as exc:
             logger.exception("Failed to enable Telegram topic mode")
@@ -3751,6 +3746,7 @@ class GatewaySlashCommandsMixin:
                 binding = await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
+                    profile_name=self._runtime_profile_for_source(source),
                 )
             except Exception:
                 logger.debug("Failed to read Telegram topic binding", exc_info=True)
@@ -4522,6 +4518,19 @@ class GatewaySlashCommandsMixin:
                 else:
                     i += 1
 
+        profile_name = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_name = self._multiplex_resume_profile(event.source)
+            if not profile_name:
+                logger.warning(
+                    "Rejecting multiplex insights request without a valid "
+                    "routed profile"
+                )
+                return t(
+                    "gateway.insights.error",
+                    error="profile context unavailable",
+                )
+
         try:
             from hermes_state import SessionDB
             from agent.insights import InsightsEngine
@@ -4530,11 +4539,12 @@ class GatewaySlashCommandsMixin:
 
             def _run_insights():
                 db = SessionDB()
-                engine = InsightsEngine(db)
-                report = engine.generate(days=days, source=source)
-                result = engine.format_gateway(report)
-                db.close()
-                return result
+                try:
+                    engine = InsightsEngine(db, profile_name=profile_name)
+                    report = engine.generate(days=days, source=source)
+                    return engine.format_gateway(report)
+                finally:
+                    db.close()
 
             return await loop.run_in_executor(None, _run_insights)
         except Exception as e:

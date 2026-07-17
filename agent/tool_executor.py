@@ -76,6 +76,93 @@ _MAX_TOOL_WORKERS = 8
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
 
 
+def _gateway_session_search_boundary(
+    agent,
+    session_db,
+) -> tuple[Optional[str], bool, Optional[str]]:
+    """Classify a gateway agent's runtime profile for transcript recall.
+
+    Non-gateway agents retain trusted local cross-profile behavior. Native
+    gateway agents derive the boundary from their stable routing key; API
+    gateway agents carry a separate server-selected profile because their
+    optional memory key is client-controlled. A persisted current row must
+    agree with either form of runtime evidence.
+    """
+    from session_profile_evidence import classify_session_profile_evidence
+
+    legacy_owner = getattr(session_db, "legacy_profile_name", None)
+    gateway_key = str(
+        getattr(agent, "_gateway_session_key", None) or ""
+    ).strip()
+    has_authoritative_profile = hasattr(
+        agent,
+        "_gateway_session_search_profile",
+    )
+    if has_authoritative_profile:
+        authoritative_profile = getattr(
+            agent,
+            "_gateway_session_search_profile",
+            None,
+        )
+        if not str(authoritative_profile or "").strip():
+            return None, False, (
+                "session_search denied: gateway profile boundary is unavailable"
+            )
+        runtime = classify_session_profile_evidence(
+            {"profile_name": authoritative_profile},
+            legacy_owner,
+        )
+    elif gateway_key:
+        runtime = classify_session_profile_evidence(
+            {"session_key": gateway_key},
+            legacy_owner,
+        )
+    else:
+        return None, True, None
+
+    if not runtime.coherent:
+        return None, False, (
+            "session_search denied: invalid gateway profile evidence"
+            f" ({runtime.error or 'unknown error'})"
+        )
+
+    session_id = str(getattr(agent, "session_id", None) or "").strip()
+    if not session_id:
+        return runtime.profile, False, None
+    try:
+        row = session_db.get_session(session_id)
+    except Exception as exc:
+        logger.warning(
+            "session_search could not authorize gateway session %s: %s",
+            session_id,
+            exc,
+        )
+        return None, False, "session_search denied: current session ownership is unavailable"
+    if not row:
+        # The first tool call can race durable session creation. The stable
+        # gateway key still supplies trusted profile evidence in that window.
+        return runtime.profile, False, None
+
+    persisted_key = str(row.get("session_key") or "").strip()
+    if (
+        not has_authoritative_profile
+        and persisted_key
+        and persisted_key != gateway_key
+    ):
+        return None, False, "session_search denied: gateway session identity mismatch"
+
+    persisted = classify_session_profile_evidence(row, legacy_owner)
+    if not persisted.coherent:
+        return None, False, (
+            "session_search denied: invalid persisted profile evidence"
+            f" ({persisted.error or 'unknown error'})"
+        )
+    if persisted.profile != runtime.profile:
+        return None, False, "session_search denied: gateway profile evidence conflicts"
+
+    return runtime.profile, False, None
+
+
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     """Parse model-emitted arguments without repairing or coercing them."""
     try:
@@ -1269,6 +1356,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 if not session_db:
                     from hermes_state import format_session_db_unavailable
                     return json.dumps({"success": False, "error": format_session_db_unavailable()})
+                profile_name, allow_cross_profile, boundary_error = (
+                    _gateway_session_search_boundary(agent, session_db)
+                )
+                if boundary_error:
+                    return json.dumps(
+                        {"success": False, "error": boundary_error},
+                        ensure_ascii=False,
+                    )
                 from tools.session_search_tool import session_search as _session_search
                 return _session_search(
                     query=next_args.get("query", ""),
@@ -1278,8 +1373,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     around_message_id=next_args.get("around_message_id"),
                     window=next_args.get("window", 5),
                     sort=next_args.get("sort"),
+                    profile=next_args.get("profile"),
                     db=session_db,
                     current_session_id=agent.session_id,
+                    profile_name=profile_name,
+                    allow_cross_profile=allow_cross_profile,
                 )
             function_result, function_args = _run_agent_tool_execution_middleware(
                 agent,

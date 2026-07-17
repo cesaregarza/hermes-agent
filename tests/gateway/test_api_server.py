@@ -4011,6 +4011,28 @@ def _patch_create_agent_runtime(monkeypatch, captured: dict, fake_agent_cls):
     monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
 
 
+def test_create_agent_binds_server_selected_session_search_profile(
+    monkeypatch,
+):
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    adapter = _make_routing_adapter({})
+    _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name",
+        lambda: "coder",
+    )
+
+    agent = adapter._create_agent(gateway_session_key="webui:user-42")
+
+    assert captured["gateway_session_key"] == "webui:user-42"
+    assert agent._gateway_session_search_profile == "coder"
+
+
 class TestModelRoutesParsing:
     def test_valid_routes_are_parsed(self):
         routes = {"minimax-m2": {"model": "minimax/minimax-m1", "provider": "openrouter"}}

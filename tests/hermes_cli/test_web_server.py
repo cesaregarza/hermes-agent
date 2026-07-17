@@ -1489,7 +1489,10 @@ class TestWebServerEndpoints:
         finally:
             default_db.close()
 
-        worker_db = SessionDB(db_path=worker_home / "state.db")
+        worker_db = SessionDB(
+            db_path=worker_home / "state.db",
+            profile_name="worker",
+        )
         try:
             worker_db.create_session(session_id="worker-only", source="cli")
             worker_db.append_message("worker-only", role="user", content="worker")
@@ -1527,7 +1530,10 @@ class TestWebServerEndpoints:
         finally:
             default_db.close()
 
-        worker_db = SessionDB(db_path=worker_home / "state.db")
+        worker_db = SessionDB(
+            db_path=worker_home / "state.db",
+            profile_name="worker",
+        )
         try:
             worker_db.create_session(session_id="shared-root", source="cli")
             worker_db.create_session(

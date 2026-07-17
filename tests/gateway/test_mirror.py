@@ -152,6 +152,42 @@ class TestFindSessionId:
 
 
 class TestMirrorToSession:
+    def test_shared_db_mirror_writes_only_requested_profile(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db", profile_name="default")
+        try:
+            for profile in ("default", "coder"):
+                db.create_session(
+                    f"{profile}-session",
+                    source="telegram",
+                    session_key=(
+                        "agent:main:telegram:dm:shared"
+                        if profile == "default"
+                        else "agent:coder:telegram:dm:shared"
+                    ),
+                    chat_id="shared",
+                    chat_type="dm",
+                    user_id="same-user",
+                    profile_name=profile,
+                )
+
+            assert mirror_to_session(
+                "telegram",
+                "shared",
+                "default-only",
+                user_id="same-user",
+                profile_name="default",
+                session_db=db,
+            ) is True
+
+            assert [
+                row["content"] for row in db.get_messages("default-session")
+            ] == ["default-only"]
+            assert db.get_messages("coder-session") == []
+        finally:
+            db.close()
+
     def test_successful_mirror(self, tmp_path):
         sessions_dir, index_file = _setup_sessions(tmp_path, {
             "s1": {

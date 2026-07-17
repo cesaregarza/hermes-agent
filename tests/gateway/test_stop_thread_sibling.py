@@ -19,20 +19,22 @@ class _FakeAgent:
     pass
 
 
-def _thread_source(uid, thread_id="thr1", chat_id="chan1"):
+def _thread_source(uid, thread_id="thr1", chat_id="chan1", profile=None):
     return SessionSource(
         platform=Platform.DISCORD,
         chat_type="forum",
         chat_id=chat_id,
         thread_id=thread_id,
         user_id=uid,
+        profile=profile,
     )
 
 
-def _per_user_key(uid, thread_id="thr1", chat_id="chan1"):
+def _per_user_key(uid, thread_id="thr1", chat_id="chan1", profile=None):
     return build_session_key(
-        _thread_source(uid, thread_id, chat_id),
+        _thread_source(uid, thread_id, chat_id, profile),
         thread_sessions_per_user=True,
+        profile=profile,
     )
 
 
@@ -72,6 +74,41 @@ def test_sibling_does_not_match_different_thread_same_chat():
     key_b_other = _per_user_key("userB", thread_id="thr11")
     runner._running_agents = {key_b_other: _FakeAgent()}
     assert runner._sibling_thread_run_keys(_thread_source("userA"), key_a) == []
+
+
+@pytest.mark.parametrize(
+    ("profile", "other_profile"),
+    [
+        ("coder", "default"),
+        ("default", "coder"),
+    ],
+)
+def test_sibling_scan_never_crosses_profile_namespace(profile, other_profile):
+    runner = object.__new__(GatewayRunner)
+    own_key = _per_user_key("userA", profile=profile)
+    same_profile = _per_user_key("userB", profile=profile)
+    other_profile_key = _per_user_key("userC", profile=other_profile)
+    runner._running_agents = {
+        same_profile: _FakeAgent(),
+        other_profile_key: _FakeAgent(),
+    }
+
+    assert runner._sibling_thread_run_keys(
+        _thread_source("userA", profile=profile),
+        own_key,
+    ) == [same_profile]
+
+
+def test_sibling_scan_rejects_noncanonical_default_namespace():
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {
+        _per_user_key("userB", profile="default"): _FakeAgent(),
+    }
+
+    assert runner._sibling_thread_run_keys(
+        _thread_source("userA", profile="default"),
+        "agent:default:discord:forum:chan1:thr1:userA",
+    ) == []
 
 
 def test_sibling_returns_empty_for_non_thread_source():

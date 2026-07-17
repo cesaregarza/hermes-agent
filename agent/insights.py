@@ -90,15 +90,37 @@ class InsightsEngine:
     to query session and message data.
     """
 
-    def __init__(self, db):
+    def __init__(self, db, profile_name: str = None):
         """
         Initialize with a SessionDB instance.
 
         Args:
             db: A SessionDB instance (from hermes_state.py)
+            profile_name: Optional mandatory runtime-profile boundary. When
+                provided, every query is constrained to that profile, including
+                legacy rows owned by the database primary. This is required for
+                multiplexed gateway callers sharing one state database.
         """
         self.db = db
         self._conn = db._conn
+        self.profile_name = None
+        if profile_name is not None:
+            canonicalize = getattr(db, "_canonical_profile_name", None)
+            profile_scope_sql = getattr(db, "_profile_scope_sql", None)
+            canonical = canonicalize(profile_name) if callable(canonicalize) else None
+            if canonical is None or not callable(profile_scope_sql):
+                raise ValueError(
+                    "Profile-scoped insights require a valid SessionDB profile boundary"
+                )
+            self.profile_name = canonical
+
+    def _profile_predicate(self, column: str) -> tuple[str, tuple[str, ...]]:
+        """Return a fail-closed profile predicate for an internal SQL column."""
+        if self.profile_name is None:
+            return "", ()
+        # ``column`` is always a hard-coded identifier supplied by this module.
+        expression = self.db._profile_scope_sql(column)
+        return f" AND {expression} = ?", (self.profile_name,)
 
     def generate(self, days: int = 30, source: str = None) -> Dict[str, Any]:
         """
@@ -190,10 +212,20 @@ class InsightsEngine:
 
     def _get_sessions(self, cutoff: float, source: str = None) -> List[Dict]:
         """Fetch sessions within the time window."""
+        profile_clause, profile_params = self._profile_predicate("profile_name")
         if source:
-            cursor = self._conn.execute(self._GET_SESSIONS_WITH_SOURCE, (cutoff, source))
+            query = self._GET_SESSIONS_WITH_SOURCE.replace(
+                " ORDER BY", f"{profile_clause} ORDER BY", 1
+            )
+            cursor = self._conn.execute(
+                query,
+                (cutoff, source, *profile_params),
+            )
         else:
-            cursor = self._conn.execute(self._GET_SESSIONS_ALL, (cutoff,))
+            query = self._GET_SESSIONS_ALL.replace(
+                " ORDER BY", f"{profile_clause} ORDER BY", 1
+            )
+            cursor = self._conn.execute(query, (cutoff, *profile_params))
         return [dict(row) for row in cursor.fetchall()]
 
     def _get_tool_usage(self, cutoff: float, source: str = None) -> List[Dict]:
@@ -205,6 +237,7 @@ class InsightsEngine:
            tool_name is not populated on tool responses)
         """
         tool_counts = Counter()
+        profile_clause, profile_params = self._profile_predicate("s.profile_name")
 
         # Source 1: explicit tool_name on tool response messages
         if source:
@@ -213,10 +246,12 @@ class InsightsEngine:
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ? AND s.source = ?
-                     AND m.role = 'tool' AND m.tool_name IS NOT NULL
+                     AND m.role = 'tool' AND m.tool_name IS NOT NULL"""
+                + profile_clause
+                + """
                    GROUP BY m.tool_name
                    ORDER BY count DESC""",
-                (cutoff, source),
+                (cutoff, source, *profile_params),
             )
         else:
             cursor = self._conn.execute(
@@ -224,10 +259,12 @@ class InsightsEngine:
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ?
-                     AND m.role = 'tool' AND m.tool_name IS NOT NULL
+                     AND m.role = 'tool' AND m.tool_name IS NOT NULL"""
+                + profile_clause
+                + """
                    GROUP BY m.tool_name
                    ORDER BY count DESC""",
-                (cutoff,),
+                (cutoff, *profile_params),
             )
         for row in cursor.fetchall():
             tool_counts[row["tool_name"]] += row["count"]
@@ -240,8 +277,9 @@ class InsightsEngine:
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ? AND s.source = ?
-                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff, source),
+                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"""
+                + profile_clause,
+                (cutoff, source, *profile_params),
             )
         else:
             cursor2 = self._conn.execute(
@@ -249,8 +287,9 @@ class InsightsEngine:
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ?
-                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff,),
+                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"""
+                + profile_clause,
+                (cutoff, *profile_params),
             )
 
         tool_calls_counts = Counter()
@@ -291,6 +330,7 @@ class InsightsEngine:
     def _get_skill_usage(self, cutoff: float, source: str = None) -> List[Dict]:
         """Extract per-skill usage from assistant tool calls."""
         skill_counts: Dict[str, Dict[str, Any]] = {}
+        profile_clause, profile_params = self._profile_predicate("s.profile_name")
 
         if source:
             cursor = self._conn.execute(
@@ -298,8 +338,9 @@ class InsightsEngine:
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ? AND s.source = ?
-                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff, source),
+                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"""
+                + profile_clause,
+                (cutoff, source, *profile_params),
             )
         else:
             cursor = self._conn.execute(
@@ -307,8 +348,9 @@ class InsightsEngine:
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ?
-                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff,),
+                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"""
+                + profile_clause,
+                (cutoff, *profile_params),
             )
 
         for row in cursor.fetchall():
@@ -366,6 +408,7 @@ class InsightsEngine:
 
     def _get_message_stats(self, cutoff: float, source: str = None) -> Dict:
         """Get aggregate message statistics."""
+        profile_clause, profile_params = self._profile_predicate("s.profile_name")
         if source:
             cursor = self._conn.execute(
                 """SELECT
@@ -375,8 +418,9 @@ class InsightsEngine:
                      SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ? AND s.source = ?""",
-                (cutoff, source),
+                   WHERE s.started_at >= ? AND s.source = ?"""
+                + profile_clause,
+                (cutoff, source, *profile_params),
             )
         else:
             cursor = self._conn.execute(
@@ -387,8 +431,9 @@ class InsightsEngine:
                      SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ?""",
-                (cutoff,),
+                   WHERE s.started_at >= ?"""
+                + profile_clause,
+                (cutoff, *profile_params),
             )
         row = cursor.fetchone()
         return dict(row) if row else {
@@ -523,12 +568,19 @@ class InsightsEngine:
         per-session aggregate.
         """
         try:
+            profile_clause, profile_params = self._profile_predicate(
+                "s.profile_name"
+            )
             if source:
                 cursor = self._conn.execute(
-                    self._GET_MODEL_USAGE_WITH_SOURCE, (cutoff, source)
+                    self._GET_MODEL_USAGE_WITH_SOURCE + profile_clause,
+                    (cutoff, source, *profile_params),
                 )
             else:
-                cursor = self._conn.execute(self._GET_MODEL_USAGE_ALL, (cutoff,))
+                cursor = self._conn.execute(
+                    self._GET_MODEL_USAGE_ALL + profile_clause,
+                    (cutoff, *profile_params),
+                )
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.OperationalError:
             return []

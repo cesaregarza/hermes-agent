@@ -33,6 +33,8 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+from session_profile_evidence import classify_session_profile_evidence
+
 # Sources that are excluded from session browsing/searching by default.
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool;
 # delegate subagent runs are tagged "subagent" — neither belongs in the
@@ -81,25 +83,74 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     return str(ts)
 
 
-def _resolve_to_parent(db, session_id: str) -> str:
-    """Walk parent_session_id chain to the lineage root. Falls back to input on errors."""
+def _get_profile_scoped_session(
+    db,
+    session_id: str,
+    profile_name: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Return one session only when its persisted evidence owns ``profile_name``.
+
+    ``profile_name=None`` is the trusted local/TUI mode and intentionally keeps
+    the historical cross-profile behavior. Gateway callers always provide a
+    profile boundary, so malformed, conflicting, quarantined, or foreign rows
+    fail closed before any transcript content is loaded.
+    """
+    try:
+        row = db.get_session(session_id)
+    except Exception as exc:
+        logging.debug("get_session failed for %s: %s", session_id, exc, exc_info=True)
+        return None
+    if not row:
+        return None
+    if profile_name is None:
+        return row
+
+    classification = classify_session_profile_evidence(
+        row,
+        getattr(db, "legacy_profile_name", None),
+    )
+    if not classification.coherent or classification.profile != profile_name:
+        logging.debug(
+            "Rejected session_search row %s for profile %s: %s",
+            session_id,
+            profile_name,
+            classification.error or f"owned by {classification.profile}",
+        )
+        return None
+    return row
+
+
+def _resolve_to_parent(
+    db,
+    session_id: str,
+    profile_name: Optional[str] = None,
+) -> Optional[str]:
+    """Walk to a lineage root without crossing a gateway profile boundary."""
     if not session_id:
         return session_id
     visited = set()
     cur = session_id
     while cur and cur not in visited:
         visited.add(cur)
-        try:
-            s = db.get_session(cur)
-            if not s:
-                break
-            parent = s.get("parent_session_id")
-            if not parent:
-                break
-            cur = parent
-        except Exception as e:
-            logging.debug("Error resolving parent for %s: %s", cur, e, exc_info=True)
+        session = _get_profile_scoped_session(db, cur, profile_name)
+        if not session:
+            # In trusted local mode preserve the historical fallback to the
+            # input. In constrained mode an incoherent starting row has no
+            # usable lineage; a foreign parent merely terminates the walk at
+            # the last profile-owned child.
+            if profile_name is not None and cur == session_id:
+                return None
             break
+        parent = session.get("parent_session_id")
+        if not parent:
+            break
+        if profile_name is not None and not _get_profile_scoped_session(
+            db,
+            parent,
+            profile_name,
+        ):
+            break
+        cur = parent
     return cur
 
 
@@ -161,7 +212,54 @@ def _resolve_profile_db(profile: str):
     if not profiles_mod.profile_exists(canon):
         raise ValueError(f"profile '{canon}' does not exist")
 
-    return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
+    return SessionDB(
+        db_path=profiles_mod.get_profile_dir(canon) / "state.db",
+        read_only=True,
+        profile_name=canon,
+    )
+
+
+def _canonical_profile_name(profile: Any) -> Optional[str]:
+    """Canonicalize a profile name with the same rules used by Hermes."""
+    if profile is None or not str(profile).strip():
+        return None
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        canonical = profiles_mod.normalize_profile_name(profile)
+        profiles_mod.validate_profile_name(canonical)
+    except (TypeError, ValueError):
+        return None
+    return canonical
+
+
+def _trusted_profile_boundary(
+    db,
+    profile_name: Optional[str],
+    allow_cross_profile: bool,
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate hidden caller-owned authorization inputs.
+
+    The public schema cannot set these values. A constrained caller must
+    provide one coherent profile; an invalid/missing boundary is an error,
+    never a request to fall back to unscoped local behavior.
+    """
+    if allow_cross_profile:
+        if profile_name is None:
+            return None, None
+    elif profile_name is None or not str(profile_name).strip():
+        return None, "session_search profile boundary is unavailable"
+
+    classification = classify_session_profile_evidence(
+        {"profile_name": profile_name},
+        getattr(db, "legacy_profile_name", None),
+    )
+    if not classification.coherent:
+        return None, (
+            "session_search profile boundary is invalid: "
+            f"{classification.error or 'unknown profile evidence'}"
+        )
+    return classification.profile, None
 
 
 def _locate_session_db(session_id: str):
@@ -195,7 +293,11 @@ def _locate_session_db(session_id: str):
             continue
         seen.add(key)
         try:
-            pdb = SessionDB(db_path=db_path, read_only=True)
+            pdb = SessionDB(
+                db_path=db_path,
+                read_only=True,
+                profile_name=name,
+            )
         except Exception:
             continue
         try:
@@ -208,7 +310,13 @@ def _locate_session_db(session_id: str):
     return None, None
 
 
-def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
+def _read_session(
+    db,
+    session_id: str,
+    head: int = 20,
+    tail: int = 10,
+    profile_name: Optional[str] = None,
+) -> str:
     """Read shape: dump a whole session by id (head + tail when large).
 
     Serves the linked-session case — the user dropped an @session reference and
@@ -216,11 +324,7 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
     full, large ones return the first ``head`` and last ``tail`` messages with a
     pointer to scroll the middle.
     """
-    try:
-        meta = db.get_session(session_id) or {}
-    except Exception as e:
-        logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
-        meta = {}
+    meta = _get_profile_scoped_session(db, session_id, profile_name) or {}
     if not meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
 
@@ -257,20 +361,34 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    profile_name: Optional[str] = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
-        sessions = db.list_sessions_rich(
+        list_kwargs = dict(
             limit=limit + 5,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
-        )  # fetch extra so we can skip current
+        )
+        if profile_name is not None:
+            list_kwargs["profile_name"] = profile_name
+        sessions = db.list_sessions_rich(**list_kwargs)  # fetch extra so we can skip current
 
-        current_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
+        current_root = (
+            _resolve_to_parent(db, current_session_id, profile_name)
+            if current_session_id
+            else None
+        )
 
         results = []
         for s in sessions:
             sid = s.get("id", "")
+            if not _get_profile_scoped_session(db, sid, profile_name):
+                continue
             if current_root and (sid == current_root or sid == current_session_id):
                 continue
             # Skip child / delegation sessions
@@ -306,6 +424,7 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    profile_name: Optional[str] = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -333,8 +452,8 @@ def _scroll(
     # Reject scrolling inside the active session lineage — those messages are
     # already in context.
     if current_session_id:
-        a_root = _resolve_to_parent(db, session_id)
-        c_root = _resolve_to_parent(db, current_session_id)
+        a_root = _resolve_to_parent(db, session_id, profile_name)
+        c_root = _resolve_to_parent(db, current_session_id, profile_name)
         if a_root and c_root and a_root == c_root:
             return tool_error(
                 "scroll rejected: anchor lives in the current session lineage (already in your active context)",
@@ -342,11 +461,7 @@ def _scroll(
             )
 
     # Session existence check
-    try:
-        session_meta = db.get_session(session_id) or {}
-    except Exception as e:
-        logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
-        session_meta = {}
+    session_meta = _get_profile_scoped_session(db, session_id, profile_name) or {}
     if not session_meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
 
@@ -376,9 +491,14 @@ def _scroll(
         except Exception as e:
             logging.debug("owning-session lookup failed: %s", e, exc_info=True)
             owning = None
-        if owning and owning != session_id:
-            a_root = _resolve_to_parent(db, session_id)
-            o_root = _resolve_to_parent(db, owning)
+        owning_meta = (
+            _get_profile_scoped_session(db, owning, profile_name)
+            if owning
+            else None
+        )
+        if owning_meta and owning != session_id:
+            a_root = _resolve_to_parent(db, session_id, profile_name)
+            o_root = _resolve_to_parent(db, owning, profile_name)
             if a_root and o_root and a_root == o_root:
                 try:
                     rebind_view = db.get_messages_around(owning, around_message_id, window=window)
@@ -389,10 +509,7 @@ def _scroll(
                             f"around_message_id {around_message_id} lives in {owning} "
                             f"(child of {session_id}); rebound transparently"
                         )
-                        try:
-                            session_meta = db.get_session(owning) or session_meta
-                        except Exception:
-                            pass
+                        session_meta = owning_meta
                         session_id = owning
                 except Exception as e:
                     logging.debug("rebind get_messages_around failed: %s", e, exc_info=True)
@@ -433,6 +550,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    profile_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -440,22 +558,32 @@ def _title_match_result(
         return None
 
     try:
-        session_id = db.resolve_session_by_title(title_query)
+        if profile_name is None:
+            session_id = db.resolve_session_by_title(title_query)
+        else:
+            session_id = db.resolve_session_by_title(
+                title_query,
+                profile_name=profile_name,
+            )
     except Exception:
         logging.debug("resolve_session_by_title failed for %r", title_query, exc_info=True)
         return None
     if not session_id:
         return None
+    session_row = _get_profile_scoped_session(db, session_id, profile_name)
+    if not session_row:
+        return None
 
-    lineage_root = _resolve_to_parent(db, session_id)
+    lineage_root = _resolve_to_parent(db, session_id, profile_name)
+    if not lineage_root:
+        return None
     if current_lineage_root and lineage_root == current_lineage_root:
         return None
 
-    try:
-        session_meta = db.get_session(lineage_root) or db.get_session(session_id) or {}
-    except Exception:
-        logging.debug("get_session failed for title match %s", session_id, exc_info=True)
-        session_meta = {}
+    session_meta = (
+        _get_profile_scoped_session(db, lineage_root, profile_name)
+        or session_row
+    )
     if session_meta.get("source") in _HIDDEN_SESSION_SOURCES:
         return None
 
@@ -503,11 +631,21 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    profile_name: Optional[str] = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
-    current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    current_lineage_root = (
+        _resolve_to_parent(db, current_session_id, profile_name)
+        if current_session_id
+        else None
+    )
+    title_result = _title_match_result(
+        db,
+        query,
+        current_lineage_root,
+        profile_name,
+    )
 
     try:
         raw_results = db.search_messages(
@@ -519,10 +657,24 @@ def _discover(
             # of cron rows are still in hand for the demotion pass below.
             offset=0,
             sort=sort,
+            profile_name=profile_name,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {e}", success=False)
+
+    # Keep a row-level classification check after the SQL profile predicate.
+    # This rejects malformed/conflicting persisted evidence before ranking,
+    # lineage traversal, anchored windows, or response shaping.
+    raw_results = [
+        row
+        for row in raw_results
+        if _get_profile_scoped_session(
+            db,
+            str(row.get("session_id") or ""),
+            profile_name,
+        )
+    ]
 
     # Demote automation (cron) rows below interactive ones before dedup, so a
     # high-volume cron corpus can't starve the user's own sessions out of the
@@ -556,7 +708,9 @@ def _discover(
         if len(seen_sessions) >= limit:
             break
         raw_sid = r["session_id"]
-        resolved_sid = _resolve_to_parent(db, raw_sid)
+        resolved_sid = _resolve_to_parent(db, raw_sid, profile_name)
+        if not resolved_sid:
+            continue
         # Skip the current session lineage
         if current_lineage_root and resolved_sid == current_lineage_root:
             continue
@@ -580,10 +734,12 @@ def _discover(
             logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
             continue
 
-        try:
-            session_meta = db.get_session(lineage_root) or {}
-        except Exception:
-            session_meta = {}
+        session_meta = (
+            _get_profile_scoped_session(db, lineage_root, profile_name)
+            or {}
+        )
+        if not session_meta:
+            continue
 
         entry = {
             "session_id": hit_sid,
@@ -630,6 +786,12 @@ def session_search(
     sort: str = None,
     # Cross-profile (any shape)
     profile: str = None,
+    *,
+    # Hidden trusted-caller authorization boundary. Gateway callers set
+    # ``allow_cross_profile=False`` and provide their classified runtime
+    # profile; local CLI/TUI callers retain historical cross-profile access.
+    profile_name: str = None,
+    allow_cross_profile: bool = True,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -651,17 +813,45 @@ def session_search(
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
 
+    scoped_profile, boundary_error = _trusted_profile_boundary(
+        db,
+        profile_name,
+        allow_cross_profile,
+    )
+    if boundary_error:
+        return tool_error(boundary_error, success=False)
+
     # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
     # Session ids never contain "/", so a slash unambiguously means profile/id —
     # always strip the prefix off the id, and adopt the embedded profile only
     # when one wasn't passed explicitly. Handles every permutation the model
     # might send (full value as id, with or without a separate profile=).
+    embedded_profile = None
     if isinstance(session_id, str) and "/" in session_id:
         emb_profile, _, emb_id = session_id.partition("/")
         if emb_id:
             session_id = emb_id
+            embedded_profile = emb_profile or None
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
+
+    if not allow_cross_profile:
+        # ``profile`` is public, model-controlled input. In a gateway runtime it
+        # may only restate the already-authorized profile; it can never select
+        # another physical database. Check the embedded and explicit values
+        # independently so conflicting permutations cannot hide one another.
+        for requested in (embedded_profile, profile):
+            if requested is None or not str(requested).strip():
+                continue
+            canonical = _canonical_profile_name(requested)
+            if canonical is None or canonical != scoped_profile:
+                return tool_error(
+                    "cross-profile session_search is unavailable in gateway sessions",
+                    success=False,
+                )
+        # Keep using the shared gateway DB. The selected profile's gateway
+        # sessions may not live in that profile's standalone state.db.
+        profile = None
 
     # Cross-profile read: swap in the named profile's DB (read-only) for every
     # shape below. The current-session-lineage guards no longer apply across
@@ -683,27 +873,29 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            profile_name=scoped_profile,
         )
 
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
         sid = session_id.strip()
-        result = _read_session(db, sid)
+        result = _read_session(db, sid, profile_name=scoped_profile)
         if json.loads(result).get("success"):
             return result
 
         # Miss in the target profile — the model may have dropped the owning
         # profile from the link. Scan every profile and read it from wherever
         # it lives, tagging the profile it was found in.
-        located, owner = _locate_session_db(sid)
-        if located is not None:
-            try:
-                found = json.loads(_read_session(located, sid))
-            finally:
-                located.close()
-            if found.get("success"):
-                found["profile"] = owner
-                return json.dumps(found, ensure_ascii=False)
+        if allow_cross_profile:
+            located, owner = _locate_session_db(sid)
+            if located is not None:
+                try:
+                    found = json.loads(_read_session(located, sid))
+                finally:
+                    located.close()
+                if found.get("success"):
+                    found["profile"] = owner
+                    return json.dumps(found, ensure_ascii=False)
         return result
 
     # Limit clamp [1, 10]
@@ -716,7 +908,12 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            scoped_profile,
+        )
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -737,6 +934,7 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        profile_name=scoped_profile,
     )
 
 
@@ -915,6 +1113,8 @@ registry.register(
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
+        profile_name=kw.get("profile_name"),
+        allow_cross_profile=kw.get("allow_cross_profile", True),
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",

@@ -9,9 +9,29 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _bind_cron_session_search_profile
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+def test_cron_session_search_is_bound_to_active_profile():
+    agent = MagicMock()
+    with patch(
+        "hermes_cli.profiles.get_active_profile_name",
+        return_value="coder",
+    ):
+        assert _bind_cron_session_search_profile(agent) == "coder"
+    assert agent._gateway_session_search_profile == "coder"
+
+
+def test_cron_session_search_fails_closed_without_valid_profile():
+    agent = MagicMock()
+    with patch(
+        "hermes_cli.profiles.get_active_profile_name",
+        return_value="../../escape",
+    ):
+        assert _bind_cron_session_search_profile(agent) is None
+    assert agent._gateway_session_search_profile is None
 
 
 class TestPerJobToolsetMcpMerge:

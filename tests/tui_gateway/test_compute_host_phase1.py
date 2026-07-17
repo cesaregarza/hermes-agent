@@ -334,3 +334,55 @@ for raw in sys.stdin:
         assert supervisor.is_running()
     finally:
         supervisor.shutdown()
+
+
+def test_compute_host_rejects_live_session_profile_retarget(tmp_path):
+    coder_home = str((tmp_path / "profiles" / "coder").resolve())
+    writer_home = str((tmp_path / "profiles" / "writer").resolve())
+
+    class _Server:
+        _sessions = {
+            "sid": {
+                "profile_name": "coder",
+                "profile_home": coder_home,
+                "transport": None,
+            }
+        }
+
+        @staticmethod
+        def _profile_name_for_home(name, home):
+            resolved = str(Path(home).resolve())
+            if name == "coder" and resolved == coder_home:
+                return "coder"
+            if name == "writer" and resolved == writer_home:
+                return "writer"
+            return None
+
+        @staticmethod
+        def _resolve_profile_target(name):
+            return name or "default", None
+
+        @staticmethod
+        def _profile_scope_name(name):
+            return name or "default"
+
+    host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
+    try:
+        with pytest.raises(
+            ValueError,
+            match="cannot be retargeted",
+        ):
+            host._ensure_server_session(
+                _Server,
+                {
+                    "sid": "sid",
+                    "session_key": "key",
+                    "profile_name": "writer",
+                    "profile_home": writer_home,
+                },
+            )
+    finally:
+        host.close()
+
+    assert _Server._sessions["sid"]["profile_name"] == "coder"
+    assert _Server._sessions["sid"]["profile_home"] == coder_home

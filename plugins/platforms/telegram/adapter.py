@@ -783,14 +783,20 @@ class TelegramAdapter(BasePlatformAdapter):
             if self.config.extra.get("base_url")
             else 20 * 1024 * 1024
         )
-        # Interactive model picker state per chat
-        self._model_picker_state: Dict[str, dict] = {}
-        self._choice_picker_state: Dict[str, dict] = {}
+        # Interactive picker state. Exact (chat_id, message_id) keys isolate
+        # concurrent prompts in different topics/runtime profiles on one shared
+        # bot; chat_id aliases preserve compatibility with older in-memory state.
+        self._model_picker_state: Dict[Any, dict] = {}
+        self._choice_picker_state: Dict[Any, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
+        # Trusted runtime profile captured with the slash-confirm prompt. A
+        # shared primary bot may transport a secondary profile's prompt, so
+        # callback follow-up cleanup cannot infer this from adapter ownership.
+        self._slash_confirm_profile_state: Dict[str, str] = {}
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
@@ -1202,7 +1208,11 @@ class TelegramAdapter(BasePlatformAdapter):
         return "thread not found" in str(error).lower()
 
     def _prune_stale_dm_topic_binding(
-        self, chat_id: Any, thread_id: Any,
+        self,
+        chat_id: Any,
+        thread_id: Any,
+        *,
+        profile_name: Optional[str] = None,
     ) -> None:
         """Drop the stale ``telegram_dm_topic_bindings`` row for a
         topic Telegram has confirmed deleted.
@@ -1225,8 +1235,44 @@ class TelegramAdapter(BasePlatformAdapter):
         if db is None or not hasattr(db, "delete_telegram_topic_binding"):
             return
         try:
+            from gateway.session import canonicalize_gateway_profile_name
+
+            runtime_profile = canonicalize_gateway_profile_name(
+                profile_name,
+                field_name="Telegram topic prune runtime profile",
+            )
+        except (ImportError, TypeError, ValueError):
+            logger.warning(
+                "[%s] Skipping stale Telegram topic prune with invalid runtime "
+                "profile %r (chat=%s thread=%s)",
+                self.name,
+                profile_name,
+                chat_id,
+                thread_id,
+            )
+            return
+        adapter_profile = str(getattr(self, "_profile_name", "") or "").strip() or None
+        if (
+            runtime_profile is None
+            and bool(getattr(self, "_profile_routes_enabled", False))
+        ):
+            # A shared primary credential can transport turns for several
+            # runtime profiles. Its owner is not evidence of which profile's
+            # binding failed. Skipping cleanup is safer than deleting a sibling
+            # profile's same-(chat, thread) row.
+            logger.warning(
+                "[%s] Skipping stale Telegram topic prune without runtime "
+                "profile context (chat=%s thread=%s)",
+                self.name,
+                chat_id,
+                thread_id,
+            )
+            return
+        try:
             removed = db.delete_telegram_topic_binding(
-                chat_id=str(chat_id), thread_id=str(thread_id),
+                chat_id=str(chat_id),
+                thread_id=str(thread_id),
+                profile_name=runtime_profile or adapter_profile,
             )
         except Exception:
             logger.debug(
@@ -4166,7 +4212,11 @@ class TelegramAdapter(BasePlatformAdapter):
                                     self.name, effective_thread_id,
                                 )
                                 self._prune_stale_dm_topic_binding(
-                                    chat_id, effective_thread_id,
+                                    chat_id,
+                                    effective_thread_id,
+                                    profile_name=(
+                                        (metadata or {}).get("runtime_profile")
+                                    ),
                                 )
                                 used_thread_fallback = True
                                 effective_thread_id = None
@@ -4908,6 +4958,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             raise RuntimeError("Not connected")
 
+        topic_profile_name = kwargs.pop("_topic_profile_name", None)
         message_thread_id = kwargs.get("message_thread_id")
         try:
             return await self._bot.send_message(**kwargs)
@@ -4927,7 +4978,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 # so the binding row in state.db must go too
                 # (#31501).
                 self._prune_stale_dm_topic_binding(
-                    kwargs.get("chat_id"), message_thread_id,
+                    kwargs.get("chat_id"),
+                    message_thread_id,
+                    profile_name=topic_profile_name,
                 )
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("message_thread_id", None)
@@ -4958,6 +5011,7 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
             msg = await self._send_message_with_thread_fallback(
+                _topic_profile_name=(metadata or {}).get("runtime_profile"),
                 chat_id=normalize_telegram_chat_id(chat_id),
                 text=text,
                 parse_mode=ParseMode.MARKDOWN_V2,
@@ -5028,6 +5082,7 @@ class TelegramAdapter(BasePlatformAdapter):
             keyboard = InlineKeyboardMarkup([buttons])
 
             kwargs: Dict[str, Any] = {
+                "_topic_profile_name": (metadata or {}).get("runtime_profile"),
                 "chat_id": normalize_telegram_chat_id(chat_id),
                 "text": text,
                 "parse_mode": ParseMode.HTML,
@@ -5079,6 +5134,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             thread_id = self._metadata_thread_id(metadata)
             kwargs: Dict[str, Any] = {
+                "_topic_profile_name": (metadata or {}).get("runtime_profile"),
                 "chat_id": normalize_telegram_chat_id(chat_id),
                 "text": preview,
                 "parse_mode": ParseMode.MARKDOWN_V2,
@@ -5099,6 +5155,18 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
             self._slash_confirm_state[confirm_id] = session_key
+            if runtime_profile := str(
+                (metadata or {}).get("runtime_profile") or ""
+            ).strip():
+                profile_state = getattr(
+                    self,
+                    "_slash_confirm_profile_state",
+                    None,
+                )
+                if profile_state is None:
+                    profile_state = {}
+                    self._slash_confirm_profile_state = profile_state
+                profile_state[confirm_id] = runtime_profile
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, _redact_telegram_error_text(e))
@@ -5143,6 +5211,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 text += f"\n\n{option_lines}"
 
             kwargs: Dict[str, Any] = {
+                "_topic_profile_name": (metadata or {}).get("runtime_profile"),
                 "chat_id": normalize_telegram_chat_id(chat_id),
                 "text": text,
                 "parse_mode": ParseMode.HTML,
@@ -5186,6 +5255,65 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    @staticmethod
+    def _remember_picker_state(
+        store: Dict[Any, dict],
+        chat_id: Any,
+        message_id: Any,
+        state: dict,
+    ) -> None:
+        """Keep an exact prompt key plus the historical per-chat alias."""
+        chat_key = str(chat_id)
+        store[(chat_key, str(message_id))] = state
+        store[chat_key] = state
+
+    @staticmethod
+    def _picker_state_for_query(
+        store: Dict[Any, dict],
+        query: Any,
+        chat_id: Any,
+    ) -> tuple[Any, Optional[dict]]:
+        """Resolve picker state only for the Telegram message that owns it.
+
+        A shared bot can render pickers for multiple runtime profiles in the
+        same chat. Falling back from one prompt's callback to the chat's newest
+        picker would invoke the wrong profile callback, so a real message id
+        mismatch expires instead of crossing that boundary.
+        """
+        chat_key = str(chat_id)
+        message = getattr(query, "message", None)
+        message_id = getattr(message, "message_id", None)
+        if isinstance(message_id, (int, str)) and str(message_id):
+            exact_key = (chat_key, str(message_id))
+            state = store.get(exact_key)
+            if state is not None:
+                return exact_key, state
+            legacy_state = store.get(chat_key)
+            if (
+                legacy_state is not None
+                and str(legacy_state.get("msg_id")) == str(message_id)
+            ):
+                return chat_key, legacy_state
+            return exact_key, None
+        return chat_key, store.get(chat_key)
+
+    @staticmethod
+    def _drop_picker_state(
+        store: Dict[Any, dict],
+        chat_id: Any,
+        state_key: Any,
+        state: dict,
+    ) -> None:
+        """Remove exact and compatibility aliases only when they own *state*."""
+        chat_key = str(chat_id)
+        if store.get(state_key) is state:
+            store.pop(state_key, None)
+        exact_key = (chat_key, str(state.get("msg_id")))
+        if store.get(exact_key) is state:
+            store.pop(exact_key, None)
+        if store.get(chat_key) is state:
+            store.pop(chat_key, None)
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -5227,6 +5355,7 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id = metadata.get("thread_id") if metadata else None
             reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
             msg = await self._send_message_with_thread_fallback(
+                _topic_profile_name=(metadata or {}).get("runtime_profile"),
                 chat_id=normalize_telegram_chat_id(chat_id),
                 text=text,
                 parse_mode=ParseMode.MARKDOWN_V2,
@@ -5242,8 +5371,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
 
-            # Store picker state keyed by chat_id
-            self._model_picker_state[str(chat_id)] = {
+            state = {
                 "msg_id": msg.message_id,
                 "providers": providers,
                 "session_key": session_key,
@@ -5252,6 +5380,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 "current_provider": current_provider,
                 "provider_page": 0,
             }
+            self._remember_picker_state(
+                self._model_picker_state,
+                chat_id,
+                msg.message_id,
+                state,
+            )
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -5297,6 +5431,7 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id = metadata.get("thread_id") if metadata else None
             reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
             msg = await self._send_message_with_thread_fallback(
+                _topic_profile_name=(metadata or {}).get("runtime_profile"),
                 chat_id=normalize_telegram_chat_id(chat_id),
                 text=self.format_message(title),
                 parse_mode=ParseMode.MARKDOWN_V2,
@@ -5312,12 +5447,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
 
-            self._choice_picker_state[str(chat_id)] = {
+            state = {
                 "msg_id": msg.message_id,
                 "choices": choices,
                 "session_key": session_key,
                 "on_choice_selected": on_choice_selected,
             }
+            self._remember_picker_state(
+                self._choice_picker_state,
+                chat_id,
+                msg.message_id,
+                state,
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_choice_picker failed: %s", self.name, _redact_telegram_error_text(e))
@@ -5327,7 +5468,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self, query, data: str, chat_id: str
     ) -> None:
         """Handle choice picker button taps (cp:<index>)."""
-        state = self._choice_picker_state.get(chat_id)
+        state_key, state = self._picker_state_for_query(
+            self._choice_picker_state,
+            query,
+            chat_id,
+        )
         if not state:
             await query.answer(text="Picker expired — run the command again.")
             return
@@ -5379,7 +5524,12 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass
         await query.answer()
-        self._choice_picker_state.pop(chat_id, None)
+        self._drop_picker_state(
+            self._choice_picker_state,
+            chat_id,
+            state_key,
+            state,
+        )
 
     _MODEL_PAGE_SIZE = 8
 
@@ -5499,7 +5649,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self, query, data: str, chat_id: str
     ) -> None:
         """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
-        state = self._model_picker_state.get(chat_id)
+        state_key, state = self._picker_state_for_query(
+            self._model_picker_state,
+            query,
+            chat_id,
+        )
         if not state:
             await query.answer(text="Picker expired — use /model again.")
             return
@@ -5662,7 +5816,12 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(
                 text="Switch failed." if switch_failed else "Model switched!"
             )
-            self._model_picker_state.pop(chat_id, None)
+            self._drop_picker_state(
+                self._model_picker_state,
+                chat_id,
+                state_key,
+                state,
+            )
 
         elif data.startswith("mm:"):
             # --- Model selected: perform the switch ---
@@ -5745,7 +5904,12 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             # Clean up state
-            self._model_picker_state.pop(chat_id, None)
+            self._drop_picker_state(
+                self._model_picker_state,
+                chat_id,
+                state_key,
+                state,
+            )
 
         elif data.startswith("mpg:"):
             # --- Provider group selected: show member providers ---
@@ -5819,7 +5983,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         elif data == "mx":
             # --- Cancel ---
-            self._model_picker_state.pop(chat_id, None)
+            self._drop_picker_state(
+                self._model_picker_state,
+                chat_id,
+                state_key,
+                state,
+            )
             await query.edit_message_text(
                 text="Model selection cancelled.",
                 reply_markup=None,
@@ -5985,6 +6154,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to answer this prompt.")
                     return
 
+                profile_state = getattr(
+                    self,
+                    "_slash_confirm_profile_state",
+                    {},
+                )
+                topic_profile_name = (
+                    profile_state.pop(confirm_id, None)
+                    if isinstance(profile_state, dict)
+                    else None
+                )
                 session_key = self._slash_confirm_state.pop(confirm_id, None)
                 if not session_key:
                     await query.answer(text="This prompt has already been resolved.")
@@ -6027,6 +6206,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_type = getattr(chat, "type", None)
                         prompt_message_id = getattr(query.message, "message_id", None)
                         send_kwargs: Dict[str, Any] = {
+                            "_topic_profile_name": topic_profile_name,
                             "chat_id": int(query.message.chat_id),
                             "text": self.format_message(result_text),
                             "parse_mode": ParseMode.MARKDOWN_V2,

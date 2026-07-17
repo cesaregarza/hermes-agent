@@ -314,7 +314,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'switching session…' })
 
-      gw.request<SessionActivateResponse>('session.activate', { session_id: id })
+      gw.request<SessionActivateResponse>('session.activate', {
+        current_session_id: getUiState().sid,
+        session_id: id
+      })
         .then(raw => {
           const r = asRpcResult<SessionActivateResponse>(raw)
 

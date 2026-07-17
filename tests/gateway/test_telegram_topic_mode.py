@@ -638,7 +638,7 @@ async def test_topic_root_command_explicitly_migrates_and_enables_topic_mode(tmp
 
     assert "Telegram multi-session topics are enabled" in result
     assert "All Messages" in result
-    assert session_db.get_meta("telegram_dm_topic_schema_version") == "2"
+    assert session_db.get_meta("telegram_dm_topic_schema_version") == "3"
     assert session_db.is_telegram_topic_mode_enabled(chat_id="208214988", user_id="208214988")
     assert runner._telegram_topic_mode_enabled(_make_source()) is True
     runner._run_agent.assert_not_called()
@@ -1252,7 +1252,7 @@ def test_migration_rebuilds_v1_binding_table_with_cascade_fk(tmp_path):
     version = db._conn.execute(
         "SELECT value FROM state_meta WHERE key = 'telegram_dm_topic_schema_version'"
     ).fetchone()
-    assert version is not None and version[0] == "2"
+    assert version is not None and version[0] == "3"
 
 
 @pytest.mark.asyncio

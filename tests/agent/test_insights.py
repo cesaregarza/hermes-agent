@@ -260,6 +260,107 @@ class TestInsightsEmpty:
 # =========================================================================
 
 class TestInsightsPopulated:
+    def test_profile_scope_filters_every_report_surface(self, db):
+        db.create_session(
+            session_id="default-visible",
+            source="telegram",
+            model="visible-model",
+            profile_name="default",
+        )
+        db.update_token_counts(
+            "default-visible",
+            input_tokens=10,
+            output_tokens=5,
+            model="visible-model",
+            billing_provider="custom",
+            estimated_cost_usd=1.0,
+            cost_status="estimated",
+            cost_source="provider",
+            api_call_count=1,
+        )
+        db.append_message("default-visible", "user", "visible prompt")
+        db.append_message(
+            "default-visible",
+            "assistant",
+            "visible tools",
+            tool_calls=[
+                {"function": {"name": "visible_tool"}},
+                {
+                    "function": {
+                        "name": "skill_view",
+                        "arguments": '{"name":"visible-skill"}',
+                    }
+                },
+            ],
+        )
+        db.append_message(
+            "default-visible",
+            "tool",
+            "visible result",
+            tool_name="visible_tool",
+        )
+
+        db.create_session(
+            session_id="coder-secret",
+            source="slack",
+            model="secret-model",
+            profile_name="coder",
+        )
+        db.update_token_counts(
+            "coder-secret",
+            input_tokens=1000,
+            output_tokens=500,
+            model="secret-model",
+            billing_provider="custom",
+            estimated_cost_usd=99.0,
+            cost_status="estimated",
+            cost_source="provider",
+            api_call_count=9,
+        )
+        db.append_message("coder-secret", "user", "secret prompt")
+        db.append_message(
+            "coder-secret",
+            "assistant",
+            "secret tools",
+            tool_calls=[
+                {"function": {"name": "secret_tool"}},
+                {
+                    "function": {
+                        "name": "skill_manage",
+                        "arguments": '{"name":"secret-skill"}',
+                    }
+                },
+            ],
+        )
+        db.append_message(
+            "coder-secret",
+            "tool",
+            "secret result",
+            tool_name="secret_tool",
+        )
+
+        report = InsightsEngine(db, profile_name="default").generate(days=30)
+
+        assert report["overview"]["total_sessions"] == 1
+        assert report["overview"]["total_messages"] == 3
+        assert report["overview"]["estimated_cost"] == pytest.approx(1.0)
+        assert {model["model"] for model in report["models"]} == {
+            "visible-model"
+        }
+        assert {platform["platform"] for platform in report["platforms"]} == {
+            "telegram"
+        }
+        assert {tool["tool"] for tool in report["tools"]} == {
+            "skill_view",
+            "visible_tool",
+        }
+        assert {
+            skill["skill"] for skill in report["skills"]["top_skills"]
+        } == {"visible-skill"}
+        assert {
+            item["session_id"] for item in report["top_sessions"]
+        } <= {"default-visible"}
+
     def test_generate_returns_all_sections(self, populated_db):
         engine = InsightsEngine(populated_db)
         report = engine.generate(days=30)

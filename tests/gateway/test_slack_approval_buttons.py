@@ -3,6 +3,7 @@
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -73,6 +74,31 @@ class _AuthRunner:
 
 def _attach_auth_runner(adapter, auth_fn=None):
     runner = _AuthRunner(auth_fn=auth_fn)
+    adapter.set_message_handler(runner.handle)
+    return runner
+
+
+class _MultiplexAuthRunner(_AuthRunner):
+    def __init__(self, auth_fn=None):
+        super().__init__(auth_fn=auth_fn)
+        self.config = SimpleNamespace(multiplex_profiles=True)
+
+    @staticmethod
+    def _primary_adapter_profile_name():
+        return "default"
+
+    @staticmethod
+    def _profile_name_for_source(source):
+        if source.thread_id == "9999.0000":
+            return "restricted"
+        return "default"
+
+
+def _attach_multiplex_auth_runner(adapter, auth_fn=None):
+    runner = _MultiplexAuthRunner(auth_fn=auth_fn)
+    adapter.gateway_runner = runner
+    adapter._profile_name = "default"
+    adapter._profile_routes_enabled = True
     adapter.set_message_handler(runner.handle)
     return runner
 
@@ -301,6 +327,66 @@ class TestSlackApprovalAction:
         ack.assert_called_once()
         mock_resolve.assert_not_called()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action_id",
+        ["hermes_approve_once", "hermes_deny"],
+    )
+    async def test_thread_profile_denial_blocks_dangerous_action(self, action_id):
+        adapter = _make_adapter()
+        _attach_multiplex_auth_runner(
+            adapter,
+            auth_fn=lambda source: source.profile == "default",
+        )
+        adapter._approval_resolved["1234.5678"] = False
+        adapter._team_clients["T1"].chat_update = AsyncMock()
+
+        body = {
+            "message": {
+                "ts": "1234.5678",
+                "thread_ts": "9999.0000",
+                "blocks": [],
+            },
+            "channel": {"id": "C1"},
+            "user": {"name": "channel-owner", "id": "U_OWNER"},
+        }
+        action = {
+            "action_id": action_id,
+            "value": "agent:restricted:slack:group:C1:9999.0000",
+        }
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._handle_approval_action(AsyncMock(), body, action)
+
+        mock_resolve.assert_not_called()
+        adapter._team_clients["T1"].chat_update.assert_not_called()
+        assert adapter._approval_resolved["1234.5678"] is False
+
+    @pytest.mark.asyncio
+    async def test_pending_profile_mismatch_blocks_authorized_actor(self):
+        adapter = _make_adapter()
+        runner = _attach_multiplex_auth_runner(adapter, auth_fn=lambda _source: True)
+        adapter._approval_resolved["1234.5678"] = False
+
+        body = {
+            # Missing thread_ts resolves authorization in the default profile,
+            # which must not consume a restricted-profile pending approval.
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "channel-owner", "id": "U_OWNER"},
+        }
+        action = {
+            "action_id": "hermes_approve_once",
+            "value": "agent:restricted:slack:group:C1:9999.0000",
+        }
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._handle_approval_action(AsyncMock(), body, action)
+
+        mock_resolve.assert_not_called()
+        assert runner.seen_sources == []
+        assert adapter._approval_resolved["1234.5678"] is False
+
 
 class TestSlackInteractiveAuth:
     def test_delegates_to_gateway_runner_auth(self):
@@ -340,6 +426,53 @@ class TestSlackInteractiveAuth:
             team_id="T1",
         ) is True
         assert runner.seen_sources[0].scope_id == "T1"
+
+    def test_passes_thread_scope_and_authorizes_in_resolved_profile(self):
+        adapter = _make_adapter()
+        runner = _attach_multiplex_auth_runner(
+            adapter,
+            auth_fn=lambda source: source.profile == "default",
+        )
+
+        assert adapter._is_interactive_user_authorized(
+            "U_OWNER",
+            channel_id="C1",
+            team_id="T1",
+            session_key="agent:main:slack:group:C1",
+        ) is True
+        assert adapter._is_interactive_user_authorized(
+            "U_OWNER",
+            channel_id="C1",
+            team_id="T1",
+            thread_id="9999.0000",
+            session_key="agent:restricted:slack:group:C1:9999.0000",
+        ) is False
+
+        assert runner.seen_sources[0].thread_id is None
+        assert runner.seen_sources[0].profile == "default"
+        assert runner.seen_sources[1].thread_id == "9999.0000"
+        assert runner.seen_sources[1].scope_id == "T1"
+        assert runner.seen_sources[1].profile == "restricted"
+
+    @pytest.mark.parametrize(
+        "session_key",
+        [
+            "",
+            "agent:default:slack:group:C1",
+            "agent:../escape:slack:group:C1",
+            "agent:restricted:discord:group:C1",
+        ],
+    )
+    def test_multiplex_rejects_missing_or_invalid_profile_evidence(self, session_key):
+        adapter = _make_adapter()
+        runner = _attach_multiplex_auth_runner(adapter, auth_fn=lambda _source: True)
+
+        assert adapter._is_interactive_user_authorized(
+            "U_OWNER",
+            channel_id="C1",
+            session_key=session_key,
+        ) is False
+        assert runner.seen_sources == []
 
     def test_secondary_uses_registered_profile_auth_not_primary_env(self, monkeypatch):
         """A closure-bound secondary cannot inherit the primary allow-all env."""
@@ -471,6 +604,47 @@ class TestSlackSlashConfirmAction:
         secondary_client.chat_update.assert_awaited_once()
         secondary_client.chat_postMessage.assert_awaited_once()
         adapter._team_clients["T1"].chat_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action_id",
+        ["hermes_confirm_once", "hermes_confirm_cancel"],
+    )
+    async def test_thread_profile_denial_blocks_confirm_and_cancel(self, action_id):
+        adapter = _make_adapter()
+        _attach_multiplex_auth_runner(
+            adapter,
+            auth_fn=lambda source: source.profile == "default",
+        )
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+        mock_client.chat_postMessage = AsyncMock()
+
+        body = {
+            "message": {
+                "ts": "2222.3333",
+                "thread_ts": "9999.0000",
+                "blocks": [],
+            },
+            "channel": {"id": "C1"},
+            "user": {"name": "channel-owner", "id": "U_OWNER"},
+        }
+        action = {
+            "action_id": action_id,
+            "value": (
+                "agent:restricted:slack:group:C1:9999.0000|confirm-restricted"
+            ),
+        }
+
+        with patch(
+            "tools.slash_confirm.resolve",
+            new=AsyncMock(),
+        ) as mock_resolve:
+            await adapter._handle_slash_confirm_action(AsyncMock(), body, action)
+
+        mock_resolve.assert_not_awaited()
+        mock_client.chat_update.assert_not_called()
+        mock_client.chat_postMessage.assert_not_called()
 
 
 # ===========================================================================

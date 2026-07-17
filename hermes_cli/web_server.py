@@ -4025,6 +4025,7 @@ async def get_action_status(name: str, lines: int = 200):
 # them; ``GET /api/sessions/{id}`` detail reads stay complete. List callers
 # that genuinely need the full rows can pass ``?full=1``.
 _SESSION_LIST_HEAVY_FIELDS = ("system_prompt", "model_config")
+_SESSION_DB_PAGE_SIZE = 500
 
 
 def _strip_session_list_rows(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -4032,6 +4033,644 @@ def _strip_session_list_rows(sessions: List[Dict[str, Any]]) -> List[Dict[str, A
         for key in _SESSION_LIST_HEAVY_FIELDS:
             s.pop(key, None)
     return sessions
+
+
+def _session_db_path_key(path: Path) -> str:
+    """Return a stable comparison key without requiring the path to exist."""
+    try:
+        return str(Path(path).resolve(strict=False))
+    except (OSError, RuntimeError):
+        return str(Path(path).absolute())
+
+
+@contextmanager
+def _open_profile_session_candidates(
+    profile: Optional[str],
+    *,
+    read_only: bool,
+):
+    """Open every DB that may contain sessions owned by one profile.
+
+    A multiplex gateway persists every routed profile in the default
+    profile's shared ``state.db``. Older standalone profile runs persist in
+    ``<profile>/state.db`` instead. Dashboard reads and mutations therefore
+    need an owner-filtered union of both stores; opening only the physical
+    profile DB makes multiplex sessions disappear, while treating the shared
+    DB as implicitly owned by the requested profile exposes its neighbours.
+    """
+    from hermes_state import DEFAULT_DB_PATH, SessionDB
+
+    target_name: Optional[str] = None
+    target_home: Optional[Path] = None
+    if profile:
+        target_name, target_home = _cron_profile_home(profile)
+
+    primary_path = Path(DEFAULT_DB_PATH)
+    specs: List[Tuple[Optional[str], Path, bool]] = [
+        (None, primary_path, True),
+    ]
+    if target_home is not None:
+        target_path = Path(target_home) / "state.db"
+        if _session_db_path_key(target_path) != _session_db_path_key(primary_path):
+            specs.append((target_name, target_path, False))
+
+    handles: List[Any] = []
+    seen_paths: set[str] = set()
+    try:
+        for owner_hint, db_path, is_primary in specs:
+            path_key = _session_db_path_key(db_path)
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+
+            # Named profile DBs are optional: a profile can exist before it
+            # has ever created a session. Do not create those files during a
+            # dashboard read or a lookup for an existing row.
+            if not is_primary and not db_path.exists():
+                continue
+            if read_only and db_path.exists():
+                kwargs: Dict[str, Any] = {
+                    "db_path": db_path,
+                    "read_only": True,
+                }
+                if owner_hint is not None:
+                    kwargs["profile_name"] = owner_hint
+                db = SessionDB(**kwargs)
+            else:
+                kwargs = {"db_path": db_path}
+                if owner_hint is not None:
+                    kwargs["profile_name"] = owner_hint
+                db = SessionDB(**kwargs)
+            handles.append(db)
+
+        if not handles:
+            # The primary branch above normally creates this handle. Keep a
+            # defensive fallback for test doubles and unusual custom stores.
+            handles.append(SessionDB())
+        if target_name is None:
+            target_name = str(
+                getattr(handles[0], "legacy_profile_name", "default")
+                or "default"
+            )
+        yield target_name, handles
+    finally:
+        for db in handles:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+@contextmanager
+def _open_profile_session_sources(
+    targets: List[Tuple[str, Path]],
+):
+    """Open each physical profile store plus the shared primary exactly once."""
+    from hermes_state import DEFAULT_DB_PATH, SessionDB
+
+    primary_path = Path(DEFAULT_DB_PATH)
+    specs: List[Tuple[Optional[str], Path]] = [(None, primary_path)]
+    for name, home in targets:
+        path = Path(home) / "state.db"
+        if _session_db_path_key(path) == _session_db_path_key(primary_path):
+            continue
+        specs.append((name, path))
+
+    handles: List[Any] = []
+    seen_paths: set[str] = set()
+    try:
+        for owner_hint, db_path in specs:
+            path_key = _session_db_path_key(db_path)
+            if path_key in seen_paths or not db_path.exists():
+                continue
+            seen_paths.add(path_key)
+            kwargs: Dict[str, Any] = {
+                "db_path": db_path,
+                "read_only": True,
+            }
+            if owner_hint is not None:
+                kwargs["profile_name"] = owner_hint
+            handles.append(SessionDB(**kwargs))
+        yield handles
+    finally:
+        for db in handles:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _session_row_profile(db: Any, row: Dict[str, Any]) -> Optional[str]:
+    """Classify persisted ownership, excluding malformed/conflicting rows."""
+    from session_profile_evidence import classify_session_profile_evidence
+
+    classification = classify_session_profile_evidence(
+        row,
+        getattr(db, "legacy_profile_name", None),
+    )
+    return classification.profile if classification.coherent else None
+
+
+def _owned_session_row(
+    db: Any,
+    session_id: str,
+    profile_name: str,
+) -> Optional[Dict[str, Any]]:
+    row = db.get_session(session_id)
+    if not row or _session_row_profile(db, row) != profile_name:
+        return None
+    return row
+
+
+def _owned_compression_tip(
+    db: Any,
+    session_id: str,
+    profile_name: str,
+) -> Optional[str]:
+    """Resolve one compression tip without letting another owner win.
+
+    ``SessionDB.get_compression_tip`` predates multiplexing and ranks every
+    child in the physical database. Post-validating only its chosen result is
+    fail-closed for confidentiality, but a newer foreign child can still
+    starve the requested profile's valid continuation. Rank the same candidate
+    set and discard incoherent/foreign rows *before* choosing each hop.
+    """
+    if _owned_session_row(db, session_id, profile_name) is None:
+        return None
+
+    conn = getattr(db, "_conn", None)
+    lock = getattr(db, "_lock", None)
+    if conn is None or lock is None:
+        return session_id
+
+    current = session_id
+    seen = {current}
+    for _ in range(100):
+        with lock:
+            rows = conn.execute(
+                """
+                SELECT child.*,
+                       COALESCE(
+                         (SELECT MAX(m.timestamp)
+                          FROM messages m
+                          WHERE m.session_id = child.id),
+                         child.started_at
+                       ) AS _candidate_activity
+                FROM sessions parent
+                JOIN sessions child ON child.parent_session_id = parent.id
+                WHERE parent.id = ?
+                  AND parent.end_reason = 'compression'
+                  AND json_extract(
+                        COALESCE(child.model_config, '{}'),
+                        '$._branched_from'
+                      ) IS NULL
+                  AND json_extract(
+                        COALESCE(child.model_config, '{}'),
+                        '$._delegate_from'
+                      ) IS NULL
+                  AND COALESCE(child.source, '') != 'tool'
+                ORDER BY
+                  CASE
+                    WHEN child.end_reason = 'compression' THEN 0
+                    WHEN child.ended_at IS NULL THEN 1
+                    ELSE 2
+                  END,
+                  _candidate_activity DESC,
+                  child.started_at DESC,
+                  child.id DESC
+                """,
+                (current,),
+            ).fetchall()
+
+        next_id = None
+        for raw in rows:
+            candidate = dict(raw)
+            candidate.pop("_candidate_activity", None)
+            if _session_row_profile(db, candidate) == profile_name:
+                next_id = str(candidate.get("id") or "")
+                break
+        if not next_id or next_id in seen:
+            return current
+        seen.add(next_id)
+        current = next_id
+    return current
+
+
+def _owned_resume_session_id(
+    db: Any,
+    session_id: str,
+    profile_name: str,
+) -> Optional[str]:
+    """Profile-safe equivalent of ``SessionDB.resolve_resume_session_id``."""
+    current = _owned_compression_tip(db, session_id, profile_name)
+    if current is None:
+        return None
+
+    conn = getattr(db, "_conn", None)
+    lock = getattr(db, "_lock", None)
+    if conn is None or lock is None:
+        return current
+
+    original = current
+    best = None
+    seen = {current}
+    for _ in range(32):
+        with lock:
+            has_messages = conn.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                (current,),
+            ).fetchone()
+            child_rows = conn.execute(
+                """
+                SELECT *
+                FROM sessions
+                WHERE parent_session_id = ?
+                  AND json_extract(
+                        COALESCE(model_config, '{}'),
+                        '$._branched_from'
+                      ) IS NULL
+                  AND json_extract(
+                        COALESCE(model_config, '{}'),
+                        '$._delegate_from'
+                      ) IS NULL
+                  AND COALESCE(source, '') != 'tool'
+                ORDER BY started_at DESC, id DESC
+                """,
+                (current,),
+            ).fetchall()
+        if has_messages is not None:
+            best = current
+
+        child_id = None
+        for raw in child_rows:
+            candidate = dict(raw)
+            if _session_row_profile(db, candidate) == profile_name:
+                child_id = str(candidate.get("id") or "")
+                break
+        if not child_id or child_id in seen:
+            break
+        seen.add(child_id)
+        current = child_id
+    return best if best is not None else original
+
+
+def _project_owned_compression_tip(
+    db: Any,
+    row: Dict[str, Any],
+    profile_name: str,
+    *,
+    compact_rows: bool,
+) -> Dict[str, Any]:
+    """Project a list row only when the selected tip has the same owner."""
+    if row.get("end_reason") != "compression":
+        return row
+    try:
+        tip_id = _owned_compression_tip(
+            db,
+            str(row["id"]),
+            profile_name,
+        )
+    except Exception:
+        return row
+    if not tip_id or tip_id == row["id"]:
+        return row
+    try:
+        tip = db._get_session_rich_row(tip_id, compact_rows=compact_rows)
+    except Exception:
+        tip = None
+    if not tip or _session_row_profile(db, tip) != profile_name:
+        return row
+
+    projected = dict(row)
+    for key in (
+        "id",
+        "ended_at",
+        "end_reason",
+        "message_count",
+        "tool_call_count",
+        "title",
+        "last_active",
+        "preview",
+        "model",
+        "system_prompt",
+        "cwd",
+        "git_branch",
+        "git_repo_root",
+    ):
+        if key in tip:
+            projected[key] = tip[key]
+    projected["_lineage_root_id"] = row["id"]
+    return projected
+
+
+def _list_owned_sessions_from_db(
+    db: Any,
+    profile_name: str,
+    *,
+    source: Optional[str],
+    exclude_sources: Optional[List[str]],
+    cwd_prefix: Optional[str],
+    min_message_count: int,
+    include_archived: bool,
+    archived_only: bool,
+    order_by_last_active: bool,
+    compact_rows: bool,
+) -> List[Dict[str, Any]]:
+    """Read every listable row in one profile scope, then verify evidence."""
+    owned: List[Dict[str, Any]] = []
+    raw_offset = 0
+    while True:
+        page = db.list_sessions_rich(
+            source=source,
+            exclude_sources=exclude_sources,
+            cwd_prefix=cwd_prefix,
+            limit=_SESSION_DB_PAGE_SIZE,
+            offset=raw_offset,
+            min_message_count=min_message_count,
+            include_archived=include_archived,
+            archived_only=archived_only,
+            order_by_last_active=order_by_last_active,
+            compact_rows=compact_rows,
+            profile_name=profile_name,
+            project_compression_tips=False,
+        )
+        for row in page:
+            if _session_row_profile(db, row) != profile_name:
+                continue
+            owned.append(
+                _project_owned_compression_tip(
+                    db,
+                    row,
+                    profile_name,
+                    compact_rows=compact_rows,
+                )
+            )
+        if len(page) < _SESSION_DB_PAGE_SIZE:
+            break
+        raw_offset += len(page)
+    return owned
+
+
+def _list_classified_sessions_from_db(
+    db: Any,
+    allowed_profiles: set[str],
+    *,
+    source: Optional[str],
+    exclude_sources: Optional[List[str]],
+    min_message_count: int,
+    include_archived: bool,
+    archived_only: bool,
+    order_by_last_active: bool,
+    compact_rows: bool,
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """Scan one physical DB once and attribute each coherent row."""
+    classified: List[Tuple[str, Dict[str, Any]]] = []
+    raw_offset = 0
+    while True:
+        page = db.list_sessions_rich(
+            source=source,
+            exclude_sources=exclude_sources,
+            limit=_SESSION_DB_PAGE_SIZE,
+            offset=raw_offset,
+            min_message_count=min_message_count,
+            include_archived=include_archived,
+            archived_only=archived_only,
+            order_by_last_active=order_by_last_active,
+            compact_rows=compact_rows,
+            project_compression_tips=False,
+        )
+        for row in page:
+            owner = _session_row_profile(db, row)
+            if owner not in allowed_profiles:
+                continue
+            classified.append(
+                (
+                    owner,
+                    _project_owned_compression_tip(
+                        db,
+                        row,
+                        owner,
+                        compact_rows=compact_rows,
+                    ),
+                )
+            )
+        if len(page) < _SESSION_DB_PAGE_SIZE:
+            break
+        raw_offset += len(page)
+    return classified
+
+
+def _merge_owned_session_rows(
+    handles: List[Any],
+    profile_name: str,
+    *,
+    source: Optional[str],
+    exclude_sources: Optional[List[str]],
+    cwd_prefix: Optional[str],
+    min_message_count: int,
+    include_archived: bool,
+    archived_only: bool,
+    order_by_last_active: bool,
+    compact_rows: bool,
+) -> List[Dict[str, Any]]:
+    """Merge shared and physical stores, preferring the shared primary row."""
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for db in handles:
+        rows = _list_owned_sessions_from_db(
+            db,
+            profile_name,
+            source=source,
+            exclude_sources=exclude_sources,
+            cwd_prefix=cwd_prefix,
+            min_message_count=min_message_count,
+            include_archived=include_archived,
+            archived_only=archived_only,
+            order_by_last_active=order_by_last_active,
+            compact_rows=compact_rows,
+        )
+        for row in rows:
+            session_id = str(row.get("id") or "")
+            if session_id and session_id not in by_id:
+                by_id[session_id] = row
+
+    sort_key = "last_active" if order_by_last_active else "started_at"
+    return sorted(
+        by_id.values(),
+        key=lambda row: row.get(sort_key) or row.get("started_at") or 0,
+        reverse=True,
+    )
+
+
+def _resolve_owned_session(
+    handles: List[Any],
+    profile_name: str,
+    session_id_or_prefix: str,
+) -> Optional[Tuple[Any, Dict[str, Any]]]:
+    """Resolve an exact/unique prefix without consulting another owner."""
+    exact: List[Tuple[Any, Dict[str, Any]]] = []
+    for db in handles:
+        row = _owned_session_row(db, session_id_or_prefix, profile_name)
+        if row is not None:
+            exact.append((db, row))
+    if exact:
+        return exact[0]
+
+    escaped = (
+        session_id_or_prefix
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    matches: Dict[str, Tuple[Any, Dict[str, Any]]] = {}
+    for db in handles:
+        conn = getattr(db, "_conn", None)
+        lock = getattr(db, "_lock", None)
+        if conn is None or lock is None:
+            continue
+        with lock:
+            rows = conn.execute(
+                "SELECT * FROM sessions "
+                "WHERE id LIKE ? ESCAPE '\\' "
+                "ORDER BY started_at DESC",
+                (f"{escaped}%",),
+            ).fetchall()
+        for raw in rows:
+            row = dict(raw)
+            if _session_row_profile(db, row) == profile_name:
+                matches.setdefault(str(row["id"]), (db, row))
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    return None
+
+
+def _all_owned_session_records(
+    handles: List[Any],
+    profile_name: str,
+    *,
+    deduplicate: bool = True,
+) -> List[Tuple[Any, Dict[str, Any]]]:
+    """Return raw owned rows across candidate DBs.
+
+    Reads/counts use the default logical-session dedupe (shared primary wins).
+    Mutations pass ``deduplicate=False`` so a stale physical-profile duplicate
+    cannot resurrect after the authoritative shared row is changed or deleted.
+    """
+    records: Dict[str, Tuple[Any, Dict[str, Any]]] = {}
+    all_records: List[Tuple[Any, Dict[str, Any]]] = []
+    for db in handles:
+        conn = getattr(db, "_conn", None)
+        lock = getattr(db, "_lock", None)
+        if conn is None or lock is None:
+            continue
+        with lock:
+            rows = conn.execute("SELECT * FROM sessions").fetchall()
+        for raw in rows:
+            row = dict(raw)
+            session_id = str(row.get("id") or "")
+            if not session_id or _session_row_profile(db, row) != profile_name:
+                continue
+            if deduplicate:
+                records.setdefault(session_id, (db, row))
+            else:
+                all_records.append((db, row))
+    return list(records.values()) if deduplicate else all_records
+
+
+def _ordered_session_mutation_handles(handles: List[Any]) -> List[Any]:
+    """Mutate legacy physical stores before the authoritative shared store.
+
+    Candidate handles are opened shared-primary first so reads naturally
+    prefer its row. Writes use the reverse order: if a stale physical duplicate
+    rejects a scoped mutation, the primary row remains unchanged and the
+    logical dashboard view cannot report an error after already changing.
+    """
+    return list(reversed(handles))
+
+
+def _set_owned_session_archived(
+    db: Any,
+    session_id: str,
+    profile_name: str,
+    archived: bool,
+) -> bool:
+    def _do(conn):
+        rows = conn.execute("SELECT * FROM sessions").fetchall()
+        all_rows = {
+            str(row["id"]): dict(row)
+            for row in rows
+            if row["id"]
+        }
+        owned = {
+            row_id: row
+            for row_id, row in all_rows.items()
+            if _session_row_profile(db, row) == profile_name
+        }
+        if session_id not in owned:
+            return 0
+
+        lineage = {session_id}
+        current = session_id
+        seen = {session_id}
+        while True:
+            row = owned.get(current)
+            parent_id = str(row.get("parent_session_id") or "") if row else ""
+            parent = owned.get(parent_id)
+            if (
+                not parent_id
+                or parent_id in seen
+                or parent is None
+                or parent.get("end_reason") != "compression"
+            ):
+                break
+            lineage.add(parent_id)
+            seen.add(parent_id)
+            current = parent_id
+
+        children: Dict[str, List[str]] = {}
+        for row_id, row in owned.items():
+            parent_id = str(row.get("parent_session_id") or "")
+            if parent_id:
+                children.setdefault(parent_id, []).append(row_id)
+        frontier = list(lineage)
+        while frontier:
+            parent_id = frontier.pop()
+            parent = owned.get(parent_id)
+            if not parent or parent.get("end_reason") != "compression":
+                continue
+            for child_id in children.get(parent_id, []):
+                if child_id in lineage:
+                    continue
+                lineage.add(child_id)
+                frontier.append(child_id)
+
+        lineage_ids = sorted(lineage)
+        placeholders = ",".join("?" for _ in lineage_ids)
+        cursor = conn.execute(
+            f"UPDATE sessions SET archived = ? "
+            f"WHERE id IN ({placeholders})",
+            [int(bool(archived)), *lineage_ids],
+        )
+        return cursor.rowcount
+
+    return bool(db._execute_write(_do))
+
+
+def _delete_owned_session_ids(
+    db: Any,
+    session_ids: List[str],
+    profile_name: str,
+    *,
+    sessions_dir: Optional[Path] = None,
+) -> int:
+    """Delete owned rows atomically through SessionDB's profile boundary."""
+    return int(
+        db.delete_sessions(
+            session_ids,
+            sessions_dir=sessions_dir,
+            profile_name=profile_name,
+        )
+        or 0
+    )
 
 
 @app.get("/api/sessions")
@@ -4072,12 +4711,11 @@ def get_sessions(
             status_code=400,
             detail="order must be one of: created, recent",
         )
-    profile_name: Optional[str] = None
-    if profile:
-        profile_name, _ = _cron_profile_home(profile)
     try:
-        db = _open_session_db_for_profile(profile)
-        try:
+        with _open_profile_session_candidates(
+            profile,
+            read_only=True,
+        ) as (profile_name, handles):
             min_message_count = max(0, min_messages)
             archived_only = archived == "only"
             include_archived = archived == "include"
@@ -4086,37 +4724,55 @@ def get_sessions(
             # uses these to split recents (exclude=cron) from the cron-jobs
             # section (source=cron) into two independent lists.
             exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
-            sessions = db.list_sessions_rich(
-                source=source or None,
-                exclude_sources=exclude_list or None,
-                cwd_prefix=(cwd_prefix or None),
-                limit=limit,
-                offset=offset,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                order_by_last_active=order == "recent",
-                # SQL-level projection: when the caller didn't ask for full
-                # rows, skip the system_prompt blob inside SQLite too (pairs
-                # with the API-level _strip_session_list_rows below).
-                compact_rows=not full,
-            )
-            total = db.session_count(
-                source=source or None,
-                cwd_prefix=(cwd_prefix or None),
-                exclude_sources=exclude_list or None,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                exclude_children=True,
-            )
+            # A few downstream tests/extensions provide a deliberately tiny
+            # SessionDB duck type. Preserve that compatibility path; real
+            # SessionDB handles always expose ``legacy_profile_name`` and take
+            # the owner-verified multiplex path below.
+            if len(handles) == 1 and not hasattr(handles[0], "legacy_profile_name"):
+                db = handles[0]
+                sessions = db.list_sessions_rich(
+                    source=source or None,
+                    exclude_sources=exclude_list or None,
+                    cwd_prefix=(cwd_prefix or None),
+                    limit=limit,
+                    offset=offset,
+                    min_message_count=min_message_count,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    order_by_last_active=order == "recent",
+                    compact_rows=not full,
+                )
+                total = db.session_count(
+                    source=source or None,
+                    cwd_prefix=(cwd_prefix or None),
+                    exclude_sources=exclude_list or None,
+                    min_message_count=min_message_count,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    exclude_children=True,
+                )
+            else:
+                merged = _merge_owned_session_rows(
+                    handles,
+                    profile_name,
+                    source=source or None,
+                    exclude_sources=exclude_list or None,
+                    cwd_prefix=cwd_prefix or None,
+                    min_message_count=min_message_count,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    order_by_last_active=order == "recent",
+                    compact_rows=not full,
+                )
+                total = len(merged)
+                sessions = merged[max(0, offset):max(0, offset) + max(0, limit)]
             now = time.time()
             for s in sessions:
                 s["is_active"] = (
                     s.get("ended_at") is None
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
-                if profile_name:
+                if profile:
                     s["profile"] = profile_name
                     s["is_default_profile"] = profile_name == "default"
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
@@ -4124,8 +4780,6 @@ def get_sessions(
             if not full:
                 _strip_session_list_rows(sessions)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
-        finally:
-            db.close()
     except HTTPException:
         raise
     except Exception:
@@ -4162,7 +4816,6 @@ def get_profiles_sessions(
     if order not in ("created", "recent"):
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
 
-    from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
 
     targets: List[Tuple[str, Path]] = []
@@ -4187,72 +4840,60 @@ def get_profiles_sessions(
     # newest cron sessions can't starve the recents page.
     source_filter = source or None
     exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
-    # Over-fetch per profile so the merged+sorted window is correct for the
-    # requested page. Capped so a huge profile can't blow up the response.
-    per_profile = min(max(limit + offset, limit), 500)
-
     merged: List[Dict[str, Any]] = []
-    total = 0
     profile_totals: Dict[str, int] = {}
     errors: List[Dict[str, str]] = []
     now = time.time()
-    for name, home in targets:
-        db_path = Path(home) / "state.db"
-        if not db_path.exists():
-            continue
-        try:
-            # Read-only: this loop runs on every sidebar refresh, so it must
-            # never DDL/write-lock another profile's live DB (see SessionDB
-            # read_only docstring).
-            db = SessionDB(db_path=db_path, read_only=True)
-        except Exception as exc:
-            errors.append({"profile": name, "error": str(exc)})
-            continue
-        try:
-            rows = db.list_sessions_rich(
-                source=source_filter,
-                exclude_sources=exclude_list or None,
-                limit=per_profile,
-                offset=0,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                order_by_last_active=order == "recent",
-                # Same SQL-level blob skip as /api/sessions (see above).
-                compact_rows=not full,
-            )
-            profile_total = db.session_count(
-                source=source_filter,
-                exclude_sources=exclude_list or None,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                exclude_children=True,
-            )
-            total += profile_total
-            profile_totals[name] = profile_total
-            for s in rows:
-                s["profile"] = name
-                s["is_default_profile"] = name == "default"
-                s["is_active"] = (
-                    s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
+    target_names = {name for name, _home in targets}
+    try:
+        with _open_profile_session_sources(targets) as handles:
+            # Scan each physical DB once. Rows in the primary shared DB are
+            # attributed by durable profile evidence, not by the file being
+            # scanned; this is what makes secondary multiplex rows visible
+            # under their real profile without duplicating primary rows.
+            seen: set[Tuple[str, str]] = set()
+            for db in handles:
+                rows = _list_classified_sessions_from_db(
+                    db,
+                    target_names,
+                    source=source_filter,
+                    exclude_sources=exclude_list or None,
+                    min_message_count=min_message_count,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    order_by_last_active=order == "recent",
+                    compact_rows=not full,
                 )
-                s["archived"] = bool(s.get("archived"))
-                merged.append(s)
-        except Exception as exc:
-            errors.append({"profile": name, "error": str(exc)})
-        finally:
-            db.close()
+                for name, s in rows:
+                    dedupe_key = (name, str(s.get("id") or ""))
+                    if not dedupe_key[1] or dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+                    s["profile"] = name
+                    s["is_default_profile"] = name == "default"
+                    s["is_active"] = (
+                        s.get("ended_at") is None
+                        and (
+                            now
+                            - s.get("last_active", s.get("started_at", 0))
+                        )
+                        < 300
+                    )
+                    s["archived"] = bool(s.get("archived"))
+                    merged.append(s)
+                    profile_totals[name] = profile_totals.get(name, 0) + 1
+    except Exception as exc:
+        _log.exception("GET /api/profiles/sessions failed")
+        errors.append({"profile": profile or "all", "error": str(exc)})
 
     sort_key = "last_active" if order == "recent" else "started_at"
     merged.sort(key=lambda s: s.get(sort_key) or s.get("started_at") or 0, reverse=True)
-    window = merged[offset:offset + limit]
+    window = merged[max(0, offset):max(0, offset) + max(0, limit)]
     if not full:
         _strip_session_list_rows(window)
     return {
         "sessions": window,
-        "total": total,
+        "total": len(merged),
         "profile_totals": profile_totals,
         "limit": limit,
         "offset": offset,
@@ -4260,8 +4901,7 @@ def get_profiles_sessions(
     }
 
 
-@app.get("/api/sessions/search")
-async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
+def _search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
     """Search sessions by ID plus full-text message content using FTS5.
 
     Direct session-id matches are surfaced first, then FTS message-content
@@ -4275,35 +4915,35 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
     if not q or not q.strip():
         return {"results": []}
     try:
-        db = _open_session_db_for_profile(profile)
-        try:
+        with _open_profile_session_candidates(
+            profile,
+            # SessionDB's read-only fast path intentionally skips its FTS
+            # feature probe, so search needs normal handles even though this
+            # endpoint itself does not write.
+            read_only=False,
+        ) as (profile_name, handles):
             safe_limit = max(1, min(int(limit or 20), 100))
+            root_cache: Dict[Tuple[int, str], str] = {}
+            tip_cache: Dict[Tuple[int, str], str] = {}
 
-            # Walk parent_session_id to the compression root, memoized so a
-            # chain of compression segments only costs one walk. We deliberately
-            # stop at branch/delegate edges: those sessions may diverge from the
-            # parent and should remain searchable on their own.
-            root_cache: dict = {}
-
-            def compression_root(session_id: str) -> str:
+            def compression_root(db: Any, session_id: str) -> str:
                 if not session_id:
                     return session_id
-                if session_id in root_cache:
-                    return root_cache[session_id]
-                chain = []
+                cache_key = (id(db), session_id)
+                if cache_key in root_cache:
+                    return root_cache[cache_key]
+                chain: List[str] = []
                 cur = session_id
-                visited = set()
+                visited: set[str] = set()
                 root = session_id
                 while cur and cur not in visited:
                     visited.add(cur)
                     chain.append(cur)
-                    if cur in root_cache:
-                        root = root_cache[cur]
+                    cur_key = (id(db), cur)
+                    if cur_key in root_cache:
+                        root = root_cache[cur_key]
                         break
-                    try:
-                        s = db.get_session(cur)
-                    except Exception:
-                        s = None
+                    s = _owned_session_row(db, cur, profile_name)
                     if not s:
                         root = cur
                         break
@@ -4311,10 +4951,7 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
                     if not parent:
                         root = cur
                         break
-                    try:
-                        parent_session = db.get_session(parent)
-                    except Exception:
-                        parent_session = None
+                    parent_session = _owned_session_row(db, parent, profile_name)
                     if not parent_session:
                         root = cur
                         break
@@ -4331,59 +4968,77 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
                         break
                     cur = parent
                 for node in chain:
-                    root_cache[node] = root
+                    root_cache[(id(db), node)] = root
                 return root
 
-            tip_cache: dict = {}
-
-            def lineage_tip(root_id: str) -> str:
-                if root_id in tip_cache:
-                    return tip_cache[root_id]
+            def lineage_tip(db: Any, root_id: str) -> str:
+                cache_key = (id(db), root_id)
+                if cache_key in tip_cache:
+                    return tip_cache[cache_key]
                 tip = root_id
                 try:
-                    resolved = db.get_compression_tip(root_id)
-                    if resolved:
-                        tip = resolved
+                    owned_resolved = _owned_compression_tip(
+                        db,
+                        root_id,
+                        profile_name,
+                    )
+                    if owned_resolved is not None:
+                        tip = owned_resolved
                 except Exception:
                     pass
-                tip_cache[root_id] = tip
+                tip_cache[cache_key] = tip
                 return tip
 
-            # Both ID matches and content matches share one keyspace, keyed by
-            # compression lineage root, so an id-hit and a content-hit on the
-            # same logical conversation collapse to a single result. The first
-            # hit for a lineage wins; ID matches run first and take priority.
-            seen: dict = {}
+            seen: Dict[str, Dict[str, Any]] = {}
 
-            def add_lineage_result(raw_sid: str, payload: dict) -> None:
+            def add_lineage_result(
+                db: Any,
+                raw_sid: str,
+                payload: Dict[str, Any],
+            ) -> None:
                 if not raw_sid:
                     return
-                root = compression_root(raw_sid)
+                if _owned_session_row(db, raw_sid, profile_name) is None:
+                    return
+                root = compression_root(db, raw_sid)
                 if root in seen or len(seen) >= safe_limit:
                     return
                 payload = dict(payload)
-                payload["session_id"] = lineage_tip(root)
+                payload["session_id"] = lineage_tip(db, root)
                 payload["lineage_root"] = root
                 seen[root] = payload
 
-            # Direct ID matches first: users often paste a session id from CLI,
-            # logs, or another Hermes surface. FTS can't find those unless the
-            # id happens to appear in message text. search_sessions_by_id is
-            # SQL-bounded, so this stays cheap even with thousands of sessions.
-            for row in db.search_sessions_by_id(q, limit=safe_limit, include_archived=True):
-                sid = row.get("id")
-                preview = (row.get("preview") or "").strip()
-                snippet = preview or f"Session ID: {sid}"
-                add_lineage_result(
-                    sid,
-                    {
-                        "snippet": snippet,
-                        "role": None,
-                        "source": row.get("source"),
-                        "model": row.get("model"),
-                        "session_started": row.get("started_at"),
-                    },
+            # ID matches run first and take priority over content hits. SQL's
+            # coarse profile predicate keeps this bounded; the shared evidence
+            # classifier below rejects malformed/conflicting rows.
+            fetch_limit = max(safe_limit * 10, 100)
+            for db in handles:
+                rows = db.list_sessions_rich(
+                    limit=fetch_limit,
+                    offset=0,
+                    include_archived=True,
+                    order_by_last_active=True,
+                    id_query=q,
+                    compact_rows=True,
+                    profile_name=profile_name,
+                    project_compression_tips=False,
                 )
+                for row in rows:
+                    if _session_row_profile(db, row) != profile_name:
+                        continue
+                    sid = row.get("id")
+                    preview = (row.get("preview") or "").strip()
+                    add_lineage_result(
+                        db,
+                        sid,
+                        {
+                            "snippet": preview or f"Session ID: {sid}",
+                            "role": None,
+                            "source": row.get("source"),
+                            "model": row.get("model"),
+                            "session_started": row.get("started_at"),
+                        },
+                    )
 
             # Auto-add prefix wildcards so partial words match
             # e.g. "nimb" → "nimb*" matches "nimby"
@@ -4396,32 +5051,38 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
                 else:
                     terms.append(token + "*")
             prefix_query = " ".join(terms)
-            # Over-fetch so lineage dedup can still surface `limit` distinct
-            # conversations even when several hits collapse onto one root.
-            fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(query=prefix_query, limit=fetch_limit)
-
-            for m in matches:
-                if len(seen) >= safe_limit:
-                    break
-                add_lineage_result(
-                    m["session_id"],
-                    {
-                        "snippet": m.get("snippet", ""),
-                        "role": m.get("role"),
-                        "source": m.get("source"),
-                        "model": m.get("model"),
-                        "session_started": m.get("session_started"),
-                    },
+            for db in handles:
+                matches = db.search_messages(
+                    query=prefix_query,
+                    limit=fetch_limit,
+                    profile_name=profile_name,
                 )
+                for match in matches:
+                    if len(seen) >= safe_limit:
+                        break
+                    add_lineage_result(
+                        db,
+                        match["session_id"],
+                        {
+                            "snippet": match.get("snippet", ""),
+                            "role": match.get("role"),
+                            "source": match.get("source"),
+                            "model": match.get("model"),
+                            "session_started": match.get("session_started"),
+                        },
+                    )
             return {"results": list(seen.values())}
-        finally:
-            db.close()
     except HTTPException:
         raise
     except Exception:
         _log.exception("GET /api/sessions/search failed")
         raise HTTPException(status_code=500, detail="Search failed")
+
+
+@app.get("/api/sessions/search")
+def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
+    """Search session history without blocking the serving event loop."""
+    return _search_sessions(q, limit, profile)
 
 
 def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -9778,7 +10439,11 @@ async def cancel_oauth_session(
 
 
 
-def _session_latest_descendant(session_id: str, db):
+def _session_latest_descendant(
+    session_id: str,
+    db: Any,
+    profile_name: Optional[str] = None,
+):
     """Resolve a session id to the newest child leaf session.
 
     /model may create child sessions. Dashboard refresh should continue the
@@ -9795,9 +10460,14 @@ def _session_latest_descendant(session_id: str, db):
             except Exception:
                 return None
 
-    sid = db.resolve_session_id(session_id)
-    if not sid or not db.get_session(sid):
-        return None, []
+    if profile_name is None:
+        sid = db.resolve_session_id(session_id)
+        if not sid or not db.get_session(sid):
+            return None, []
+    else:
+        sid = session_id
+        if _owned_session_row(db, sid, profile_name) is None:
+            return None, []
 
     conn = (
         getattr(db, "conn", None)
@@ -9822,13 +10492,29 @@ def _session_latest_descendant(session_id: str, db):
             (sid,),
         ).fetchall()
         for row in raw_rows:
-            rows.append({
+            candidate = {
                 "id": row_get(row, "id", 0),
                 "parent_session_id": row_get(row, "parent_session_id", 1),
                 "started_at": row_get(row, "started_at", 2),
-            })
+            }
+            if (
+                profile_name is None
+                or _owned_session_row(
+                    db,
+                    str(candidate.get("id") or ""),
+                    profile_name,
+                )
+                is not None
+            ):
+                rows.append(candidate)
     else:
         rows = db.list_sessions_rich(limit=10000, offset=0, compact_rows=True)
+        if profile_name is not None:
+            rows = [
+                row
+                for row in rows
+                if _session_row_profile(db, row) == profile_name
+            ]
 
     children = {}
     for row in rows:
@@ -9944,14 +10630,52 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
             status_code=400,
             detail="ids must contain at most 500 entries",
         )
-    def _delete() -> int:
-        db = _open_session_db_for_profile(body.profile)
-        try:
-            return db.delete_sessions(body.ids)
-        finally:
-            db.close()
 
-    deleted = await asyncio.to_thread(_delete)
+    def _delete() -> int:
+        with _open_profile_session_candidates(
+            body.profile,
+            read_only=False,
+        ) as (profile_name, handles):
+            requested = {
+                session_id
+                for session_id in body.ids
+                if isinstance(session_id, str) and session_id
+            }
+            by_db: Dict[Any, List[str]] = {}
+            found: set[str] = set()
+            for db, row in _all_owned_session_records(
+                handles,
+                profile_name,
+                deduplicate=False,
+            ):
+                session_id = str(row["id"])
+                if session_id in requested:
+                    found.add(session_id)
+                    by_db.setdefault(db, []).append(session_id)
+            for db in _ordered_session_mutation_handles(handles):
+                session_ids = by_db.get(db)
+                if not session_ids:
+                    continue
+                _delete_owned_session_ids(
+                    db,
+                    session_ids,
+                    profile_name,
+                )
+            remaining = {
+                session_id
+                for session_id in found
+                if any(
+                    _owned_session_row(db, session_id, profile_name)
+                    is not None
+                    for db in handles
+                )
+            }
+            return len(found - remaining)
+
+    try:
+        deleted = await asyncio.to_thread(_delete)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"ok": True, "deleted": deleted}
 
 
@@ -9990,11 +10714,19 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
     that does nothing. Cheap, single-COUNT query.
     """
     def _count() -> int:
-        db = _open_session_db_for_profile(profile)
-        try:
-            return db.count_empty_sessions()
-        finally:
-            db.close()
+        with _open_profile_session_candidates(
+            profile,
+            read_only=True,
+        ) as (profile_name, handles):
+            return sum(
+                row.get("message_count", 0) == 0
+                and row.get("ended_at") is not None
+                and not bool(row.get("archived"))
+                for _db, row in _all_owned_session_records(
+                    handles,
+                    profile_name,
+                )
+            )
 
     return {"count": await asyncio.to_thread(_count)}
 
@@ -10020,36 +10752,75 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     the two delete endpoints' DB-vs-disk behaviour consistent.
     """
     def _delete() -> int:
-        db = _open_session_db_for_profile(profile)
-        try:
-            return db.delete_empty_sessions()
-        finally:
-            db.close()
+        with _open_profile_session_candidates(
+            profile,
+            read_only=False,
+        ) as (profile_name, handles):
+            by_db: Dict[Any, List[str]] = {}
+            found: set[str] = set()
+            for db, row in _all_owned_session_records(
+                handles,
+                profile_name,
+                deduplicate=False,
+            ):
+                if (
+                    row.get("message_count", 0) == 0
+                    and row.get("ended_at") is not None
+                    and not bool(row.get("archived"))
+                ):
+                    session_id = str(row["id"])
+                    found.add(session_id)
+                    by_db.setdefault(db, []).append(session_id)
+            for db in _ordered_session_mutation_handles(handles):
+                session_ids = by_db.get(db)
+                if not session_ids:
+                    continue
+                _delete_owned_session_ids(
+                    db,
+                    session_ids,
+                    profile_name,
+                )
+            remaining = {
+                session_id
+                for session_id in found
+                if any(
+                    _owned_session_row(db, session_id, profile_name)
+                    is not None
+                    for db in handles
+                )
+            }
+            return len(found - remaining)
 
-    deleted = await asyncio.to_thread(_delete)
+    try:
+        deleted = await asyncio.to_thread(_delete)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"ok": True, "deleted": deleted}
 
 
-@app.get("/api/sessions/stats")
-async def get_session_stats(profile: Optional[str] = None):
+def _get_session_stats(profile: Optional[str] = None):
     """Session-store statistics for the Sessions page (mirrors `hermes sessions stats`).
 
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
     path isn't captured as a session id by the parameterized route.
     """
-    db = _open_session_db_for_profile(profile)
-    try:
-        total = db.session_count(include_archived=True)
-        active_store = db.session_count(include_archived=False)
-        archived = db.session_count(archived_only=True)
-        messages = db.message_count()
+    with _open_profile_session_candidates(
+        profile,
+        read_only=True,
+    ) as (profile_name, handles):
+        records = _all_owned_session_records(handles, profile_name)
+        total = len(records)
+        archived = sum(bool(row.get("archived")) for _db, row in records)
+        active_store = total - archived
+        messages = 0
         by_source: Dict[str, int] = {}
-        try:
-            for s in db.list_sessions_rich(limit=10000, include_archived=True, compact_rows=True):
-                src = str(s.get("source") or "cli")
-                by_source[src] = by_source.get(src, 0) + 1
-        except Exception:
-            pass
+        for db, row in records:
+            try:
+                messages += int(db.message_count(str(row["id"])))
+            except Exception:
+                messages += max(0, int(row.get("message_count") or 0))
+            src = str(row.get("source") or "cli")
+            by_source[src] = by_source.get(src, 0) + 1
         return {
             "total": total,
             "active_store": active_store,
@@ -10057,8 +10828,12 @@ async def get_session_stats(profile: Optional[str] = None):
             "messages": messages,
             "by_source": by_source,
         }
-    finally:
-        db.close()
+
+
+@app.get("/api/sessions/stats")
+def get_session_stats(profile: Optional[str] = None):
+    """Return session statistics without blocking the serving event loop."""
+    return _get_session_stats(profile)
 
 
 def _open_session_db_for_profile(profile: Optional[str]):
@@ -10072,23 +10847,32 @@ def _open_session_db_for_profile(profile: Optional[str]):
     from hermes_state import SessionDB
     if not profile:
         return SessionDB()
-    _name, home = _cron_profile_home(profile)
-    return SessionDB(db_path=Path(home) / "state.db")
+    name, home = _cron_profile_home(profile)
+    return SessionDB(
+        db_path=Path(home) / "state.db",
+        profile_name=name,
+    )
+
+
+def _get_session_detail(session_id: str, profile: Optional[str] = None):
+    with _open_profile_session_candidates(
+        profile,
+        read_only=True,
+    ) as (profile_name, handles):
+        resolved = _resolve_owned_session(handles, profile_name, session_id)
+        if resolved is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        _db, session = resolved
+        session = dict(session)
+        if profile:
+            session["profile"] = profile_name
+        return session
 
 
 @app.get("/api/sessions/{session_id}")
-async def get_session_detail(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        session = db.get_session(sid) if sid else None
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        if profile:
-            session["profile"] = _cron_profile_home(profile)[0]
-        return session
-    finally:
-        db.close()
+def get_session_detail(session_id: str, profile: Optional[str] = None):
+    """Read session metadata without blocking the serving event loop."""
+    return _get_session_detail(session_id, profile)
 
 
 
@@ -10098,11 +10882,19 @@ async def get_session_latest_descendant(
     profile: Optional[str] = None,
 ):
     def _lookup():
-        db = _open_session_db_for_profile(profile)
-        try:
-            return _session_latest_descendant(session_id, db)
-        finally:
-            db.close()
+        with _open_profile_session_candidates(
+            profile,
+            read_only=True,
+        ) as (profile_name, handles):
+            resolved = _resolve_owned_session(handles, profile_name, session_id)
+            if resolved is None:
+                return None, []
+            db, row = resolved
+            return _session_latest_descendant(
+                str(row["id"]),
+                db,
+                profile_name,
+            )
 
     latest, path = await asyncio.to_thread(_lookup)
     if not latest:
@@ -10122,17 +10914,25 @@ async def get_session_messages(
     offset: int = 0,
 ):
     def _read():
-        db = _open_session_db_for_profile(profile)
-        try:
-            sid = db.resolve_session_id(session_id)
-            if not sid:
+        with _open_profile_session_candidates(
+            profile,
+            read_only=True,
+        ) as (profile_name, handles):
+            resolved = _resolve_owned_session(handles, profile_name, session_id)
+            if resolved is None:
                 return None
-            sid = db.resolve_resume_session_id(sid)
+            db, row = resolved
+            sid = str(row["id"])
+            owned_candidate = _owned_resume_session_id(
+                db,
+                sid,
+                profile_name,
+            )
+            if owned_candidate is not None:
+                sid = owned_candidate
             # Clamp limit to prevent abuse (max 500 per page)
             _limit = min(limit, 500) if limit is not None else None
             return sid, _limit, db.get_messages(sid, limit=_limit, offset=offset)
-        finally:
-            db.close()
 
     result = await asyncio.to_thread(_read)
     if result is None:
@@ -10155,24 +10955,29 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
     # opening its state.db directly. Remote profiles never reach here — the
     # desktop routes their DELETE to the remote backend. Omit for current/default.
     def _delete():
-        db = _open_session_db_for_profile(profile)
-        try:
-            # Resolve exact ids / unique prefixes like every other session endpoint
-            # (detail, messages, rename, export all do). A session that no longer
-            # exists is an idempotent success: DELETE's contract is "ensure it's
-            # gone", and the desktop optimistically removes the row then RESTORES it
-            # on any error — so a 404 on an already-absent row resurrected a ghost
-            # row and surfaced "session not found". /goal + auto-compression churn
-            # leaves transient empty rows (reaped by empty-session hygiene) that
-            # race the sidebar snapshot, which is exactly when this fired. Mirrors
-            # the bulk-delete endpoint, which already treats ghost ids as success.
-            sid = db.resolve_session_id(session_id)
-            if not sid:
+        with _open_profile_session_candidates(
+            profile,
+            read_only=False,
+        ) as (profile_name, handles):
+            # Resolve only inside the requested owner's namespace. A foreign
+            # row is deliberately indistinguishable from an absent row so the
+            # idempotent DELETE contract cannot become an existence oracle.
+            resolved = _resolve_owned_session(handles, profile_name, session_id)
+            if resolved is None:
                 return {"ok": True, "already_absent": True}
-            db.delete_session(sid)
+            _db, row = resolved
+            sid = str(row["id"])
+            try:
+                for db in _ordered_session_mutation_handles(handles):
+                    if _owned_session_row(db, sid, profile_name) is not None:
+                        _delete_owned_session_ids(
+                            db,
+                            [sid],
+                            profile_name,
+                        )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             return {"ok": True}
-        finally:
-            db.close()
 
     return await asyncio.to_thread(_delete)
 
@@ -10185,50 +10990,83 @@ class SessionRename(BaseModel):
     profile: Optional[str] = None
 
 
-@app.patch("/api/sessions/{session_id}")
-async def rename_session_endpoint(session_id: str, body: SessionRename):
+def _rename_session(session_id: str, body: SessionRename):
     """Update a session: rename (or clear its title) and/or archive it.
 
     ``title`` renames (empty/null clears the title); ``archived`` soft-hides or
     restores the session. Either field may be omitted. ``profile`` targets
     another profile's session.
     """
-    db = _open_session_db_for_profile(body.profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        if not sid:
+    with _open_profile_session_candidates(
+        body.profile,
+        read_only=False,
+    ) as (profile_name, handles):
+        resolved = _resolve_owned_session(handles, profile_name, session_id)
+        if resolved is None:
             raise HTTPException(status_code=404, detail="Session not found")
+        primary_db, row = resolved
+        sid = str(row["id"])
         if body.title is None and body.archived is None:
             raise HTTPException(
                 status_code=400,
                 detail="Nothing to update; provide 'title' and/or 'archived'.",
             )
-        if body.title is not None:
-            try:
-                db.set_session_title(sid, body.title or "")
-            except ValueError as e:
-                # Title too long, invalid characters, or already in use.
-                raise HTTPException(status_code=400, detail=str(e))
-        if body.archived is not None:
-            db.set_session_archived(sid, body.archived)
-        result = {"ok": True, "title": db.get_session_title(sid) or ""}
+        matches = [
+            db
+            for db in handles
+            if _owned_session_row(db, sid, profile_name) is not None
+        ]
+        for db in _ordered_session_mutation_handles(matches):
+            if body.title is not None:
+                try:
+                    db.set_session_title(
+                        sid,
+                        body.title or "",
+                        profile_name=profile_name,
+                    )
+                except ValueError as e:
+                    # Title too long, invalid characters, or already in use.
+                    raise HTTPException(status_code=400, detail=str(e))
+            if body.archived is not None:
+                _set_owned_session_archived(
+                    db,
+                    sid,
+                    profile_name,
+                    body.archived,
+                )
+        result = {
+            "ok": True,
+            "title": primary_db.get_session_title(
+                sid,
+                profile_name=profile_name,
+            )
+            or "",
+        }
         if body.archived is not None:
             result["archived"] = bool(body.archived)
         return result
-    finally:
-        db.close()
+
+
+@app.patch("/api/sessions/{session_id}")
+def rename_session_endpoint(session_id: str, body: SessionRename):
+    """Update a session without blocking the serving event loop."""
+    return _rename_session(session_id, body)
 
 
 @app.get("/api/sessions/{session_id}/export")
 async def export_session_endpoint(session_id: str, profile: Optional[str] = None):
     """Export a single session (metadata + messages) as JSON."""
     def _export():
-        db = _open_session_db_for_profile(profile)
-        try:
-            sid = db.resolve_session_id(session_id)
-            return db.export_session(sid) if sid else None
-        finally:
-            db.close()
+        with _open_profile_session_candidates(
+            profile,
+            read_only=True,
+        ) as (profile_name, handles):
+            resolved = _resolve_owned_session(handles, profile_name, session_id)
+            if resolved is None:
+                return None
+            db, row = resolved
+            sid = str(row["id"])
+            return {**row, "messages": db.get_messages(sid)}
 
     data = await asyncio.to_thread(_export)
     if data is None:
@@ -10288,35 +11126,52 @@ def _prune_sessions(body: SessionPrune):
     _effective_older_than = body.older_than_days
     if has_window or (_attr_filters_set and not _older_than_explicit):
         _effective_older_than = None
-    profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
-    db = _open_session_db_for_profile(body.profile)
-    try:
-        filters = dict(
-            older_than_days=_effective_older_than,
-            source=(body.source or None),
-            started_before=body.started_before,
-            started_after=body.started_after,
-            title_like=(body.title_like or None),
-            end_reason=(body.end_reason or None),
-            cwd_prefix=(body.cwd_prefix or None),
-            min_messages=body.min_messages,
-            max_messages=body.max_messages,
-            model_like=(body.model_like or None),
-            provider=(body.provider or None),
-            user_id=(body.user_id or None),
-            chat_id=(body.chat_id or None),
-            chat_type=(body.chat_type or None),
-            branch_like=(body.branch_like or None),
-            min_tokens=body.min_tokens,
-            max_tokens=body.max_tokens,
-            min_cost=body.min_cost,
-            max_cost=body.max_cost,
-            min_tool_calls=body.min_tool_calls,
-            max_tool_calls=body.max_tool_calls,
-            archived=None if body.include_archived else False,
+    filters = dict(
+        older_than_days=_effective_older_than,
+        source=(body.source or None),
+        started_before=body.started_before,
+        started_after=body.started_after,
+        title_like=(body.title_like or None),
+        end_reason=(body.end_reason or None),
+        cwd_prefix=(body.cwd_prefix or None),
+        min_messages=body.min_messages,
+        max_messages=body.max_messages,
+        model_like=(body.model_like or None),
+        provider=(body.provider or None),
+        user_id=(body.user_id or None),
+        chat_id=(body.chat_id or None),
+        chat_type=(body.chat_type or None),
+        branch_like=(body.branch_like or None),
+        min_tokens=body.min_tokens,
+        max_tokens=body.max_tokens,
+        min_cost=body.min_cost,
+        max_cost=body.max_cost,
+        min_tool_calls=body.min_tool_calls,
+        max_tool_calls=body.max_tool_calls,
+        archived=None if body.include_archived else False,
+    )
+    with _open_profile_session_candidates(
+        body.profile,
+        read_only=body.dry_run,
+    ) as (profile_name, handles):
+        candidates: List[Tuple[Any, Dict[str, Any]]] = []
+        logical_rows: Dict[str, Dict[str, Any]] = {}
+        for db in handles:
+            for row in db.list_prune_candidates(**filters):
+                session_id = str(row.get("id") or "")
+                if (
+                    not session_id
+                    or _owned_session_row(db, session_id, profile_name) is None
+                ):
+                    continue
+                candidates.append((db, row))
+                logical_rows.setdefault(session_id, row)
+        candidates.sort(key=lambda item: item[1].get("started_at") or 0)
+        rows = sorted(
+            logical_rows.values(),
+            key=lambda row: row.get("started_at") or 0,
         )
         if body.dry_run:
-            rows = db.list_prune_candidates(**filters)
             return {
                 "ok": True,
                 "removed": 0,
@@ -10326,30 +11181,53 @@ def _prune_sessions(body: SessionPrune):
                 "newest_started_at": rows[-1]["started_at"] if rows else None,
                 "sessions": [
                     {
-                        "id": r["id"],
-                        "source": r["source"],
-                        "title": r.get("title"),
-                        "model": r.get("model"),
-                        "started_at": r["started_at"],
-                        "message_count": r["message_count"],
+                        "id": row["id"],
+                        "source": row["source"],
+                        "title": row.get("title"),
+                        "model": row.get("model"),
+                        "started_at": row["started_at"],
+                        "message_count": row["message_count"],
                     }
-                    for r in rows
+                    for row in rows
                 ],
             }
+
+        from hermes_cli import profiles as profiles_mod
+
+        profile_home = profiles_mod.get_profile_dir(profile_name)
         sessions_dir = profile_home / "sessions"
-        removed = db.prune_sessions(
-            sessions_dir=sessions_dir if sessions_dir.exists() else None,
-            **filters,
-        )
+        by_db: Dict[Any, List[str]] = {}
+        for db, row in candidates:
+            by_db.setdefault(db, []).append(str(row["id"]))
+        for db in _ordered_session_mutation_handles(handles):
+            session_ids = by_db.get(db)
+            if not session_ids:
+                continue
+            _delete_owned_session_ids(
+                db,
+                session_ids,
+                profile_name,
+                sessions_dir=sessions_dir if sessions_dir.exists() else None,
+            )
+        remaining = {
+            session_id
+            for session_id in logical_rows
+            if any(
+                _owned_session_row(db, session_id, profile_name) is not None
+                for db in handles
+            )
+        }
+        removed = len(set(logical_rows) - remaining)
         return {"ok": True, "removed": removed}
-    finally:
-        db.close()
 
 
 @app.post("/api/sessions/prune")
 async def prune_sessions_endpoint(body: SessionPrune):
     """Delete ended sessions matching filters without blocking the event loop."""
-    return await asyncio.to_thread(_prune_sessions, body)
+    try:
+        return await asyncio.to_thread(_prune_sessions, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -10699,9 +11577,30 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
     except (TypeError, ValueError):
         limit_n = 20
 
-    db = _open_session_db_for_profile(selected)
-    try:
-        runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
+    with _open_profile_session_candidates(
+        selected,
+        read_only=True,
+    ) as (profile_name, handles):
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for db in handles:
+            # Fetch a bounded overage per physical store, then classify before
+            # the global limit. Identical cron/job ids can exist in multiple
+            # multiplex profiles, so a raw prefix query is not an owner check.
+            for row in db.list_cron_job_runs(
+                canonical,
+                limit=limit_n,
+                offset=0,
+            ):
+                if _session_row_profile(db, row) != profile_name:
+                    continue
+                session_id = str(row.get("id") or "")
+                if session_id:
+                    by_id.setdefault(session_id, row)
+        runs = sorted(
+            by_id.values(),
+            key=lambda row: row.get("started_at") or 0,
+            reverse=True,
+        )[:limit_n]
         now = time.time()
         for s in runs:
             s["is_active"] = (
@@ -10710,10 +11609,8 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
             )
             s["archived"] = bool(s.get("archived"))
             if selected:
-                s["profile"] = selected
+                s["profile"] = profile_name
         return {"runs": runs, "limit": limit_n}
-    finally:
-        db.close()
 
 
 @app.get("/api/cron/jobs/{job_id}/runs")
@@ -14407,37 +15304,272 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
 # ---------------------------------------------------------------------------
 
 
-def _aux_usage_rows(db, cutoff: float) -> List[Dict[str, Any]]:
-    """Per-(model, task) auxiliary usage within the window (issue #23270).
+def _analytics_profile_inputs(
+    cutoff: float,
+    profile: Optional[str],
+) -> tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    Dict[str, Any],
+]:
+    """Load deduped, owner-classified analytics inputs across profile stores."""
+    records: List[Tuple[Any, Dict[str, Any]]]
+    with _open_profile_session_candidates(
+        profile,
+        read_only=True,
+    ) as (_profile_name, handles):
+        records = [
+            (db, row)
+            for db, row in _all_owned_session_records(handles, _profile_name)
+            if float(row.get("started_at") or 0) > cutoff
+        ]
+        sessions = [dict(row) for _db, row in records]
+        ids_by_db: Dict[Any, List[str]] = {}
+        for db, row in records:
+            ids_by_db.setdefault(db, []).append(str(row["id"]))
 
-    Reads the task-dimension rows (task != '') that record_auxiliary_usage
-    writes into session_model_usage. Returns [] when the table predates the
-    task column (older DB opened read-only by newer code).
-    """
-    try:
-        cur = db._conn.execute("""
-            SELECT u.model,
-                   u.task,
-                   u.billing_provider,
-                   SUM(u.input_tokens) as input_tokens,
-                   SUM(u.output_tokens) as output_tokens,
-                   SUM(u.cache_read_tokens) as cache_read_tokens,
-                   SUM(u.reasoning_tokens) as reasoning_tokens,
-                   COALESCE(SUM(u.estimated_cost_usd), 0) as estimated_cost,
-                   COUNT(DISTINCT u.session_id) as sessions,
-                   SUM(COALESCE(u.api_call_count, 0)) as api_calls,
-                   MAX(u.last_seen) as last_used_at
-            FROM session_model_usage u
-            JOIN sessions s ON s.id = u.session_id
-            WHERE s.started_at > ? AND u.task != ''
-            GROUP BY u.model, u.task, u.billing_provider
-            ORDER BY SUM(u.input_tokens) + SUM(u.output_tokens) DESC
-        """, (cutoff,))
-        return [dict(r) for r in cur.fetchall()]
-    except Exception:
-        # Table predates the task column (older DB opened by newer code) —
-        # aux breakdown is simply unavailable.
-        return []
+        aux_groups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        explicit_tool_counts: Dict[str, int] = {}
+        assistant_tool_counts: Dict[str, int] = {}
+        skill_groups: Dict[str, Dict[str, Any]] = {}
+
+        for db, session_ids in ids_by_db.items():
+            for start in range(0, len(session_ids), 500):
+                chunk = session_ids[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                lock = getattr(db, "_lock", None)
+                conn = getattr(db, "_conn", None)
+                if lock is None or conn is None:
+                    continue
+
+                # Auxiliary model usage is optional on older read-only DBs.
+                try:
+                    with lock:
+                        aux_rows = conn.execute(
+                            """
+                            SELECT session_id, model, task, billing_provider,
+                                   input_tokens, output_tokens,
+                                   cache_read_tokens, reasoning_tokens,
+                                   estimated_cost_usd, api_call_count, last_seen
+                            FROM session_model_usage
+                            WHERE task != ''
+                              AND session_id IN ("""
+                            + placeholders
+                            + ")",
+                            chunk,
+                        ).fetchall()
+                except Exception:
+                    aux_rows = []
+                for raw in aux_rows:
+                    row = dict(raw)
+                    key = (
+                        str(row.get("model") or "unknown"),
+                        str(row.get("task") or ""),
+                        str(row.get("billing_provider") or ""),
+                    )
+                    group = aux_groups.setdefault(
+                        key,
+                        {
+                            "model": key[0],
+                            "task": key[1],
+                            "billing_provider": key[2],
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_read_tokens": 0,
+                            "reasoning_tokens": 0,
+                            "estimated_cost": 0.0,
+                            "api_calls": 0,
+                            "last_used_at": None,
+                            "_session_ids": set(),
+                        },
+                    )
+                    group["input_tokens"] += int(
+                        row.get("input_tokens") or 0
+                    )
+                    group["output_tokens"] += int(
+                        row.get("output_tokens") or 0
+                    )
+                    group["cache_read_tokens"] += int(
+                        row.get("cache_read_tokens") or 0
+                    )
+                    group["reasoning_tokens"] += int(
+                        row.get("reasoning_tokens") or 0
+                    )
+                    group["estimated_cost"] += float(
+                        row.get("estimated_cost_usd") or 0
+                    )
+                    group["api_calls"] += int(
+                        row.get("api_call_count") or 0
+                    )
+                    group["_session_ids"].add(str(row.get("session_id") or ""))
+                    last_seen = row.get("last_seen")
+                    if last_seen is not None and (
+                        group["last_used_at"] is None
+                        or last_seen > group["last_used_at"]
+                    ):
+                        group["last_used_at"] = last_seen
+
+                with lock:
+                    message_rows = conn.execute(
+                        """
+                        SELECT role, tool_name, tool_calls, timestamp
+                        FROM messages
+                        WHERE session_id IN ("""
+                        + placeholders
+                        + """)
+                          AND (
+                            (role = 'tool' AND tool_name IS NOT NULL)
+                            OR (role = 'assistant' AND tool_calls IS NOT NULL)
+                          )
+                        """,
+                        chunk,
+                    ).fetchall()
+                for raw in message_rows:
+                    row = dict(raw)
+                    if row.get("role") == "tool" and row.get("tool_name"):
+                        tool_name = str(row["tool_name"])
+                        explicit_tool_counts[tool_name] = (
+                            explicit_tool_counts.get(tool_name, 0) + 1
+                        )
+                    if row.get("role") != "assistant":
+                        continue
+                    calls = row.get("tool_calls")
+                    try:
+                        calls = json.loads(calls) if isinstance(calls, str) else calls
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(calls, list):
+                        continue
+                    for call in calls:
+                        func = (
+                            call.get("function", {})
+                            if isinstance(call, dict)
+                            else {}
+                        )
+                        tool_name = func.get("name")
+                        if tool_name:
+                            name = str(tool_name)
+                            assistant_tool_counts[name] = (
+                                assistant_tool_counts.get(name, 0) + 1
+                            )
+                        if tool_name not in {"skill_view", "skill_manage"}:
+                            continue
+                        args = func.get("arguments")
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except (json.JSONDecodeError, TypeError):
+                                continue
+                        if not isinstance(args, dict):
+                            continue
+                        skill_name = args.get("name")
+                        if (
+                            not isinstance(skill_name, str)
+                            or not skill_name.strip()
+                        ):
+                            continue
+                        skill = skill_groups.setdefault(
+                            skill_name,
+                            {
+                                "skill": skill_name,
+                                "view_count": 0,
+                                "manage_count": 0,
+                                "last_used_at": None,
+                            },
+                        )
+                        count_key = (
+                            "view_count"
+                            if tool_name == "skill_view"
+                            else "manage_count"
+                        )
+                        skill[count_key] += 1
+                        timestamp = row.get("timestamp")
+                        if timestamp is not None and (
+                            skill["last_used_at"] is None
+                            or timestamp > skill["last_used_at"]
+                        ):
+                            skill["last_used_at"] = timestamp
+
+    aux_rows: List[Dict[str, Any]] = []
+    for group in aux_groups.values():
+        session_ids = group.pop("_session_ids")
+        group["sessions"] = len(session_ids)
+        aux_rows.append(group)
+    aux_rows.sort(
+        key=lambda row: (
+            row.get("input_tokens") or 0
+        ) + (row.get("output_tokens") or 0),
+        reverse=True,
+    )
+
+    tool_names = set(explicit_tool_counts) | set(assistant_tool_counts)
+    merged_tool_counts = {
+        name: (
+            max(
+                explicit_tool_counts.get(name, 0),
+                assistant_tool_counts.get(name, 0),
+            )
+            if explicit_tool_counts
+            else assistant_tool_counts.get(name, 0)
+        )
+        for name in tool_names
+    }
+    total_tool_calls = sum(merged_tool_counts.values())
+    tools = [
+        {
+            "tool": name,
+            "count": count,
+            "percentage": (
+                count / total_tool_calls * 100
+                if total_tool_calls
+                else 0
+            ),
+        }
+        for name, count in sorted(
+            merged_tool_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+
+    skill_rows = list(skill_groups.values())
+    total_skill_loads = sum(row["view_count"] for row in skill_rows)
+    total_skill_edits = sum(row["manage_count"] for row in skill_rows)
+    total_skill_actions = total_skill_loads + total_skill_edits
+    top_skills = []
+    for row in skill_rows:
+        total_count = row["view_count"] + row["manage_count"]
+        top_skills.append(
+            {
+                **row,
+                "total_count": total_count,
+                "percentage": (
+                    total_count / total_skill_actions * 100
+                    if total_skill_actions
+                    else 0
+                ),
+            }
+        )
+    top_skills.sort(
+        key=lambda row: (
+            row["total_count"],
+            row["view_count"],
+            row["manage_count"],
+            row["last_used_at"] or 0,
+            row["skill"],
+        ),
+        reverse=True,
+    )
+    skills = {
+        "summary": {
+            "total_skill_loads": total_skill_loads,
+            "total_skill_edits": total_skill_edits,
+            "total_skill_actions": total_skill_actions,
+            "distinct_skills_used": len(skill_rows),
+        },
+        "top_skills": top_skills,
+    }
+    return sessions, aux_rows, tools, skills
 
 
 def _merge_aux_into_by_model(
@@ -14517,84 +15649,127 @@ def _aux_task_summary(aux_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
-    from agent.insights import InsightsEngine
+    cutoff = time.time() - (days * 86400)
+    sessions, aux_rows, tools, skills = _analytics_profile_inputs(
+        cutoff,
+        profile,
+    )
 
-    db = _open_session_db_for_profile(profile)
-    try:
-        cutoff = time.time() - (days * 86400)
-        cur = db._conn.execute("""
-            SELECT date(started_at, 'unixepoch') as day,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   SUM(cache_read_tokens) as cache_read_tokens,
-                   SUM(reasoning_tokens) as reasoning_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls
-            FROM sessions WHERE started_at > ?
-            GROUP BY day ORDER BY day
-        """, (cutoff,))
-        daily = [dict(r) for r in cur.fetchall()]
-
-        cur2 = db._conn.execute("""
-            SELECT model,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL
-            GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-        """, (cutoff,))
-        by_model = [dict(r) for r in cur2.fetchall()]
-
-        # Fold in auxiliary usage (vision, compression, title_generation, ...)
-        # recorded per (model, task) in session_model_usage. Aux calls never
-        # touch the sessions counters, so this is add-only — no double count.
-        # Without it the models list shows only the main agent model even when
-        # aux models are actively burning tokens (issue #23270).
-        aux_rows = _aux_usage_rows(db, cutoff)
-        by_model = _merge_aux_into_by_model(by_model, aux_rows)
-
-        cur3 = db._conn.execute("""
-            SELECT SUM(input_tokens) as total_input,
-                   SUM(output_tokens) as total_output,
-                   SUM(cache_read_tokens) as total_cache_read,
-                   SUM(reasoning_tokens) as total_reasoning,
-                   COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
-                   COUNT(*) as total_sessions,
-                   SUM(COALESCE(api_call_count, 0)) as total_api_calls
-            FROM sessions WHERE started_at > ?
-        """, (cutoff,))
-        totals = dict(cur3.fetchone())
-        insights_report = InsightsEngine(db).generate(days=days)
-        skills = insights_report.get("skills", {
-            "summary": {
-                "total_skill_loads": 0,
-                "total_skill_edits": 0,
-                "total_skill_actions": 0,
-                "distinct_skills_used": 0,
+    daily_groups: Dict[str, Dict[str, Any]] = {}
+    model_groups: Dict[str, Dict[str, Any]] = {}
+    for row in sessions:
+        started_at = float(row.get("started_at") or 0)
+        day = datetime.fromtimestamp(started_at, timezone.utc).strftime(
+            "%Y-%m-%d"
+        )
+        daily = daily_groups.setdefault(
+            day,
+            {
+                "day": day,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "reasoning_tokens": 0,
+                "estimated_cost": 0.0,
+                "actual_cost": 0.0,
+                "sessions": 0,
+                "api_calls": 0,
             },
-            "top_skills": [],
-        })
+        )
+        daily["input_tokens"] += int(row.get("input_tokens") or 0)
+        daily["output_tokens"] += int(row.get("output_tokens") or 0)
+        daily["cache_read_tokens"] += int(
+            row.get("cache_read_tokens") or 0
+        )
+        daily["reasoning_tokens"] += int(
+            row.get("reasoning_tokens") or 0
+        )
+        daily["estimated_cost"] += float(
+            row.get("estimated_cost_usd") or 0
+        )
+        daily["actual_cost"] += float(row.get("actual_cost_usd") or 0)
+        daily["sessions"] += 1
+        daily["api_calls"] += int(row.get("api_call_count") or 0)
 
-        return {
-            "daily": daily,
-            "by_model": by_model,
-            # Aux-task summary across models (vision, compression, ...). Lets
-            # the dashboard answer "what is compression costing me" directly.
-            "by_task": _aux_task_summary(aux_rows),
-            "totals": totals,
-            "period_days": days,
-            "skills": skills,
-            # Per-tool-name call counts (already computed by InsightsEngine);
-            # the desktop Capabilities page aggregates these per toolset.
-            "tools": insights_report.get("tools", []),
-        }
-    finally:
-        db.close()
+        model = row.get("model")
+        if model is None:
+            continue
+        model_group = model_groups.setdefault(
+            str(model),
+            {
+                "model": model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "estimated_cost": 0.0,
+                "sessions": 0,
+                "api_calls": 0,
+            },
+        )
+        model_group["input_tokens"] += int(row.get("input_tokens") or 0)
+        model_group["output_tokens"] += int(row.get("output_tokens") or 0)
+        model_group["estimated_cost"] += float(
+            row.get("estimated_cost_usd") or 0
+        )
+        model_group["sessions"] += 1
+        model_group["api_calls"] += int(row.get("api_call_count") or 0)
+
+    daily_rows = [daily_groups[key] for key in sorted(daily_groups)]
+    by_model = sorted(
+        model_groups.values(),
+        key=lambda row: (
+            row.get("input_tokens") or 0
+        ) + (row.get("output_tokens") or 0),
+        reverse=True,
+    )
+    # Fold in auxiliary usage (vision, compression, title generation, ...).
+    by_model = _merge_aux_into_by_model(by_model, aux_rows)
+
+    has_sessions = bool(sessions)
+    totals = {
+        "total_input": (
+            sum(int(row.get("input_tokens") or 0) for row in sessions)
+            if has_sessions
+            else None
+        ),
+        "total_output": (
+            sum(int(row.get("output_tokens") or 0) for row in sessions)
+            if has_sessions
+            else None
+        ),
+        "total_cache_read": (
+            sum(int(row.get("cache_read_tokens") or 0) for row in sessions)
+            if has_sessions
+            else None
+        ),
+        "total_reasoning": (
+            sum(int(row.get("reasoning_tokens") or 0) for row in sessions)
+            if has_sessions
+            else None
+        ),
+        "total_estimated_cost": sum(
+            float(row.get("estimated_cost_usd") or 0)
+            for row in sessions
+        ),
+        "total_actual_cost": sum(
+            float(row.get("actual_cost_usd") or 0)
+            for row in sessions
+        ),
+        "total_sessions": len(sessions),
+        "total_api_calls": (
+            sum(int(row.get("api_call_count") or 0) for row in sessions)
+            if has_sessions
+            else None
+        ),
+    }
+    return {
+        "daily": daily_rows,
+        "by_model": by_model,
+        "by_task": _aux_task_summary(aux_rows),
+        "totals": totals,
+        "period_days": days,
+        "skills": skills,
+        "tools": tools,
+    }
 
 
 @app.get("/api/analytics/usage")
@@ -14608,35 +15783,76 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
     Returns token/cost/session breakdown per model plus capability metadata
     from models.dev (context window, vision, tools, reasoning, etc.).
     """
-    db = _open_session_db_for_profile(profile)
-    try:
-        cutoff = time.time() - (days * 86400)
+    cutoff = time.time() - (days * 86400)
+    sessions, aux_rows, _tools, _skills = _analytics_profile_inputs(
+        cutoff,
+        profile,
+    )
 
-        cur = db._conn.execute("""
-            SELECT model,
-                   billing_provider,
-                   SUM(input_tokens) as input_tokens,
-                   SUM(output_tokens) as output_tokens,
-                   SUM(cache_read_tokens) as cache_read_tokens,
-                   SUM(reasoning_tokens) as reasoning_tokens,
-                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-                   COUNT(*) as sessions,
-                   SUM(COALESCE(api_call_count, 0)) as api_calls,
-                   SUM(tool_call_count) as tool_calls,
-                   MAX(started_at) as last_used_at,
-                   AVG(input_tokens + output_tokens) as avg_tokens_per_session
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
-            GROUP BY model, billing_provider
-            ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-        """, (cutoff,))
-        raw_rows = [dict(r) for r in cur.fetchall()]
+    def _compute() -> Dict[str, Any]:
+        grouped_rows: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for session in sessions:
+            model = str(session.get("model") or "")
+            if not model:
+                continue
+            provider = str(session.get("billing_provider") or "")
+            key = (model, provider)
+            row = grouped_rows.setdefault(
+                key,
+                {
+                    "model": model,
+                    "billing_provider": provider,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "estimated_cost": 0.0,
+                    "actual_cost": 0.0,
+                    "sessions": 0,
+                    "api_calls": 0,
+                    "tool_calls": 0,
+                    "last_used_at": None,
+                    "avg_tokens_per_session": 0.0,
+                },
+            )
+            row["input_tokens"] += int(session.get("input_tokens") or 0)
+            row["output_tokens"] += int(session.get("output_tokens") or 0)
+            row["cache_read_tokens"] += int(
+                session.get("cache_read_tokens") or 0
+            )
+            row["reasoning_tokens"] += int(
+                session.get("reasoning_tokens") or 0
+            )
+            row["estimated_cost"] += float(
+                session.get("estimated_cost_usd") or 0
+            )
+            row["actual_cost"] += float(
+                session.get("actual_cost_usd") or 0
+            )
+            row["sessions"] += 1
+            row["api_calls"] += int(session.get("api_call_count") or 0)
+            row["tool_calls"] += int(session.get("tool_call_count") or 0)
+            started_at = session.get("started_at")
+            if started_at is not None and (
+                row["last_used_at"] is None
+                or started_at > row["last_used_at"]
+            ):
+                row["last_used_at"] = started_at
+
+        raw_rows = list(grouped_rows.values())
+        for row in raw_rows:
+            tokens = (
+                (row.get("input_tokens") or 0)
+                + (row.get("output_tokens") or 0)
+            )
+            count = row.get("sessions") or 0
+            row["avg_tokens_per_session"] = tokens / count if count else 0
 
         # Add auxiliary usage as (model, provider) rows so aux-only models
         # (dedicated vision/compression models) appear on the Models page
         # instead of being invisible (issue #23270). Keyed by
         # model+billing_provider to match the GROUP BY above.
-        for aux in _aux_usage_rows(db, cutoff):
+        for aux in aux_rows:
             raw_rows.append({
                 "model": aux.get("model") or "unknown",
                 "billing_provider": aux.get("billing_provider") or "",
@@ -14690,8 +15906,12 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
                     target["sessions"] = (target.get("sessions") or 0) + (row.get("sessions") or 0)
                     target["last_used_at"] = max(target.get("last_used_at") or 0, row.get("last_used_at") or 0)
                     total_tokens = (target.get("input_tokens") or 0) + (target.get("output_tokens") or 0)
-                    sessions = target.get("sessions") or 0
-                    target["avg_tokens_per_session"] = total_tokens / sessions if sessions else 0
+                    session_count = target.get("sessions") or 0
+                    target["avg_tokens_per_session"] = (
+                        total_tokens / session_count
+                        if session_count
+                        else 0
+                    )
                 rows.append(target)
                 rows.extend(
                     r for r in model_rows
@@ -14755,27 +15975,72 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
                 "capabilities": caps,
             })
 
-        totals_cur = db._conn.execute("""
-            SELECT COUNT(DISTINCT model) as distinct_models,
-                   SUM(input_tokens) as total_input,
-                   SUM(output_tokens) as total_output,
-                   SUM(cache_read_tokens) as total_cache_read,
-                   SUM(reasoning_tokens) as total_reasoning,
-                   COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
-                   COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
-                   COUNT(*) as total_sessions,
-                   SUM(COALESCE(api_call_count, 0)) as total_api_calls
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
-        """, (cutoff,))
-        totals = dict(totals_cur.fetchone())
+        accounted_sessions = [
+            row for row in sessions if str(row.get("model") or "")
+        ]
+        has_sessions = bool(accounted_sessions)
+        totals = {
+            "distinct_models": len(
+                {str(row["model"]) for row in accounted_sessions}
+            ),
+            "total_input": (
+                sum(
+                    int(row.get("input_tokens") or 0)
+                    for row in accounted_sessions
+                )
+                if has_sessions
+                else None
+            ),
+            "total_output": (
+                sum(
+                    int(row.get("output_tokens") or 0)
+                    for row in accounted_sessions
+                )
+                if has_sessions
+                else None
+            ),
+            "total_cache_read": (
+                sum(
+                    int(row.get("cache_read_tokens") or 0)
+                    for row in accounted_sessions
+                )
+                if has_sessions
+                else None
+            ),
+            "total_reasoning": (
+                sum(
+                    int(row.get("reasoning_tokens") or 0)
+                    for row in accounted_sessions
+                )
+                if has_sessions
+                else None
+            ),
+            "total_estimated_cost": sum(
+                float(row.get("estimated_cost_usd") or 0)
+                for row in accounted_sessions
+            ),
+            "total_actual_cost": sum(
+                float(row.get("actual_cost_usd") or 0)
+                for row in accounted_sessions
+            ),
+            "total_sessions": len(accounted_sessions),
+            "total_api_calls": (
+                sum(
+                    int(row.get("api_call_count") or 0)
+                    for row in accounted_sessions
+                )
+                if has_sessions
+                else None
+            ),
+        }
 
         return {
             "models": models,
             "totals": totals,
             "period_days": days,
         }
-    finally:
-        db.close()
+
+    return _compute()
 
 
 @app.get("/api/analytics/models")
@@ -15245,13 +16510,19 @@ def _resolve_chat_argv(
         env["HERMES_HOME"] = str(profile_dir)
 
     if resume:
-        _resume_db = _open_session_db_for_profile(
-            requested if profile_dir is not None else None
-        )
-        try:
-            latest_resume, _latest_path = _session_latest_descendant(resume, _resume_db)
-        finally:
-            _resume_db.close()
+        with _open_profile_session_candidates(
+            requested if profile_dir is not None else None,
+            read_only=True,
+        ) as (profile_name, handles):
+            resolved = _resolve_owned_session(handles, profile_name, resume)
+            latest_resume = None
+            if resolved is not None:
+                resume_db, row = resolved
+                latest_resume = _owned_resume_session_id(
+                    resume_db,
+                    str(row["id"]),
+                    profile_name,
+                )
         if latest_resume:
             resume = latest_resume
         env["HERMES_TUI_RESUME"] = resume

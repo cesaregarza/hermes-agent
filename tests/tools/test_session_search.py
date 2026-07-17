@@ -573,6 +573,316 @@ class TestCrossProfileRead:
 
 
 # =========================================================================
+# Multiplex gateway profile authorization
+# =========================================================================
+
+class TestMultiplexProfileBoundary:
+    @pytest.fixture
+    def shared_db(self, tmp_path):
+        db = SessionDB(tmp_path / "shared-state.db", profile_name="default")
+        db.create_session(
+            "default-session",
+            source="telegram",
+            session_key="agent:main:telegram:dm:1",
+            profile_name="default",
+        )
+        db.append_message(
+            "default-session",
+            role="user",
+            content="boundarytoken DEFAULT_PUBLIC 边界秘密",
+        )
+        db.append_message(
+            "default-session",
+            role="assistant",
+            content="default response",
+        )
+
+        db.create_session(
+            "coder-session",
+            source="telegram",
+            session_key="agent:coder:telegram:dm:2",
+            profile_name="coder",
+        )
+        db.append_message(
+            "coder-session",
+            role="user",
+            content="boundarytoken CODER_SECRET 边界秘密",
+        )
+        db.append_message(
+            "coder-session",
+            role="assistant",
+            content="coder response",
+        )
+        db._conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?",
+            ("Default Boundary Chat", "default-session"),
+        )
+        db._conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?",
+            ("Coder Private Title", "coder-session"),
+        )
+        db._conn.commit()
+        return db
+
+    @staticmethod
+    def _constrained(db, **kwargs):
+        return json.loads(session_search(
+            db=db,
+            profile_name="default",
+            allow_cross_profile=False,
+            **kwargs,
+        ))
+
+    def test_browse_and_discovery_only_return_owned_rows(self, shared_db):
+        browse = self._constrained(shared_db)
+        assert [row["session_id"] for row in browse["results"]] == [
+            "default-session"
+        ]
+
+        discovery = self._constrained(
+            shared_db,
+            query="boundarytoken",
+            limit=10,
+        )
+        assert [row["session_id"] for row in discovery["results"]] == [
+            "default-session"
+        ]
+        assert "CODER_SECRET" not in json.dumps(discovery)
+
+        foreign_only = self._constrained(shared_db, query="CODER_SECRET")
+        assert foreign_only["success"] is True
+        assert foreign_only["results"] == []
+
+        foreign_title = self._constrained(
+            shared_db,
+            query="Coder Private Title",
+        )
+        assert foreign_title["success"] is True
+        assert foreign_title["results"] == []
+        own_title = self._constrained(
+            shared_db,
+            query="Default Boundary Chat",
+        )
+        assert own_title["results"][0]["session_id"] == "default-session"
+
+    @pytest.mark.parametrize("query", ["boundarytoken", "边界", "边界秘密"])
+    def test_database_search_scope_covers_fts_and_cjk_paths(
+        self,
+        shared_db,
+        query,
+    ):
+        rows = shared_db.search_messages(
+            query,
+            limit=10,
+            profile_name="default",
+        )
+        assert {row["session_id"] for row in rows} == {"default-session"}
+        assert "CODER_SECRET" not in json.dumps(rows)
+
+    def test_foreign_hits_cannot_starve_owned_discovery(self, shared_db):
+        shared_db.append_message(
+            "default-session",
+            role="user",
+            content="starvationtoken OWNED_RESULT",
+        )
+        for index in range(301):
+            shared_db.append_message(
+                "coder-session",
+                role="user",
+                content=f"starvationtoken FOREIGN_RESULT_{index}",
+            )
+
+        result = self._constrained(
+            shared_db,
+            query="starvationtoken",
+            limit=10,
+            sort="newest",
+        )
+
+        assert [row["session_id"] for row in result["results"]] == [
+            "default-session"
+        ]
+        assert "FOREIGN_RESULT" not in json.dumps(result)
+
+    def test_constrained_mode_requires_a_valid_trusted_boundary(self, shared_db):
+        missing = json.loads(session_search(
+            db=shared_db,
+            allow_cross_profile=False,
+        ))
+        assert missing["success"] is False
+        assert "boundary is unavailable" in missing["error"]
+
+        invalid = json.loads(session_search(
+            db=shared_db,
+            profile_name="../coder",
+            allow_cross_profile=False,
+        ))
+        assert invalid["success"] is False
+        assert "boundary is invalid" in invalid["error"]
+
+    def test_read_and_scroll_reject_foreign_but_allow_owned(self, shared_db):
+        own = self._constrained(shared_db, session_id="default-session")
+        assert own["success"] is True
+        assert "DEFAULT_PUBLIC" in json.dumps(own)
+
+        foreign = self._constrained(shared_db, session_id="coder-session")
+        assert foreign["success"] is False
+        assert "CODER_SECRET" not in json.dumps(foreign)
+
+        own_anchor = shared_db._conn.execute(
+            "SELECT id FROM messages WHERE session_id = ? ORDER BY id LIMIT 1",
+            ("default-session",),
+        ).fetchone()[0]
+        own_scroll = self._constrained(
+            shared_db,
+            session_id="default-session",
+            around_message_id=own_anchor,
+        )
+        assert own_scroll["success"] is True
+
+        foreign_anchor = shared_db._conn.execute(
+            "SELECT id FROM messages WHERE session_id = ? ORDER BY id LIMIT 1",
+            ("coder-session",),
+        ).fetchone()[0]
+        foreign_scroll = self._constrained(
+            shared_db,
+            session_id="coder-session",
+            around_message_id=foreign_anchor,
+        )
+        assert foreign_scroll["success"] is False
+        assert "CODER_SECRET" not in json.dumps(foreign_scroll)
+
+    def test_model_controlled_profile_values_cannot_cross_boundary(
+        self,
+        shared_db,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "tools.session_search_tool._locate_session_db",
+            lambda _sid: pytest.fail("constrained lookup scanned profile databases"),
+        )
+
+        for kwargs in (
+            {"session_id": "coder-session"},
+            {"session_id": "coder/coder-session"},
+            {"session_id": "coder-session", "profile": "coder"},
+            {
+                "session_id": "coder/coder-session",
+                "profile": "default",
+            },
+        ):
+            result = self._constrained(shared_db, **kwargs)
+            assert result["success"] is False, kwargs
+            assert "CODER_SECRET" not in json.dumps(result)
+
+        # Restating the authorized profile is harmless and must keep using the
+        # shared gateway DB rather than opening a standalone profile DB.
+        own = self._constrained(
+            shared_db,
+            session_id="default/default-session",
+            profile="default",
+        )
+        assert own["success"] is True
+
+    def test_rebind_and_lineage_walk_never_cross_profiles(self, shared_db):
+        shared_db.create_session(
+            "default-root",
+            source="telegram",
+            session_key="agent:main:telegram:dm:1",
+            profile_name="default",
+        )
+        shared_db.append_message(
+            "default-root",
+            role="user",
+            content="default lineage root",
+        )
+        shared_db.create_session(
+            "coder-child",
+            source="telegram",
+            session_key="agent:coder:telegram:dm:2",
+            profile_name="coder",
+            parent_session_id="default-root",
+        )
+        foreign_anchor = shared_db.append_message(
+            "coder-child",
+            role="user",
+            content="REBIND_CODER_SECRET",
+        )
+
+        # A message-id lookup can discover only the owning session id. It must
+        # still authorize that session before rebinding and loading messages.
+        rebound = self._constrained(
+            shared_db,
+            session_id="default-root",
+            around_message_id=foreign_anchor,
+        )
+        assert rebound["success"] is False
+        assert "REBIND_CODER_SECRET" not in json.dumps(rebound)
+
+        shared_db.create_session(
+            "default-child",
+            source="telegram",
+            session_key="agent:main:telegram:dm:1",
+            profile_name="default",
+            parent_session_id="coder-session",
+        )
+        shared_db.append_message(
+            "default-child",
+            role="user",
+            content="OWN_CHILD_BOUNDARY_TOKEN",
+        )
+        shared_db._conn.commit()
+        discovery = self._constrained(
+            shared_db,
+            query="OWN_CHILD_BOUNDARY_TOKEN",
+        )
+        assert discovery["success"] is True
+        assert discovery["results"][0]["session_id"] == "default-child"
+        assert "parent_session_id" not in discovery["results"][0]
+
+    def test_conflicting_persisted_evidence_is_quarantined(self, shared_db):
+        shared_db.create_session(
+            "conflicted-session",
+            source="telegram",
+            session_key="agent:coder:telegram:dm:3",
+            profile_name="default",
+        )
+        shared_db.append_message(
+            "conflicted-session",
+            role="user",
+            content="CONFLICTED_SECRET",
+        )
+        shared_db._conn.commit()
+
+        discovery = self._constrained(
+            shared_db,
+            query="CONFLICTED_SECRET",
+        )
+        assert discovery["success"] is True
+        assert discovery["results"] == []
+        read = self._constrained(
+            shared_db,
+            session_id="conflicted-session",
+        )
+        assert read["success"] is False
+
+    def test_trusted_local_mode_keeps_cross_profile_recall(self, shared_db):
+        read = json.loads(session_search(
+            db=shared_db,
+            session_id="coder-session",
+        ))
+        assert read["success"] is True
+        assert "CODER_SECRET" in json.dumps(read)
+
+        discovery = json.loads(session_search(
+            db=shared_db,
+            query="CODER_SECRET",
+        ))
+        assert discovery["success"] is True
+        assert discovery["results"][0]["session_id"] == "coder-session"
+
+
+# =========================================================================
 # Cron demotion in discover ranking (#19434)
 # =========================================================================
 

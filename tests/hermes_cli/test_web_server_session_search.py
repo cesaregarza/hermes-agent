@@ -1,5 +1,3 @@
-import asyncio
-
 from hermes_cli import web_server
 
 
@@ -13,10 +11,15 @@ class _FakeSessionDB:
     """
 
     closed = False
+    legacy_profile_name = "default"
 
-    def search_sessions_by_id(self, query, limit=20, include_archived=True):
-        assert query == "20260603"
-        assert include_archived is True
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def list_sessions_rich(self, **kwargs):
+        assert kwargs["id_query"] == "20260603"
+        assert kwargs["include_archived"] is True
+        assert kwargs["profile_name"] == "default"
         return [
             {
                 "id": "20260603_090200_exact",
@@ -27,8 +30,9 @@ class _FakeSessionDB:
             }
         ]
 
-    def search_messages(self, query, limit=20):
+    def search_messages(self, query, limit=20, profile_name=None):
         assert query == "20260603*"
+        assert profile_name == "default"
         return [
             {
                 "session_id": "20260603_090200_exact",
@@ -62,7 +66,7 @@ class _FakeSessionDB:
 def test_desktop_session_search_merges_id_matches_before_content_matches(monkeypatch):
     monkeypatch.setattr("hermes_state.SessionDB", _FakeSessionDB)
 
-    response = asyncio.run(web_server.search_sessions(q="20260603", limit=2))
+    response = web_server.search_sessions(q="20260603", limit=2)
 
     # ID match surfaces first; the content hit on the SAME session is deduped
     # by lineage root (not double-listed); the unrelated content hit follows.

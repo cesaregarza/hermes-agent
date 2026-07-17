@@ -3,6 +3,8 @@ from unittest.mock import MagicMock, patch
 import json
 import sys
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -87,9 +89,248 @@ def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeyp
     monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
 
     agent = _make_agent(None, platform="acp")
-    result = json.loads(agent._invoke_tool("session_search", {"query": "Hermes"}, "task-id"))
+    result = json.loads(agent._invoke_tool(
+        "session_search",
+        {"query": "Hermes", "profile": "work"},
+        "task-id",
+    ))
 
     assert result["success"] is True
     assert captured["db"] is sentinel_db
     assert captured["query"] == "Hermes"
+    assert captured["profile"] == "work"
+    assert captured["profile_name"] is None
+    assert captured["allow_cross_profile"] is True
     assert agent._session_db is sentinel_db
+
+
+@pytest.mark.parametrize(
+    ("owner", "profile_name", "gateway_key"),
+    [
+        ("research", "research", "agent:main:telegram:dm:1"),
+        ("default", "coder", "agent:coder:telegram:dm:2"),
+    ],
+)
+def test_gateway_session_search_passes_classified_profile_boundary(
+    tmp_path,
+    monkeypatch,
+    owner,
+    profile_name,
+    gateway_key,
+):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / f"{owner}.db", profile_name=owner)
+    db.create_session(
+        "telegram-session",
+        source="telegram",
+        session_key=gateway_key,
+        profile_name=profile_name,
+    )
+    captured = {}
+    session_search_mod = ModuleType("tools.session_search_tool")
+
+    def fake_session_search(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True, "results": []})
+
+    session_search_mod.session_search = fake_session_search
+    monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
+
+    agent = _make_agent(db, platform="telegram")
+    agent._gateway_session_key = gateway_key
+    result = json.loads(agent._invoke_tool(
+        "session_search",
+        {"query": "Hermes", "profile": "untrusted-model-value"},
+        "task-id",
+    ))
+
+    assert result["success"] is True
+    assert captured["profile"] == "untrusted-model-value"
+    assert captured["profile_name"] == profile_name
+    assert captured["allow_cross_profile"] is False
+
+
+def test_gateway_session_search_rejects_incoherent_current_row(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db", profile_name="default")
+    db.create_session(
+        "telegram-session",
+        source="telegram",
+        session_key="agent:coder:telegram:dm:2",
+        profile_name="default",
+    )
+    called = False
+    session_search_mod = ModuleType("tools.session_search_tool")
+
+    def fake_session_search(**_kwargs):
+        nonlocal called
+        called = True
+        return json.dumps({"success": True})
+
+    session_search_mod.session_search = fake_session_search
+    monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
+
+    agent = _make_agent(db, platform="telegram")
+    agent._gateway_session_key = "agent:coder:telegram:dm:2"
+    result = json.loads(agent._invoke_tool(
+        "session_search",
+        {"query": "Hermes"},
+        "task-id",
+    ))
+
+    assert result["success"] is False
+    assert "invalid persisted profile evidence" in result["error"]
+    assert called is False
+
+
+def test_gateway_session_search_uses_routing_key_before_row_is_persisted(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db", profile_name="default")
+    captured = {}
+    session_search_mod = ModuleType("tools.session_search_tool")
+
+    def fake_session_search(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True})
+
+    session_search_mod.session_search = fake_session_search
+    monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
+
+    agent = _make_agent(db, platform="telegram")
+    agent._gateway_session_key = "agent:coder:telegram:dm:2"
+    result = json.loads(agent._invoke_tool(
+        "session_search",
+        {"query": "Hermes"},
+        "task-id",
+    ))
+
+    assert result["success"] is True
+    assert captured["profile_name"] == "coder"
+    assert captured["allow_cross_profile"] is False
+
+
+@pytest.mark.parametrize("memory_key", [None, "webui:user-42"])
+def test_api_gateway_session_search_uses_authoritative_profile_not_memory_key(
+    tmp_path,
+    monkeypatch,
+    memory_key,
+):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db", profile_name="default")
+    db.create_session(
+        "api_server-session",
+        source="api_server",
+        profile_name="coder",
+    )
+    captured = {}
+    session_search_mod = ModuleType("tools.session_search_tool")
+
+    def fake_session_search(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True})
+
+    session_search_mod.session_search = fake_session_search
+    monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
+
+    agent = _make_agent(db, platform="api_server")
+    agent._gateway_session_key = memory_key
+    agent._gateway_session_search_profile = "coder"
+    result = json.loads(agent._invoke_tool(
+        "session_search",
+        {"query": "Hermes", "profile": "model-controlled"},
+        "task-id",
+    ))
+
+    assert result["success"] is True
+    assert captured["profile_name"] == "coder"
+    assert captured["allow_cross_profile"] is False
+
+
+def test_api_gateway_session_search_fails_closed_without_profile_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db", profile_name="default")
+    called = False
+    session_search_mod = ModuleType("tools.session_search_tool")
+
+    def fake_session_search(**_kwargs):
+        nonlocal called
+        called = True
+        return json.dumps({"success": True})
+
+    session_search_mod.session_search = fake_session_search
+    monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
+
+    agent = _make_agent(db, platform="api_server")
+    agent._gateway_session_key = None
+    agent._gateway_session_search_profile = None
+    result = json.loads(agent._invoke_tool(
+        "session_search",
+        {"query": "Hermes"},
+        "task-id",
+    ))
+
+    assert result["success"] is False
+    assert "profile boundary is unavailable" in result["error"]
+    assert called is False
+
+
+def test_sequential_tool_dispatch_applies_same_gateway_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db", profile_name="default")
+    db.create_session(
+        "telegram-session",
+        source="telegram",
+        session_key="agent:coder:telegram:dm:2",
+        profile_name="coder",
+    )
+    captured = {}
+    session_search_mod = ModuleType("tools.session_search_tool")
+
+    def fake_session_search(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True})
+
+    session_search_mod.session_search = fake_session_search
+    monkeypatch.setitem(sys.modules, "tools.session_search_tool", session_search_mod)
+
+    agent = _make_agent(db, platform="telegram")
+    agent._gateway_session_key = "agent:coder:telegram:dm:2"
+    tool_call = SimpleNamespace(
+        id="search-1",
+        function=SimpleNamespace(
+            name="session_search",
+            arguments=json.dumps({
+                "query": "Hermes",
+                "profile": "model-controlled",
+            }),
+        ),
+    )
+    messages = []
+    agent._execute_tool_calls_sequential(
+        SimpleNamespace(tool_calls=[tool_call]),
+        messages,
+        "task-id",
+    )
+
+    assert captured["profile"] == "model-controlled"
+    assert captured["profile_name"] == "coder"
+    assert captured["allow_cross_profile"] is False
+    assert json.loads(messages[-1]["content"])["success"] is True

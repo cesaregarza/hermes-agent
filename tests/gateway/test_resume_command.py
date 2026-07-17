@@ -4,6 +4,7 @@ Tests the _handle_resume_command handler (switch to a previously-named session)
 across gateway messenger platforms.
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,6 +13,7 @@ import pytest
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, build_session_key
+from session_profile_evidence import QUARANTINED_SESSION_PROFILE
 
 
 def _make_event(text="/resume", platform=Platform.TELEGRAM,
@@ -1095,6 +1097,80 @@ class TestResumeMultiplexProfileIsolation:
             "legacy_default_row",
             allow_override=False,
         ) is True
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_named_primary_can_resume_null_profile_but_siblings_cannot(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hermes_state import SessionDB
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "ops",
+        )
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db._conn.executemany(
+            "INSERT INTO sessions "
+            "(id, source, user_id, chat_id, chat_type, session_key, "
+            "origin_json, profile_name, started_at) "
+            "VALUES (?, 'telegram', 'alice', 'chat-a', 'group', ?, ?, NULL, 1)",
+            (
+                ("legacy-ops", "agent:main:telegram:group:chat-a", None),
+                (
+                    "conflicting",
+                    "agent:coder:telegram:group:chat-a",
+                    json.dumps({"profile": "other"}),
+                ),
+            ),
+        )
+        db.close()
+        db = SessionDB(db_path=tmp_path / "state.db")
+        assert db.get_session("legacy-ops")["profile_name"] == "ops"
+        assert (
+            db.get_session("conflicting")["profile_name"]
+            == QUARANTINED_SESSION_PROFILE
+        )
+        db.set_session_title("legacy-ops", "Legacy Project")
+
+        runner = self._multiplex_runner(session_db=db)
+        runner._gateway_session_origin_for_id = lambda _sid: None
+        assert await runner._resume_target_allowed(
+            self._src("ops"),
+            "legacy-ops",
+        ) is True
+        assert await runner._resume_target_allowed(
+            self._src("default"),
+            "legacy-ops",
+        ) is False
+        assert await runner._resume_target_allowed(
+            self._src("other"),
+            "legacy-ops",
+        ) is False
+        assert await runner._resume_target_allowed(
+            self._src("coder"),
+            "conflicting",
+        ) is False
+
+        event = _make_event(
+            text="/resume Legacy Project",
+            user_id="alice",
+            chat_id="chat-a",
+        )
+        event.source.chat_type = "group"
+        event.source.profile = "ops"
+        runner = self._multiplex_runner(session_db=db, event=event)
+        runner._gateway_session_origin_for_id = lambda _sid: None
+
+        result = await runner._handle_resume_command(event)
+
+        assert "Resumed" in result
+        runner.session_store.switch_session.assert_called_once_with(
+            runner._session_key_for_source(event.source),
+            "legacy-ops",
+        )
         db.close()
 
     @pytest.mark.asyncio

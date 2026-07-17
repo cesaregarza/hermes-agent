@@ -1358,6 +1358,33 @@ def _build_child_agent(
         **child_optional_kwargs,
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Delegated agents share the parent's SessionDB and may inherit the
+    # session_search toolset. Preserve any gateway/API/automation profile
+    # boundary so a child cannot be reclassified as a trusted local agent and
+    # search sibling profiles in a multiplexed database.
+    _parent_state = getattr(parent_agent, "__dict__", {})
+    if "_gateway_session_search_profile" in _parent_state:
+        child._gateway_session_search_profile = _parent_state.get(
+            "_gateway_session_search_profile"
+        )
+    elif _parent_state.get("_gateway_session_key"):
+        try:
+            from agent.tool_executor import _gateway_session_search_boundary
+
+            _profile, _allow_cross_profile, _boundary_error = (
+                _gateway_session_search_boundary(
+                    parent_agent,
+                    _parent_state.get("_session_db"),
+                )
+            )
+            child._gateway_session_search_profile = (
+                _profile
+                if not _allow_cross_profile and not _boundary_error
+                else None
+            )
+        except Exception:
+            # The attribute's presence makes session_search fail closed.
+            child._gateway_session_search_profile = None
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""

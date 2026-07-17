@@ -79,6 +79,20 @@ def test_every_on_disk_subpackage_is_covered_by_packages_find():
     )
 
 
+def test_session_profile_evidence_module_is_shipped_in_wheel():
+    """The persisted-session authorization classifier is a runtime module.
+
+    ``hermes_state`` and ``gateway.session`` import it at module load. If the
+    top-level module is omitted from setuptools' explicit ``py-modules`` list,
+    source-tree tests pass while every installed wheel fails immediately with
+    ``ModuleNotFoundError``.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    modules = set(data["tool"]["setuptools"]["py-modules"])
+
+    assert "session_profile_evidence" in modules
+
+
 def test_packaging_declared_as_core_dependency():
     """Regression for #40503.
 

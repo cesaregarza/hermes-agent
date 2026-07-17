@@ -612,6 +612,8 @@ async def test_gateway_runner_busy_ack_replies_to_triggering_message_for_telegra
         chat_type="dm",
         thread_id="20197",
         user_id="user-1",
+        profile="default",
+        transport_profile="default",
     )
     event = MessageEvent(
         text="busy follow-up",
@@ -642,6 +644,7 @@ async def test_gateway_runner_busy_ack_replies_to_triggering_message_for_telegra
         "telegram_dm_topic_reply_fallback": True,
         "direct_messages_topic_id": "20197",
         "telegram_reply_to_message_id": "463",
+        "runtime_profile": "default",
     }
 
 

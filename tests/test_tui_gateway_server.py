@@ -1386,10 +1386,13 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     captured = {}
 
     class FakeDB:
-        def get_session(self, target):
-            return {"id": target}
+        legacy_profile_name = "default"
 
-        def reopen_session(self, target):
+        def get_session(self, target):
+            return {"id": target, "profile_name": "default"}
+
+        def reopen_session(self, target, *, profile_name=None):
+            assert profile_name == "default"
             captured["reopened"] = target
 
         def get_messages_as_conversation(self, target, include_ancestors=False):
@@ -1517,15 +1520,19 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     captured = {}
 
     class FakeDB:
+        legacy_profile_name = "default"
+
         def get_session(self, target):
             return {
                 "id": target,
+                "profile_name": "default",
                 "model": "gpt-5.4",
                 "billing_provider": "openai-codex",
                 "model_config": '{"reasoning_config":{"enabled":true,"effort":"high"},"service_tier":"priority","base_url":"https://custom.example/v1","api_mode":"chat_completions"}',
             }
 
-        def reopen_session(self, target):
+        def reopen_session(self, target, *, profile_name=None):
+            assert profile_name == "default"
             pass
 
         def get_messages_as_conversation(self, target, include_ancestors=False):
@@ -1579,13 +1586,20 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
     captured = {}
 
     class ProfileDB:
+        legacy_profile_name = "worker"
+
         def get_session(self, _target):
-            return {"id": target, "cwd": str(profile_cwd)}
+            return {
+                "id": target,
+                "cwd": str(profile_cwd),
+                "profile_name": "worker",
+            }
 
         def get_session_by_title(self, _target):
             return None
 
-        def reopen_session(self, _target):
+        def reopen_session(self, _target, *, profile_name=None):
+            assert profile_name == "worker"
             captured["reopened"] = _target
 
         def get_messages_as_conversation(self, _target, include_ancestors=False):
@@ -1616,8 +1630,20 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
         return types.SimpleNamespace(model="test/model")
 
     monkeypatch.setenv("TERMINAL_CWD", str(launch_cwd))
-    monkeypatch.setattr(server, "_profile_home", lambda _profile: profile_home)
-    monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: profile_db)
+    monkeypatch.setattr(
+        server,
+        "_resolve_profile_target",
+        lambda _profile: ("worker", profile_home),
+    )
+    monkeypatch.setattr(
+        "hermes_state.SessionDB",
+        lambda db_path=None, **_kwargs: profile_db,
+    )
+    monkeypatch.setattr(
+        server,
+        "_open_profile_session_db",
+        lambda *_args, **_kwargs: profile_db,
+    )
     monkeypatch.setattr(server, "_get_db", lambda: launch_db)
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
     monkeypatch.setattr(server, "_set_session_context", lambda target: [])
@@ -1693,6 +1719,108 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
     assert captured["profile_update"] == (target, str(new_cwd))
     assert captured["profile_closed"] is True
     assert "launch_update" not in captured
+
+
+def test_session_branch_keeps_named_profile_db_and_home(monkeypatch, tmp_path):
+    """Global-remote branches must never land in the launch profile."""
+    from hermes_cli import profiles as profiles_mod
+    from hermes_constants import get_hermes_home
+    from hermes_state import SessionDB
+
+    launch_home = tmp_path / "launch"
+    ops_home = launch_home / "profiles" / "ops"
+    launch_home.mkdir()
+    ops_home.mkdir(parents=True)
+    monkeypatch.setattr(
+        profiles_mod,
+        "get_profile_dir",
+        lambda name: launch_home if name == "default" else launch_home / "profiles" / name,
+    )
+    monkeypatch.setattr(
+        profiles_mod,
+        "get_active_profile_name",
+        lambda: "default",
+    )
+
+    launch_db = SessionDB(launch_home / "state.db", profile_name="default")
+    ops_db = SessionDB(ops_home / "state.db", profile_name="ops")
+    ops_db.create_session("ops-parent", source="tui")
+    ops_db.set_session_title("ops-parent", "Parent")
+    ops_db.append_message("ops-parent", role="user", content="hello")
+
+    captured = {}
+    parent_agent = types.SimpleNamespace(model="ops/model", _session_db=ops_db)
+    server._sessions["parent-ui"] = {
+        "agent": parent_agent,
+        "cols": 80,
+        "cwd": str(tmp_path),
+        "history": [{"role": "user", "content": "hello"}],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "profile_home": str(ops_home),
+        "profile_name": "ops",
+        "session_key": "ops-parent",
+        "source": "tui",
+    }
+
+    def fake_make_agent(_sid, _key, **kwargs):
+        captured["db"] = kwargs["session_db"]
+        captured["home"] = get_hermes_home()
+        return types.SimpleNamespace(
+            model="ops/model",
+            _session_db=kwargs["session_db"],
+        )
+
+    def fake_init_session(sid, key, agent, history, **kwargs):
+        captured["init"] = kwargs
+        server._sessions[sid] = {
+            "agent": agent,
+            "history": history,
+            "history_lock": threading.Lock(),
+            "profile_home": (
+                str(kwargs["profile_home"])
+                if kwargs.get("profile_home") is not None
+                else None
+            ),
+            "profile_name": kwargs.get("profile_name"),
+            "session_key": key,
+        }
+
+    monkeypatch.setattr(server, "_new_session_key", lambda: "ops-child")
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot",
+        lambda *_args, **_kwargs: (None, None),
+    )
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_init_session", fake_init_session)
+    monkeypatch.setattr(server, "_set_session_context", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "ops/model")
+
+    try:
+        response = server._methods["session.branch"](
+            "branch",
+            {"session_id": "parent-ui", "name": "Ops Branch"},
+        )
+        assert "error" not in response
+        child_sid = response["result"]["session_id"]
+        assert ops_db.get_session("ops-child")["profile_name"] == "ops"
+        assert ops_db.get_session_title("ops-child") == "Ops Branch"
+        assert [
+            msg["content"] for msg in ops_db.get_messages("ops-child")
+        ] == ["hello"]
+        assert launch_db.get_session("ops-child") is None
+        assert captured["home"] == ops_home
+        assert captured["db"].legacy_profile_name == "ops"
+        assert server._sessions[child_sid]["profile_home"] == str(ops_home)
+        assert server._sessions[child_sid]["profile_name"] == "ops"
+    finally:
+        if captured.get("db") is not None:
+            captured["db"].close()
+        ops_db.close()
+        launch_db.close()
+        server._sessions.clear()
 
 
 def test_stored_session_runtime_overrides_skips_bare_billing_provider():
@@ -2416,13 +2544,17 @@ def test_session_title_creates_row_and_sets_immediately_when_not_ready(monkeypat
     state = {"row": None, "title": None, "ensured": False}
 
     class _FakeDB:
-        def get_session_title(self, _key):
+        legacy_profile_name = "default"
+
+        def get_session_title(self, _key, *, profile_name=None):
+            assert profile_name == "default"
             return state["title"]
 
         def get_session(self, _key):
             return state["row"]
 
-        def set_session_title(self, _key, title):
+        def set_session_title(self, _key, title, *, profile_name=None):
+            assert profile_name == "default"
             # Mirrors SessionDB: UPDATE affects 0 rows until the row exists.
             if state["row"] is None:
                 return False
@@ -2434,7 +2566,11 @@ def test_session_title_creates_row_and_sets_immediately_when_not_ready(monkeypat
     def _fake_ensure_row(_session):
         # The real _ensure_session_db_row does an INSERT OR IGNORE.
         state["ensured"] = True
-        state["row"] = {"id": "session-key", "title": None}
+        state["row"] = {
+            "id": "session-key",
+            "profile_name": "default",
+            "title": None,
+        }
 
     import contextlib
 
@@ -2480,13 +2616,15 @@ def test_session_title_falls_back_to_queue_when_row_create_fails(monkeypatch):
     """
 
     class _FakeDB:
-        def get_session_title(self, _key):
+        def get_session_title(self, _key, *, profile_name=None):
+            assert profile_name == "default"
             return None
 
         def get_session(self, _key):
             return None
 
-        def set_session_title(self, _key, _title):
+        def set_session_title(self, _key, _title, *, profile_name=None):
+            assert profile_name == "default"
             return False
 
     fake_db = _FakeDB()
@@ -3437,13 +3575,19 @@ def test_session_title_clears_pending_after_persist(monkeypatch):
         def __init__(self):
             self.title = "old"
 
-        def get_session_title(self, _key):
+        def get_session_title(self, _key, *, profile_name=None):
+            assert profile_name == "default"
             return self.title
 
         def get_session(self, _key):
-            return {"id": _key, "title": self.title}
+            return {
+                "id": _key,
+                "profile_name": "default",
+                "title": self.title,
+            }
 
-        def set_session_title(self, _key, title):
+        def set_session_title(self, _key, title, *, profile_name=None):
+            assert profile_name == "default"
             self.title = title
             return True
 
@@ -3472,16 +3616,24 @@ def test_session_title_clears_pending_after_persist(monkeypatch):
 
 def test_session_title_does_not_queue_noop_when_row_exists(monkeypatch):
     class _FakeDB:
+        legacy_profile_name = "default"
+
         def __init__(self):
             self.title = "same title"
 
-        def get_session_title(self, _key):
+        def get_session_title(self, _key, *, profile_name=None):
+            assert profile_name == "default"
             return self.title
 
         def get_session(self, _key):
-            return {"id": _key, "title": self.title}
+            return {
+                "id": _key,
+                "profile_name": "default",
+                "title": self.title,
+            }
 
-        def set_session_title(self, _key, _title):
+        def set_session_title(self, _key, _title, *, profile_name=None):
+            assert profile_name == "default"
             # Simulate sqlite UPDATE rowcount==0 for no-op update.
             return False
 
@@ -3505,7 +3657,8 @@ def test_session_title_does_not_queue_noop_when_row_exists(monkeypatch):
 
 def test_session_title_get_falls_back_to_pending_when_db_read_throws(monkeypatch):
     class _FakeDB:
-        def get_session_title(self, _key):
+        def get_session_title(self, _key, *, profile_name=None):
+            assert profile_name == "default"
             raise RuntimeError("db temporarily locked")
 
     server._sessions["sid"] = _session(pending_title="queued title")
@@ -3524,10 +3677,12 @@ def test_session_title_get_retries_persist_for_pending_title(monkeypatch):
         def __init__(self):
             self.title = ""
 
-        def get_session_title(self, _key):
+        def get_session_title(self, _key, *, profile_name=None):
+            assert profile_name == "default"
             return self.title
 
-        def set_session_title(self, _key, title):
+        def set_session_title(self, _key, title, *, profile_name=None):
+            assert profile_name == "default"
             self.title = title
             return True
 
@@ -3552,10 +3707,12 @@ def test_session_title_get_retries_pending_even_when_db_has_title(monkeypatch):
         def __init__(self):
             self.title = "auto title"
 
-        def get_session_title(self, _key):
+        def get_session_title(self, _key, *, profile_name=None):
+            assert profile_name == "default"
             return self.title
 
-        def set_session_title(self, _key, title):
+        def set_session_title(self, _key, title, *, profile_name=None):
+            assert profile_name == "default"
             self.title = title
             return True
 
@@ -3577,7 +3734,8 @@ def test_session_title_get_retries_pending_even_when_db_has_title(monkeypatch):
 
 def test_session_title_rejects_empty_title_with_specific_error_code(monkeypatch):
     class _FakeDB:
-        def get_session_title(self, _key):
+        def get_session_title(self, _key, *, profile_name=None):
+            assert profile_name == "default"
             return ""
 
     server._sessions["sid"] = _session()
@@ -3598,13 +3756,15 @@ def test_session_title_rejects_empty_title_with_specific_error_code(monkeypatch)
 
 def test_session_title_set_maps_valueerror_to_user_error(monkeypatch):
     class _FakeDB:
-        def get_session_title(self, _key):
+        def get_session_title(self, _key, *, profile_name=None):
+            assert profile_name == "default"
             return ""
 
         def get_session(self, _key):
             return {"id": _key}
 
-        def set_session_title(self, _key, _title):
+        def set_session_title(self, _key, _title, *, profile_name=None):
+            assert profile_name == "default"
             raise ValueError("Title already in use")
 
     server._sessions["sid"] = _session()
@@ -3626,13 +3786,15 @@ def test_session_title_set_maps_valueerror_to_user_error(monkeypatch):
 
 def test_session_title_set_errors_when_row_lookup_fails_after_noop(monkeypatch):
     class _FakeDB:
-        def get_session_title(self, _key):
+        def get_session_title(self, _key, *, profile_name=None):
+            assert profile_name == "default"
             return ""
 
         def get_session(self, _key):
             raise RuntimeError("row lookup failed")
 
-        def set_session_title(self, _key, _title):
+        def set_session_title(self, _key, _title, *, profile_name=None):
+            assert profile_name == "default"
             return False
 
     server._sessions["sid"] = _session()
@@ -3673,7 +3835,8 @@ def test_session_create_drops_pending_title_on_valueerror(monkeypatch):
             }
 
     class _FakeDB:
-        def set_session_title(self, _key, _title):
+        def set_session_title(self, _key, _title, *, profile_name=None):
+            assert profile_name == "default"
             raise ValueError("Title already in use")
 
     class _ImmediateThread:
@@ -6040,8 +6203,9 @@ def test_session_info_includes_mcp_servers(monkeypatch):
 
 def test_session_info_includes_session_title(monkeypatch):
     class _FakeDB:
-        def get_session_title(self, key):
+        def get_session_title(self, key, *, profile_name=None):
             assert key == "session-key"
+            assert profile_name == "default"
             return "Dashboard title"
 
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
@@ -7239,7 +7403,12 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
 
 def test_session_delete_returns_4007_when_missing(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        legacy_profile_name = "default"
+
+        def get_session(self, _sid):
+            return None
+
+        def delete_session(self, sid, sessions_dir=None, *, profile_name=None):
             return False
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -7254,7 +7423,12 @@ def test_session_delete_returns_4007_when_missing(monkeypatch):
 
 def test_session_delete_propagates_db_exception(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        legacy_profile_name = "default"
+
+        def get_session(self, sid):
+            return {"id": sid, "profile_name": "default"}
+
+        def delete_session(self, sid, sessions_dir=None, *, profile_name=None):
             raise RuntimeError("disk full")
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -7275,9 +7449,15 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     captured: dict = {}
 
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        legacy_profile_name = "default"
+
+        def get_session(self, sid):
+            return {"id": sid, "profile_name": "default"}
+
+        def delete_session(self, sid, sessions_dir=None, *, profile_name=None):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
+            captured["profile_name"] = profile_name
             return True
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -7289,6 +7469,7 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     assert "result" in resp, resp
     assert resp["result"] == {"deleted": "old-1"}
     assert captured["sid"] == "old-1"
+    assert captured["profile_name"] == "default"
     # sessions_dir must be forwarded so transcript files get cleaned up
     # too — not just the SQLite row.  The autouse _isolate_hermes_home
     # fixture pins HERMES_HOME to a temp dir; the handler should append
@@ -7653,7 +7834,8 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
 
 def test_session_active_list_reports_live_sessions(monkeypatch):
     class _DB:
-        def get_session_title(self, key):
+        def get_session_title(self, key, *, profile_name=None):
+            assert profile_name == "default"
             return {"key-a": "Research", "key-b": "Implement"}.get(key, "")
 
     previous_sessions = dict(server._sessions)
@@ -7719,7 +7901,8 @@ def test_session_active_list_excludes_finalized_sessions(monkeypatch):
     standalone ``hermes --tui`` case) must still be reported.
     """
     class _DB:
-        def get_session_title(self, key):
+        def get_session_title(self, key, *, profile_name=None):
+            assert profile_name == "default"
             return {"key-live": "Live", "key-dead": "Dead"}.get(key, "")
 
     previous_sessions = dict(server._sessions)
@@ -7755,6 +7938,58 @@ def test_session_active_list_excludes_finalized_sessions(monkeypatch):
 
     session_rows = resp["result"]["sessions"]
     assert [row["id"] for row in session_rows] == ["sid-live"]
+
+
+def test_live_session_switching_rejects_another_profile(monkeypatch, tmp_path):
+    previous_sessions = dict(server._sessions)
+    server._sessions.clear()
+    named_home = tmp_path / "profiles" / "coder"
+    named_home.mkdir(parents=True)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_profile_name_for_home",
+        lambda name, home: (
+            "coder"
+            if name == "coder" and Path(home) == named_home
+            else None
+        ),
+    )
+    server._sessions["launch"] = _session(
+        session_key="launch-key",
+        profile_name="default",
+    )
+    server._sessions["foreign"] = _session(
+        session_key="foreign-key",
+        profile_name="coder",
+        profile_home=str(named_home),
+    )
+    try:
+        listed = server.handle_request(
+            {
+                "id": "list",
+                "method": "session.active_list",
+                "params": {"current_session_id": "launch"},
+            }
+        )
+        rejected = server.handle_request(
+            {
+                "id": "activate",
+                "method": "session.activate",
+                "params": {
+                    "current_session_id": "launch",
+                    "session_id": "foreign",
+                },
+            }
+        )
+    finally:
+        server._sessions.clear()
+        server._sessions.update(previous_sessions)
+
+    assert [
+        row["id"] for row in listed["result"]["sessions"]
+    ] == ["launch"]
+    assert rejected["error"]["code"] == 4001
 
 
 
@@ -7890,7 +8125,16 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
     """Drops `tool` rows like session.list does, returns the first hit."""
 
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            order_by_last_active=False,
+            compact_rows=False,
+            profile_name=None,
+        ):
+            assert profile_name == "default"
             return [
                 {"id": "tool-1", "source": "tool", "title": "noise", "started_at": 100},
                 {"id": "tui-1", "source": "tui", "title": "real", "started_at": 99},
@@ -7909,7 +8153,15 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
 
 def test_session_most_recent_returns_null_when_only_tool_rows(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            order_by_last_active=False,
+            compact_rows=False,
+            profile_name=None,
+        ):
             return [{"id": "tool-1", "source": "tool", "started_at": 1}]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -7927,7 +8179,15 @@ def test_session_most_recent_folds_db_exception_into_null_result(monkeypatch):
     'no answer' (Copilot review on #17130)."""
 
     class _BrokenDB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
+        def list_sessions_rich(
+            self,
+            *,
+            source=None,
+            limit=200,
+            order_by_last_active=False,
+            compact_rows=False,
+            profile_name=None,
+        ):
             raise RuntimeError("db locked")
 
     monkeypatch.setattr(server, "_get_db", lambda: _BrokenDB())
@@ -7959,6 +8219,7 @@ def test_verification_status_returns_recorded_evidence(tmp_path):
     token = set_hermes_home_override(home)
     project = tmp_path / "project"
     project.mkdir()
+    (project / ".git").mkdir()
     (project / "package.json").write_text(
         json.dumps({"scripts": {"test": "vitest"}}),
         encoding="utf-8",
@@ -10269,3 +10530,130 @@ def test_get_usage_clamps_post_compression_sentinel():
     usage = server._get_usage(agent)
     assert "context_used" not in usage
     assert "context_percent" not in usage
+
+
+def test_spawn_tree_requires_live_owner_and_cannot_cross_profile_root(
+    monkeypatch,
+    tmp_path,
+):
+    previous_sessions = dict(server._sessions)
+    server._sessions.clear()
+    named_home = tmp_path / "profiles" / "coder"
+    named_home.mkdir(parents=True)
+    monkeypatch.setattr(
+        server,
+        "_profile_name_for_home",
+        lambda name, home: (
+            "coder"
+            if name == "coder" and Path(home) == named_home
+            else None
+        ),
+    )
+    server._sessions["launch"] = _session(
+        session_key="launch-key",
+        profile_name="default",
+    )
+    server._sessions["coder"] = _session(
+        session_key="coder-key",
+        profile_name="coder",
+        profile_home=str(named_home),
+    )
+    try:
+        missing = server.handle_request(
+            {
+                "id": "missing",
+                "method": "spawn_tree.save",
+                "params": {
+                    "session_id": "unknown",
+                    "subagents": [{"id": "x"}],
+                },
+            }
+        )
+        saved = server.handle_request(
+            {
+                "id": "save",
+                "method": "spawn_tree.save",
+                "params": {
+                    "session_id": "launch",
+                    "finished_at": 1,
+                    "subagents": [{"id": "x"}],
+                },
+            }
+        )
+        crossed = server.handle_request(
+            {
+                "id": "load",
+                "method": "spawn_tree.load",
+                "params": {
+                    "session_id": "coder",
+                    "path": saved["result"]["path"],
+                },
+            }
+        )
+    finally:
+        server._sessions.clear()
+        server._sessions.update(previous_sessions)
+
+    assert missing["error"]["code"] == 4030
+    assert crossed["error"]["code"] == 4030
+
+
+def test_teardown_keeps_profile_home_bound_through_agent_and_db_close(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_constants import get_hermes_home
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    seen = []
+
+    class _DB:
+        _explicit_profile_name = "coder"
+
+        def close(self):
+            seen.append(("db", get_hermes_home()))
+
+    class _Agent:
+        _session_db = _DB()
+
+        def close(self):
+            seen.append(("agent", get_hermes_home()))
+
+    monkeypatch.setattr(
+        server,
+        "_profile_name_for_home",
+        lambda name, home: (
+            "coder"
+            if (name in {None, "coder"} and Path(home) == profile_home)
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_finalize_session_bound",
+        lambda _session, end_reason="tui_close": seen.append(
+            ("finalize", get_hermes_home())
+        ),
+    )
+    monkeypatch.setattr(
+        "tools.approval.unregister_gateway_notify",
+        lambda _key: seen.append(("unregister", get_hermes_home())),
+    )
+
+    server._teardown_session(
+        {
+            "agent": _Agent(),
+            "profile_home": str(profile_home),
+            "profile_name": "coder",
+            "session_key": "key",
+        }
+    )
+
+    assert [name for name, _home in seen] == [
+        "finalize",
+        "unregister",
+        "agent",
+        "db",
+    ]
+    assert all(home == profile_home for _name, home in seen)

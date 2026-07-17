@@ -15,6 +15,7 @@ Key design decisions:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -27,6 +28,10 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
+from session_profile_evidence import (
+    QUARANTINED_SESSION_PROFILE,
+    classify_session_profile_evidence,
+)
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -1009,10 +1014,101 @@ class SessionDB:
     _IMPORT_MAX_TOTAL_MESSAGES = 50_000
     _IMPORT_MAX_SESSION_BYTES = 5 * 1024 * 1024
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
+    _LEGACY_PROFILE_META_KEY = "sessions_legacy_profile_name"
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    @staticmethod
+    def _canonical_profile_name(value: Any) -> Optional[str]:
+        """Return a validated profile id for internal ownership metadata."""
+        try:
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            profile = normalize_profile_name(value)
+            validate_profile_name(profile)
+            return profile
+        except (ImportError, TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _active_profile_name_or_default(cls) -> str:
+        """Resolve the primary profile that owns a newly-opened state DB."""
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            active = cls._canonical_profile_name(get_active_profile_name())
+        except Exception:
+            active = None
+        return active or "default"
+
+    @classmethod
+    def _profile_owner_from_standard_db_path(cls, db_path: Path) -> Optional[str]:
+        """Infer ownership only for a canonical ``<profile>/state.db`` path.
+
+        Arbitrary/custom database paths deliberately return ``None`` and retain
+        the historical active-profile fallback.  A named-profile match must
+        resolve to the exact directory returned by ``get_profile_dir`` so a
+        coincidental basename (or traversal path) cannot claim an owner.
+        """
+        try:
+            path = Path(db_path)
+            if path.name != "state.db":
+                return None
+
+            from hermes_cli import profiles as profiles_mod
+
+            parent = path.parent.resolve()
+            default_home = Path(
+                profiles_mod.get_profile_dir("default")
+            ).resolve()
+            if parent == default_home:
+                return "default"
+
+            candidate = cls._canonical_profile_name(parent.name)
+            if not candidate or candidate == "default":
+                return None
+            expected = Path(profiles_mod.get_profile_dir(candidate)).resolve()
+            return candidate if parent == expected else None
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+            return None
+
+    def __init__(
+        self,
+        db_path: Path = None,
+        read_only: bool = False,
+        *,
+        profile_name: str = None,
+    ):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.read_only = read_only
+        explicit_profile = None
+        if profile_name is not None:
+            explicit_profile = self._canonical_profile_name(profile_name)
+            if explicit_profile is None:
+                raise ValueError(
+                    f"Invalid SessionDB profile owner {profile_name!r}"
+                )
+        inferred_profile = self._profile_owner_from_standard_db_path(self.db_path)
+        # An explicit profile binds omitted profile-sensitive operations on
+        # this handle to that profile. This is how a default-profile dashboard
+        # can safely read or mutate a named profile's on-disk database without
+        # ambient process state retargeting the operation. A read-only handle
+        # may safely take the same fixed scope from an exact canonical path;
+        # writable handles without an explicit hint retain dynamic multiplex
+        # behavior.
+        self._explicit_profile_name = explicit_profile or (
+            inferred_profile if read_only else None
+        )
+        # Rows written before profile multiplexing have no profile_name. Their
+        # owner is the primary profile whose HERMES_HOME owns this state DB,
+        # not intrinsically ``default``. Writable initialisation persists this
+        # value in state_meta. Standard profile paths provide a safe fallback
+        # when a caller omits the explicit hint; custom paths preserve the
+        # historical active-profile behavior. Read-only handles replace this
+        # initial value with the persisted owner when metadata is available.
+        self._legacy_profile_name = (
+            inferred_profile
+            or explicit_profile
+            or self._active_profile_name_or_default()
+        )
 
         self._lock = threading.Lock()
         self._write_count = 0
@@ -1038,6 +1134,8 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                self._load_read_only_legacy_profile_owner()
+                self._register_profile_scope_sql_function()
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1059,6 +1157,7 @@ class SessionDB:
                 apply_wal_with_fallback(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._init_schema()
+                self._register_profile_scope_sql_function()
 
             try:
                 _connect_and_init()
@@ -1099,7 +1198,149 @@ class SessionDB:
             # Tests that need to reset the state can call
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
+            if self._conn is not None:
+                with contextlib.suppress(Exception):
+                    self._conn.close()
+                self._conn = None
             raise
+
+    @property
+    def legacy_profile_name(self) -> str:
+        """Primary profile that owns NULL/blank legacy session rows."""
+        return self._legacy_profile_name
+
+    def _load_read_only_legacy_profile_owner(self) -> None:
+        """Load persisted legacy ownership without mutating a read-only DB."""
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (self._LEGACY_PROFILE_META_KEY,),
+            ).fetchone()
+        except sqlite3.Error:
+            return
+        if row is None:
+            return
+        value = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+        stored = self._canonical_profile_name(value)
+        if stored is None:
+            raise ValueError(
+                "Invalid persisted legacy session profile owner "
+                f"{value!r} in {self.db_path}; refusing to reinterpret legacy rows"
+            )
+        self._legacy_profile_name = stored
+
+    def _initialize_legacy_profile_owner(self, cursor: sqlite3.Cursor) -> None:
+        """Persist the stable owner used for legacy session profile fallback."""
+        row = cursor.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (self._LEGACY_PROFILE_META_KEY,),
+        ).fetchone()
+        value = None if row is None else (
+            row["value"] if isinstance(row, sqlite3.Row) else row[0]
+        )
+        stored = self._canonical_profile_name(value) if value is not None else None
+        if value is not None and stored is None:
+            raise ValueError(
+                "Invalid persisted legacy session profile owner "
+                f"{value!r} in {self.db_path}; refusing to reassign legacy rows"
+            )
+        owner = stored or self._legacy_profile_name
+        self._legacy_profile_name = owner
+        cursor.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (self._LEGACY_PROFILE_META_KEY, owner),
+        )
+
+    def _profile_scope_sql(self, column: str) -> str:
+        """SQL expression mapping NULL/blank profiles to this DB's owner.
+
+        ``column`` is always a hard-coded identifier supplied by this module.
+        The owner is validated as a profile id before it reaches this helper;
+        quote it defensively because expression indexes cannot use parameters.
+        """
+        owner = self._legacy_profile_name.replace("'", "''")
+        return f"COALESCE(NULLIF(TRIM({column}), ''), '{owner}')"
+
+    def _register_profile_scope_sql_function(self) -> None:
+        """Register an exact, fail-closed ownership predicate for CTEs.
+
+        A plain ``profile_name`` predicate is only a coarse index-friendly
+        filter: persisted ``session_key`` and ``origin_json`` can carry
+        stronger, conflicting evidence. Recursive compression queries need to
+        reject those rows *before* they can affect search, ordering, or tip
+        projection, so expose the shared classifier to SQLite.
+        """
+
+        def _matches(
+            profile_name: Any,
+            session_key: Any,
+            origin_json: Any,
+            expected_profile: Any,
+        ) -> int:
+            try:
+                classification = classify_session_profile_evidence(
+                    {
+                        "profile_name": profile_name,
+                        "session_key": session_key,
+                        "origin_json": origin_json,
+                    },
+                    self._legacy_profile_name,
+                )
+                return int(
+                    classification.coherent
+                    and classification.profile == expected_profile
+                )
+            except Exception:
+                return 0
+
+        self._conn.create_function(
+            "_hermes_session_profile_matches",
+            4,
+            _matches,
+            deterministic=True,
+        )
+
+    def _required_profile_scope(self, profile_name: str = None) -> str:
+        """Resolve a validated profile for profile-keyed auxiliary state.
+
+        Unlike session-row writes, auxiliary tables cannot represent the
+        default profile as NULL because their composite primary keys require a
+        stable value. Explicit caller evidence wins, then an explicitly scoped
+        handle, then the context-local active profile, and finally this DB's
+        persisted legacy owner.
+        """
+        if profile_name is not None:
+            canonical = self._canonical_profile_name(profile_name)
+            if canonical is None:
+                raise ValueError(f"Invalid SessionDB profile scope {profile_name!r}")
+            return canonical
+        if self._explicit_profile_name is not None:
+            return self._explicit_profile_name
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            active = self._canonical_profile_name(get_active_profile_name())
+        except Exception:
+            active = None
+        return active or self._legacy_profile_name
+
+    def _omitted_write_profile_name(self) -> Optional[str]:
+        """Resolve ownership for writes whose legacy caller omitted a profile."""
+        active_profile = self._explicit_profile_name
+        if active_profile is None:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                active_profile = self._canonical_profile_name(
+                    get_active_profile_name()
+                )
+            except Exception:
+                active_profile = None
+        active_profile = active_profile or self._legacy_profile_name
+        if active_profile == "default" and self._legacy_profile_name == "default":
+            return None
+        return active_profile
 
     # ── Core write helper ──
 
@@ -1473,6 +1714,7 @@ class SessionDB:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+        self._initialize_legacy_profile_owner(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
@@ -1779,21 +2021,63 @@ class SessionDB:
 
         # Session titles are unique within one runtime profile. Multiplexed
         # profiles share this database, so a global title constraint would let
-        # one profile reserve names in every other profile. NULL is the legacy
-        # spelling of the default profile and must collide with explicit
-        # ``default`` rows to preserve single-profile behavior.
+        # one profile reserve names in every other profile. NULL/blank is the
+        # legacy spelling of the primary profile that owns this state DB (which
+        # can itself be named), not intrinsically ``default``.
+        title_profile_expr = self._profile_scope_sql("profile_name")
+        legacy_rows = cursor.execute(
+            "SELECT id, profile_name, session_key, origin_json "
+            "FROM sessions "
+            "WHERE profile_name IS NULL OR TRIM(profile_name) = ''"
+        ).fetchall()
         existing_title_index = cursor.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' "
             "AND name = 'idx_sessions_title_unique'"
         ).fetchone()
-        if (
-            existing_title_index
-            and "COALESCE(profile_name" not in str(existing_title_index["sql"] or "")
+        if existing_title_index and (
+            legacy_rows
+            or title_profile_expr not in str(existing_title_index["sql"] or "")
         ):
             cursor.execute("DROP INDEX idx_sessions_title_unique")
+
+        # Materialise coherent legacy ownership on every open. Explicit
+        # origin.profile and named session-key evidence survive migration;
+        # pre-multiplex agent:main/no-evidence rows inherit the persisted DB
+        # primary. Malformed or conflicting rows are stamped with an invalid,
+        # reserved quarantine marker (without changing session_key/origin_json)
+        # so owner-scoped lists/title lookups cannot expose them and runtime
+        # authorization continues to reject their preserved conflict.
+        try:
+            updates = []
+            rejected = 0
+            for row in legacy_rows:
+                classification = classify_session_profile_evidence(
+                    dict(row),
+                    self._legacy_profile_name,
+                )
+                if classification.coherent:
+                    updates.append((classification.profile, row["id"]))
+                else:
+                    updates.append((QUARANTINED_SESSION_PROFILE, row["id"]))
+                    rejected += 1
+            if updates:
+                cursor.executemany(
+                    "UPDATE sessions SET profile_name = ? WHERE id = ? "
+                    "AND (profile_name IS NULL OR TRIM(profile_name) = '')",
+                    updates,
+                )
+            if rejected:
+                logger.warning(
+                    "Quarantined %d session profile row(s) because their "
+                    "persisted profile evidence is malformed or conflicting",
+                    rejected,
+                )
+        except sqlite3.OperationalError:
+            pass
+
         title_index_sql = (
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
-            "ON sessions(title, COALESCE(profile_name, 'default')) "
+            f"ON sessions(title, {title_profile_expr}) "
             "WHERE title IS NOT NULL"
         )
         try:
@@ -1802,15 +2086,16 @@ class SessionDB:
             # The index is an optimization — its creation must never abort
             # opening the database, so the repair itself is also guarded.
             try:
+                older_profile_expr = self._profile_scope_sql("older.profile_name")
+                newer_profile_expr = self._profile_scope_sql("newer.profile_name")
                 cursor.execute(
-                    """UPDATE sessions AS older
+                    f"""UPDATE sessions AS older
                        SET title = NULL
                        WHERE title IS NOT NULL
                          AND EXISTS (
                              SELECT 1 FROM sessions AS newer
                              WHERE newer.title = older.title
-                               AND COALESCE(newer.profile_name, 'default') =
-                                   COALESCE(older.profile_name, 'default')
+                               AND {newer_profile_expr} = {older_profile_expr}
                                AND newer.rowid > older.rowid
                          )"""
                 )
@@ -1889,19 +2174,13 @@ class SessionDB:
         no chat/thread to compare).
         """
         # Older call sites predate the profile_name column (compression/branch
-        # helpers in particular). A named profile's HERMES_HOME is authoritative
-        # local context, so fill that metadata centrally when omitted. Keep the
-        # default profile as NULL for on-disk backward compatibility; reads
-        # consistently interpret NULL as ``default``.
+        # helpers in particular). Stamp their *current runtime* dynamically so
+        # an omitted insert from a multiplex secondary does not get mistaken
+        # for a legacy primary row. Fall back to the persisted DB primary only
+        # when active-profile discovery is unavailable. We retain NULL solely
+        # for the single-profile default/default compatibility case.
         if profile_name is None:
-            try:
-                from hermes_cli.profiles import get_active_profile_name
-
-                active_profile = get_active_profile_name()
-                if active_profile and active_profile != "default":
-                    profile_name = active_profile
-            except Exception:
-                pass
+            profile_name = self._omitted_write_profile_name()
 
         def _do(conn):
             conn.execute(
@@ -2131,6 +2410,7 @@ class SessionDB:
         chat_id: str,
         thread_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        profile_name: str = None,
     ) -> Optional[str]:
         """Find the most recent live session_id for a platform + chat origin.
 
@@ -2142,8 +2422,13 @@ class SessionDB:
         """
         if not platform or chat_id in (None, ""):
             return None
+        profile_scope = None
+        if profile_name is not None:
+            profile_scope = self._required_profile_scope(profile_name)
         query = """
-            SELECT id, user_id, started_at FROM sessions
+            SELECT id, user_id, started_at, profile_name, session_key,
+                   origin_json
+            FROM sessions
             WHERE LOWER(source) = LOWER(?)
               AND session_key IS NOT NULL
               AND chat_id = ?
@@ -2153,9 +2438,24 @@ class SessionDB:
         if thread_id is not None:
             query += " AND COALESCE(thread_id, '') = ?"
             params.append(str(thread_id))
+        if profile_scope is not None:
+            query += f" AND {self._profile_scope_sql('profile_name')} = ?"
+            params.append(profile_scope)
         query += " ORDER BY started_at DESC"
         with self._lock:
             rows = [dict(r) for r in self._conn.execute(query, params).fetchall()]
+        if profile_scope is not None:
+            rows = [
+                row
+                for row in rows
+                if (
+                    (classification := classify_session_profile_evidence(
+                        row,
+                        self._legacy_profile_name,
+                    )).coherent
+                    and classification.profile == profile_scope
+                )
+            ]
         if not rows:
             return None
         if user_id:
@@ -2288,7 +2588,13 @@ class SessionDB:
             ).fetchone()
         return dict(row) if row else None
 
-    def end_session(self, session_id: str, end_reason: str) -> None:
+    def end_session(
+        self,
+        session_id: str,
+        end_reason: str,
+        *,
+        profile_name: str = None,
+    ) -> None:
         """Mark a session as ended.
 
         No-ops when the session is already ended. The first end_reason wins:
@@ -2298,7 +2604,32 @@ class SessionDB:
         with a different reason. Use ``reopen_session()`` first if you
         intentionally need to re-end a closed session with a new reason.
         """
+        profile_scope = (
+            self._required_profile_scope(profile_name)
+            if profile_name is not None
+            else None
+        )
+
         def _do(conn):
+            if profile_scope is not None:
+                target = conn.execute(
+                    "SELECT id, parent_session_id, profile_name, session_key, "
+                    "origin_json FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if target is None:
+                    return
+                classification = classify_session_profile_evidence(
+                    dict(target),
+                    self._legacy_profile_name,
+                )
+                if (
+                    not classification.coherent
+                    or classification.profile != profile_scope
+                ):
+                    raise ValueError(
+                        "Session profile boundary changed during finalization"
+                    )
             conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND ended_at IS NULL",
@@ -2306,9 +2637,39 @@ class SessionDB:
             )
         self._execute_write(_do)
 
-    def reopen_session(self, session_id: str) -> None:
+    def reopen_session(
+        self,
+        session_id: str,
+        *,
+        profile_name: str = None,
+    ) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
+        profile_scope = (
+            self._required_profile_scope(profile_name)
+            if profile_name is not None
+            else None
+        )
+
         def _do(conn):
+            if profile_scope is not None:
+                target = conn.execute(
+                    "SELECT id, parent_session_id, profile_name, session_key, "
+                    "origin_json FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if target is None:
+                    return
+                classification = classify_session_profile_evidence(
+                    dict(target),
+                    self._legacy_profile_name,
+                )
+                if (
+                    not classification.coherent
+                    or classification.profile != profile_scope
+                ):
+                    raise ValueError(
+                        "Session profile boundary changed during resume"
+                    )
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
@@ -3215,7 +3576,12 @@ class SessionDB:
         return cleaned
 
     def _is_compression_ancestor(
-        self, conn, *, ancestor_id: str, descendant_id: str
+        self,
+        conn,
+        *,
+        ancestor_id: str,
+        descendant_id: str,
+        profile_name: str = None,
     ) -> bool:
         """Return True if *ancestor_id* is a compression predecessor of
         *descendant_id* (walking parent links up the continuation chain).
@@ -3231,6 +3597,21 @@ class SessionDB:
         """
         if not ancestor_id or not descendant_id or ancestor_id == descendant_id:
             return False
+        profile_scope = (
+            self._required_profile_scope(profile_name)
+            if profile_name is not None
+            else None
+        )
+        profile_sql = ""
+        profile_params: list[Any] = []
+        if profile_scope is not None:
+            profile_sql = (
+                " AND _hermes_session_profile_matches("
+                "child.profile_name, child.session_key, child.origin_json, ?) = 1"
+                " AND _hermes_session_profile_matches("
+                "parent.profile_name, parent.session_key, parent.origin_json, ?) = 1"
+            )
+            profile_params.extend([profile_scope, profile_scope])
         # Walk parent links up from the descendant, following only compression
         # continuation edges, and check whether ancestor_id is reached.
         edge = _COMPRESSION_CHILD_SQL.format(a="child")
@@ -3244,14 +3625,26 @@ class SessionDB:
                 JOIN sessions child ON child.id = a.id
                 JOIN sessions parent ON parent.id = child.parent_session_id
                 WHERE {edge}
+                  {profile_sql}
             )
             SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
             """,
-            (descendant_id, ancestor_id, descendant_id),
+            (
+                descendant_id,
+                *profile_params,
+                ancestor_id,
+                descendant_id,
+            ),
         ).fetchone()
         return row is not None
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
+    def set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        profile_name: str = None,
+    ) -> bool:
         """Set or update a session's title.
 
         Returns True if session was found and title was set.
@@ -3260,25 +3653,62 @@ class SessionDB:
         Empty/whitespace-only strings are normalized to None (clearing the title).
         """
         title = self.sanitize_title(title)
+        profile_scope = (
+            self._required_profile_scope(profile_name)
+            if profile_name is not None
+            else None
+        )
+
         def _do(conn):
+            target = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if target is None:
+                return 0
+            if profile_scope is not None:
+                classification = classify_session_profile_evidence(
+                    dict(target),
+                    self._legacy_profile_name,
+                )
+                if (
+                    not classification.coherent
+                    or classification.profile != profile_scope
+                ):
+                    raise ValueError(
+                        "Session profile boundary changed during title update"
+                    )
             if title:
                 # Check uniqueness within the target session's runtime profile
-                # (allow the same session to keep its own title). Legacy NULL
-                # profile rows share the explicit ``default`` namespace.
+                # (allow the same session to keep its own title). Legacy
+                # NULL/blank profile rows share this DB's primary namespace.
+                other_profile = self._profile_scope_sql("other.profile_name")
+                target_profile = self._profile_scope_sql("target.profile_name")
                 cursor = conn.execute(
-                    """SELECT other.id
+                    f"""SELECT other.*
                        FROM sessions AS target
                        JOIN sessions AS other
                          ON other.title = ?
                         AND other.id != target.id
-                        AND COALESCE(other.profile_name, 'default') =
-                            COALESCE(target.profile_name, 'default')
+                        AND {other_profile} = {target_profile}
                        WHERE target.id = ?""",
                     (title, session_id),
                 )
                 conflict = cursor.fetchone()
                 if conflict:
                     conflict_id = conflict["id"]
+                    if profile_scope is not None:
+                        classification = classify_session_profile_evidence(
+                            dict(conflict),
+                            self._legacy_profile_name,
+                        )
+                        if (
+                            not classification.coherent
+                            or classification.profile != profile_scope
+                        ):
+                            raise ValueError(
+                                "Session title conflict crosses a profile boundary"
+                            )
                     # A compression continuation is the live, projected-forward
                     # head of its conversation; its compressed predecessors are
                     # ended and hidden from the session list (list_sessions_rich
@@ -3291,7 +3721,10 @@ class SessionDB:
                     # one session carries the exact title) and the parent-link
                     # lineage is untouched.
                     if self._is_compression_ancestor(
-                        conn, ancestor_id=conflict_id, descendant_id=session_id
+                        conn,
+                        ancestor_id=conflict_id,
+                        descendant_id=session_id,
+                        profile_name=profile_scope,
                     ):
                         conn.execute(
                             "UPDATE sessions SET title = NULL WHERE id = ?",
@@ -3309,34 +3742,60 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_title(self, session_id: str) -> Optional[str]:
+    def get_session_title(
+        self,
+        session_id: str,
+        *,
+        profile_name: str = None,
+    ) -> Optional[str]:
         """Get the title for a session, or None."""
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT title FROM sessions WHERE id = ?", (session_id,)
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
             )
             row = cursor.fetchone()
+        if row is not None and profile_name is not None:
+            profile_scope = self._required_profile_scope(profile_name)
+            classification = classify_session_profile_evidence(
+                dict(row),
+                self._legacy_profile_name,
+            )
+            if (
+                not classification.coherent
+                or classification.profile != profile_scope
+            ):
+                return None
         return row["title"] if row else None
 
-    @staticmethod
-    def _title_profile_scope(profile_name: str = None) -> str:
+    def _title_profile_scope(self, profile_name: str = None) -> str:
         """Return the profile boundary for title-based operations.
 
         Once titles are unique per profile, an unscoped lookup is ambiguous.
         Existing CLI/TUI/tool callers omit the optional argument, so bind that
-        compatibility path to the current HERMES_HOME profile rather than
-        silently searching every multiplex runtime.
+        compatibility path to the current HERMES_HOME runtime rather than
+        silently searching every multiplex profile. The persisted DB owner is
+        only the fallback if active-profile discovery is unavailable; it is
+        also used separately to interpret NULL/blank row metadata.
         """
         if profile_name is not None and str(profile_name).strip():
-            return str(profile_name).strip()
+            return self._required_profile_scope(profile_name)
+        if self._explicit_profile_name is not None:
+            return self._explicit_profile_name
         try:
             from hermes_cli.profiles import get_active_profile_name
 
-            return get_active_profile_name() or "default"
+            active = self._canonical_profile_name(get_active_profile_name())
         except Exception:
-            return "default"
+            active = None
+        return active or self._legacy_profile_name
 
-    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+    def set_session_archived(
+        self,
+        session_id: str,
+        archived: bool,
+        *,
+        profile_name: str = None,
+    ) -> bool:
         """Archive or unarchive a session.
 
         Archived sessions are hidden from the default session list but keep all
@@ -3346,9 +3805,42 @@ class SessionDB:
         displayed tip lets the still-unarchived root resurrect it on refresh.
         Returns True when at least one row was updated.
         """
+        profile_scope = (
+            self._required_profile_scope(profile_name)
+            if profile_name is not None
+            else None
+        )
+        edge_profile_sql = ""
+        edge_profile_params: list[Any] = []
+        if profile_scope is not None:
+            edge_profile_sql = (
+                " AND _hermes_session_profile_matches("
+                "child.profile_name, child.session_key, child.origin_json, ?) = 1"
+                " AND _hermes_session_profile_matches("
+                "parent.profile_name, parent.session_key, parent.origin_json, ?) = 1"
+            )
+            edge_profile_params.extend([profile_scope, profile_scope])
+
         def _do(conn):
+            if profile_scope is not None:
+                target = conn.execute(
+                    "SELECT profile_name, session_key, origin_json "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if target is None:
+                    return 0
+                classification = classify_session_profile_evidence(
+                    dict(target),
+                    self._legacy_profile_name,
+                )
+                if (
+                    not classification.coherent
+                    or classification.profile != profile_scope
+                ):
+                    return 0
             cursor = conn.execute(
-                """
+                f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
                     SELECT ?
@@ -3358,6 +3850,7 @@ class SessionDB:
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
                     WHERE parent.end_reason = 'compression'
+                      {edge_profile_sql}
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -3367,6 +3860,7 @@ class SessionDB:
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
+                      {edge_profile_sql}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -3377,7 +3871,13 @@ class SessionDB:
                 SET archived = ?
                 WHERE id IN (SELECT id FROM lineage)
                 """,
-                (session_id, session_id, 1 if archived else 0),
+                (
+                    session_id,
+                    *edge_profile_params,
+                    session_id,
+                    *edge_profile_params,
+                    1 if archived else 0,
+                ),
             )
             rowcount = cursor.rowcount
             if rowcount is None or rowcount < 0:
@@ -3393,15 +3893,28 @@ class SessionDB:
     ) -> Optional[Dict[str, Any]]:
         """Look up an exact title in one profile (the active profile by default)."""
         profile_scope = self._title_profile_scope(profile_name)
+        row_profile = self._profile_scope_sql("profile_name")
         query = (
             "SELECT * FROM sessions WHERE title = ? "
-            "AND COALESCE(profile_name, 'default') = COALESCE(?, 'default')"
+            f"AND {row_profile} = ?"
         )
         params: tuple[Any, ...] = (title, profile_scope)
         with self._lock:
             cursor = self._conn.execute(query, params)
             row = cursor.fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        result = dict(row)
+        classification = classify_session_profile_evidence(
+            result,
+            self._legacy_profile_name,
+        )
+        if (
+            not classification.coherent
+            or classification.profile != profile_scope
+        ):
+            return None
+        return result
 
     def resolve_session_by_title(
         self,
@@ -3427,23 +3940,28 @@ class SessionDB:
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         query = (
-            "SELECT id, title, started_at FROM sessions "
+            "SELECT * FROM sessions "
             "WHERE title LIKE ? ESCAPE '\\'"
         )
-        query += (
-            " AND COALESCE(profile_name, 'default') = "
-            "COALESCE(?, 'default')"
-        )
+        query += f" AND {self._profile_scope_sql('profile_name')} = ?"
         params: tuple[Any, ...] = (f"{escaped} #%", profile_scope)
         query += " ORDER BY started_at DESC"
         with self._lock:
             cursor = self._conn.execute(query, params)
             numbered = cursor.fetchall()
 
-        if numbered:
-            # Return the most recent numbered variant
-            return numbered[0]["id"]
-        elif exact:
+        for row in numbered:
+            classification = classify_session_profile_evidence(
+                dict(row),
+                self._legacy_profile_name,
+            )
+            if (
+                classification.coherent
+                and classification.profile == profile_scope
+            ):
+                # Return the most recent coherent numbered variant.
+                return row["id"]
+        if exact:
             return exact["id"]
         return None
 
@@ -3469,18 +3987,25 @@ class SessionDB:
         # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
         escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         query = (
-            "SELECT title FROM sessions "
+            "SELECT * FROM sessions "
             "WHERE (title = ? OR title LIKE ? ESCAPE '\\')"
         )
         profile_scope = self._title_profile_scope(profile_name)
-        query += (
-            " AND COALESCE(profile_name, 'default') = "
-            "COALESCE(?, 'default')"
-        )
+        query += f" AND {self._profile_scope_sql('profile_name')} = ?"
         params: tuple[Any, ...] = (base, f"{escaped} #%", profile_scope)
         with self._lock:
             cursor = self._conn.execute(query, params)
-            existing = [row["title"] for row in cursor.fetchall()]
+            existing = []
+            for row in cursor.fetchall():
+                classification = classify_session_profile_evidence(
+                    dict(row),
+                    self._legacy_profile_name,
+                )
+                if (
+                    classification.coherent
+                    and classification.profile == profile_scope
+                ):
+                    existing.append(row["title"])
 
         if not existing:
             return base  # No conflict, use the base name as-is
@@ -3494,7 +4019,12 @@ class SessionDB:
 
         return f"{base} #{max_num + 1}"
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def get_compression_tip(
+        self,
+        session_id: str,
+        *,
+        profile_name: str = None,
+    ) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
         A compression continuation is a child of a session whose
@@ -3513,23 +4043,52 @@ class SessionDB:
         themselves continuing the compression chain (``end_reason='compression'``)
         or still live over stale closed siblings such as ``ws_orphan_reap``.
         Returns the latest continuation tip, or the input id when no
-        continuation exists.
+        continuation exists. When ``profile_name`` is provided, every row in
+        the chain must have coherent evidence for that profile. A foreign or
+        malformed sibling is ignored before ranking, and a foreign starting
+        row returns ``None``.
         """
+        profile_scope = (
+            self._required_profile_scope(profile_name)
+            if profile_name is not None
+            else None
+        )
         current = session_id
         seen = {current} if current else set()
+        if profile_scope is not None:
+            with self._lock:
+                root = self._conn.execute(
+                    "SELECT profile_name, session_key, origin_json "
+                    "FROM sessions WHERE id = ?",
+                    (current,),
+                ).fetchone()
+            if root is None:
+                return None
+            classification = classify_session_profile_evidence(
+                dict(root),
+                self._legacy_profile_name,
+            )
+            if (
+                not classification.coherent
+                or classification.profile != profile_scope
+            ):
+                return None
+
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
+            limit_sql = "LIMIT 1" if profile_scope is None else ""
             with self._lock:
                 cursor = self._conn.execute(
-                    """
-                    SELECT child.id
+                    f"""
+                    SELECT child.id, child.profile_name, child.session_key,
+                           child.origin_json
                     FROM sessions parent
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
                       AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
                     ORDER BY
                       CASE
@@ -3543,11 +4102,25 @@ class SessionDB:
                       ) DESC,
                       child.started_at DESC,
                       child.id DESC
-                    LIMIT 1
+                    {limit_sql}
                     """,
                     (current,),
                 )
-                row = cursor.fetchone()
+                rows = cursor.fetchall()
+            row = None
+            for candidate in rows:
+                if profile_scope is not None:
+                    classification = classify_session_profile_evidence(
+                        dict(candidate),
+                        self._legacy_profile_name,
+                    )
+                    if (
+                        not classification.coherent
+                        or classification.profile != profile_scope
+                    ):
+                        continue
+                row = candidate
+                break
             if row is None:
                 return current
             child_id = row["id"]
@@ -3664,6 +4237,11 @@ class SessionDB:
         """
         where_clauses = []
         params = []
+        profile_scope = (
+            self._required_profile_scope(profile_name)
+            if profile_name is not None
+            else None
+        )
 
         if not include_children:
             # Show root sessions and branch sessions, while still hiding
@@ -3686,11 +4264,19 @@ class SessionDB:
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
-        if profile_name is not None:
+        if profile_scope is not None:
             where_clauses.append(
-                "COALESCE(s.profile_name, 'default') = COALESCE(?, 'default')"
+                f"{self._profile_scope_sql('s.profile_name')} = ?"
             )
-            params.append(profile_name)
+            params.append(profile_scope)
+            # ``profile_name`` is a useful coarse predicate, but persisted
+            # origin/session-key evidence can contradict it. Reject those rows
+            # before recursive search/order logic can observe them.
+            where_clauses.append(
+                "_hermes_session_profile_matches("
+                "s.profile_name, s.session_key, s.origin_json, ?) = 1"
+            )
+            params.append(profile_scope)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
@@ -3736,6 +4322,15 @@ class SessionDB:
             outer_where = where_sql
             id_params: List[Any] = []
             filter_clauses: List[str] = []
+            chain_profile_sql = ""
+            chain_profile_params: List[Any] = []
+            if profile_scope is not None:
+                chain_profile_sql = (
+                    " AND _hermes_session_profile_matches("
+                    "child.profile_name, child.session_key, "
+                    "child.origin_json, ?) = 1"
+                )
+                chain_profile_params.append(profile_scope)
 
             def _like_pattern(needle: str) -> str:
                 escaped = (
@@ -3796,6 +4391,7 @@ class SessionDB:
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
+                      {chain_profile_sql}
                 ),
                 chain_max AS (
                     SELECT
@@ -3828,7 +4424,13 @@ class SessionDB:
             """
             # WHERE params apply twice (CTE seed + outer select); the id filter
             # only applies to the outer select.
-            params = params + params + id_params + [limit, offset]
+            params = (
+                params
+                + chain_profile_params
+                + params
+                + id_params
+                + [limit, offset]
+            )
         else:
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             query = f"""
@@ -3879,7 +4481,10 @@ class SessionDB:
                 if s.get("end_reason") != "compression":
                     projected.append(s)
                     continue
-                tip_id = self.get_compression_tip(s["id"])
+                tip_id = self.get_compression_tip(
+                    s["id"],
+                    profile_name=profile_scope,
+                )
                 if tip_id == s["id"]:
                     projected.append(s)
                     continue
@@ -3887,6 +4492,17 @@ class SessionDB:
                 if not tip_row:
                     projected.append(s)
                     continue
+                if profile_scope is not None:
+                    classification = classify_session_profile_evidence(
+                        tip_row,
+                        self._legacy_profile_name,
+                    )
+                    if (
+                        not classification.coherent
+                        or classification.profile != profile_scope
+                    ):
+                        projected.append(s)
+                        continue
                 # Preserve the root's started_at for stable sort order, but
                 # surface the tip's identity and activity data.
                 merged = dict(s)
@@ -4073,6 +4689,7 @@ class SessionDB:
         observed: bool = False,
         effect_disposition: Optional[str] = None,
         timestamp: Any = None,
+        profile_name: str = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -4118,8 +4735,35 @@ class SessionDB:
         num_tool_calls = 0
         if tool_calls is not None:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
+        profile_scope = (
+            self._required_profile_scope(profile_name)
+            if profile_name is not None
+            else None
+        )
 
         def _do(conn):
+            if profile_scope is not None:
+                owner_row = conn.execute(
+                    "SELECT profile_name, session_key, origin_json "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                classification = (
+                    classify_session_profile_evidence(
+                        dict(owner_row),
+                        self._legacy_profile_name,
+                    )
+                    if owner_row is not None
+                    else None
+                )
+                if (
+                    classification is None
+                    or not classification.coherent
+                    or classification.profile != profile_scope
+                ):
+                    raise ValueError(
+                        "Session does not belong to the requested profile"
+                    )
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -5180,6 +5824,7 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        profile_name: str = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -5262,6 +5907,13 @@ class SessionDB:
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
 
+        if profile_name is not None:
+            profile_scope = self._required_profile_scope(profile_name)
+            where_clauses.append(
+                f"{self._profile_scope_sql('s.profile_name')} = ?"
+            )
+            params.append(profile_scope)
+
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
 
@@ -5337,6 +5989,11 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if profile_name is not None:
+                    tri_where.append(
+                        f"{self._profile_scope_sql('s.profile_name')} = ?"
+                    )
+                    tri_params.append(profile_scope)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -5394,6 +6051,11 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                if profile_name is not None:
+                    like_where.append(
+                        f"{self._profile_scope_sql('s.profile_name')} = ?"
+                    )
+                    like_params.append(profile_scope)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
@@ -6010,6 +6672,8 @@ class SessionDB:
             skipped_ids: List[str] = []
             parent_updates: List[tuple[str, str]] = []
             detached = 0
+            import_profile_scope = self._required_profile_scope()
+            import_profile_value = self._omitted_write_profile_name()
 
             for item in normalized:
                 raw = item["session"]
@@ -6037,7 +6701,8 @@ class SessionDB:
                            cwd, git_branch, git_repo_root,
                            billing_provider, billing_base_url, billing_mode,
                            estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
-                           pricing_version, title, api_call_count, archived
+                           pricing_version, title, api_call_count, archived,
+                           profile_name
                        )
                        VALUES (
                            :id, :source, :user_id, :model, :model_config,
@@ -6048,7 +6713,7 @@ class SessionDB:
                            :billing_provider, :billing_base_url, :billing_mode,
                            :estimated_cost_usd, :actual_cost_usd, :cost_status,
                            :cost_source, :pricing_version, :title,
-                           :api_call_count, :archived
+                           :api_call_count, :archived, :profile_name
                        )""",
                     {
                         "id": session_id,
@@ -6089,6 +6754,7 @@ class SessionDB:
                         "title": raw.get("title"),
                         "api_call_count": self._int_or_default(raw.get("api_call_count")),
                         "archived": archived,
+                        "profile_name": import_profile_value,
                     },
                 )
 
@@ -6120,6 +6786,25 @@ class SessionDB:
 
             parent_by_child = dict(parent_updates)
 
+            def _owned_parent_row(session_id: str):
+                row = conn.execute(
+                    "SELECT id, parent_session_id, profile_name, session_key, "
+                    "origin_json FROM sessions WHERE id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                classification = classify_session_profile_evidence(
+                    dict(row),
+                    self._legacy_profile_name,
+                )
+                if (
+                    not classification.coherent
+                    or classification.profile != import_profile_scope
+                ):
+                    return None
+                return row
+
             def _would_create_cycle(session_id: str, parent_id: str) -> bool:
                 seen = {session_id}
                 current = parent_id
@@ -6131,19 +6816,26 @@ class SessionDB:
                         current = parent_by_child[current]
                         continue
                     row = conn.execute(
-                        "SELECT parent_session_id FROM sessions WHERE id = ? LIMIT 1",
+                        "SELECT id, parent_session_id, profile_name, session_key, "
+                        "origin_json FROM sessions WHERE id = ? LIMIT 1",
                         (current,),
                     ).fetchone()
                     if row is None:
                         return False
+                    classification = classify_session_profile_evidence(
+                        dict(row),
+                        self._legacy_profile_name,
+                    )
+                    if (
+                        not classification.coherent
+                        or classification.profile != import_profile_scope
+                    ):
+                        return True
                     current = row["parent_session_id"]
                 return False
 
             for session_id, parent_id in parent_updates:
-                parent_exists = conn.execute(
-                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
-                    (parent_id,),
-                ).fetchone()
+                parent_exists = _owned_parent_row(parent_id)
                 if parent_exists and not _would_create_cycle(session_id, parent_id):
                     conn.execute(
                         "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
@@ -6211,6 +6903,8 @@ class SessionDB:
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        *,
+        profile_name: str = None,
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -6225,6 +6919,15 @@ class SessionDB:
         removed_delegate_ids: List[str] = []
 
         def _do(conn):
+            if profile_name is not None:
+                scope = self._required_profile_scope(profile_name)
+                removed, delegates = self._delete_sessions_for_profile(
+                    conn,
+                    [session_id],
+                    scope,
+                )
+                removed_delegate_ids.extend(delegates)
+                return bool(removed)
             cursor = conn.execute(
                 "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
             )
@@ -6248,10 +6951,117 @@ class SessionDB:
             self._remove_session_files(sessions_dir, session_id)
         return bool(deleted)
 
+    def _delete_sessions_for_profile(
+        self,
+        conn,
+        session_ids: List[str],
+        profile_name: str,
+    ) -> tuple[List[str], List[str]]:
+        """Delete owned rows without touching a foreign-profile child edge."""
+        requested = {sid for sid in session_ids if sid}
+        if not requested:
+            return [], []
+
+        def _rows_for_ids(ids: set[str]) -> list[dict]:
+            if not ids:
+                return []
+            placeholders = ",".join("?" * len(ids))
+            rows = conn.execute(
+                "SELECT id, parent_session_id, profile_name, session_key, "
+                f"origin_json, model_config FROM sessions "
+                f"WHERE id IN ({placeholders})",
+                list(ids),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+        def _owned(row: dict) -> bool:
+            classification = classify_session_profile_evidence(
+                row,
+                self._legacy_profile_name,
+            )
+            return (
+                classification.coherent
+                and classification.profile == profile_name
+            )
+
+        requested_rows = _rows_for_ids(requested)
+        owned_requested = {row["id"] for row in requested_rows if _owned(row)}
+        if not owned_requested:
+            return [], []
+
+        # Walk same-profile delegate chains. A foreign row with an actual FK
+        # parent edge into the doomed set would have to be orphaned to satisfy
+        # SQLite; reject the whole mutation instead.
+        delegate_ids: set[str] = set()
+        frontier = set(owned_requested)
+        delegate_expr = _delegate_from_json()
+        while frontier:
+            placeholders = ",".join("?" * len(frontier))
+            rows = conn.execute(
+                "SELECT id, parent_session_id, profile_name, session_key, "
+                "origin_json, model_config FROM sessions "
+                f"WHERE {delegate_expr} IN ({placeholders}) "
+                f"OR (parent_session_id IN ({placeholders}) "
+                f"AND {delegate_expr} IS NOT NULL)",
+                [*frontier, *frontier],
+            ).fetchall()
+            next_frontier: set[str] = set()
+            for raw in rows:
+                row = dict(raw)
+                row_id = row["id"]
+                if row_id in owned_requested or row_id in delegate_ids:
+                    continue
+                if not _owned(row):
+                    if row.get("parent_session_id") in frontier:
+                        raise ValueError(
+                            "Refusing delete across a foreign-profile child edge"
+                        )
+                    continue
+                delegate_ids.add(row_id)
+                next_frontier.add(row_id)
+            frontier = next_frontier
+
+        doomed = owned_requested | delegate_ids
+        placeholders = ",".join("?" * len(doomed))
+        child_rows = conn.execute(
+            "SELECT id, parent_session_id, profile_name, session_key, "
+            "origin_json, model_config FROM sessions "
+            f"WHERE parent_session_id IN ({placeholders}) "
+            f"AND id NOT IN ({placeholders})",
+            [*doomed, *doomed],
+        ).fetchall()
+        orphan_ids: list[str] = []
+        for raw in child_rows:
+            row = dict(raw)
+            if not _owned(row):
+                raise ValueError(
+                    "Refusing delete across a foreign-profile child edge"
+                )
+            orphan_ids.append(row["id"])
+
+        if orphan_ids:
+            orphan_placeholders = ",".join("?" * len(orphan_ids))
+            conn.execute(
+                "UPDATE sessions SET parent_session_id = NULL "
+                f"WHERE id IN ({orphan_placeholders})",
+                orphan_ids,
+            )
+        conn.execute(
+            f"DELETE FROM messages WHERE session_id IN ({placeholders})",
+            list(doomed),
+        )
+        conn.execute(
+            f"DELETE FROM sessions WHERE id IN ({placeholders})",
+            list(doomed),
+        )
+        return list(owned_requested), list(delegate_ids)
+
     def delete_session_if_empty(
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        *,
+        profile_name: str = None,
     ) -> bool:
         """Delete *session_id* only when it never gained resumable content.
 
@@ -6268,6 +7078,24 @@ class SessionDB:
         flushed. Returns True if the session was deleted.
         """
         def _do(conn):
+            if profile_name is not None:
+                scope = self._required_profile_scope(profile_name)
+                target = conn.execute(
+                    "SELECT id, parent_session_id, profile_name, session_key, "
+                    "origin_json, model_config FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if target is None:
+                    return False
+                classification = classify_session_profile_evidence(
+                    dict(target),
+                    self._legacy_profile_name,
+                )
+                if (
+                    not classification.coherent
+                    or classification.profile != scope
+                ):
+                    return False
             cursor = conn.execute(
                 """
                 DELETE FROM sessions
@@ -6279,7 +7107,7 @@ class SessionDB:
                   AND NOT EXISTS (
                       SELECT 1 FROM sessions child
                       WHERE child.parent_session_id = sessions.id
-                  )
+                )
                 """,
                 (session_id,),
             )
@@ -6294,6 +7122,8 @@ class SessionDB:
         self,
         session_ids: List[str],
         sessions_dir: Optional[Path] = None,
+        *,
+        profile_name: str = None,
     ) -> int:
         """Delete every session in *session_ids* in a single transaction.
 
@@ -6332,6 +7162,16 @@ class SessionDB:
         removed_delegate_ids: list[str] = []
 
         def _do(conn):
+            if profile_name is not None:
+                scope = self._required_profile_scope(profile_name)
+                removed, delegates = self._delete_sessions_for_profile(
+                    conn,
+                    unique_ids,
+                    scope,
+                )
+                removed_ids.extend(removed)
+                removed_delegate_ids.extend(delegates)
+                return len(removed)
             placeholders = ",".join("?" * len(unique_ids))
             # First, filter to IDs that actually exist — we want to
             # return the real deleted count, not the input length.
@@ -6746,12 +7586,15 @@ class SessionDB:
           v1 — initial shape (no ON DELETE CASCADE on session_id FK)
           v2 — session_id FK gets ON DELETE CASCADE so session pruning
                automatically clears bindings.
+          v3 — runtime profile becomes part of every topic-mode key so shared
+               multiplex databases cannot route one profile through another.
         """
         def _do(conn):
-            conn.executescript(
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS telegram_dm_topic_mode (
-                    chat_id TEXT PRIMARY KEY,
+                    profile_name TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     activated_at REAL NOT NULL,
@@ -6760,10 +7603,15 @@ class SessionDB:
                     allows_users_to_create_topics INTEGER,
                     capability_checked_at REAL,
                     intro_message_id TEXT,
-                    pinned_message_id TEXT
-                );
-
+                    pinned_message_id TEXT,
+                    PRIMARY KEY (profile_name, chat_id)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS telegram_dm_topic_bindings (
+                    profile_name TEXT NOT NULL,
                     chat_id TEXT NOT NULL,
                     thread_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
@@ -6772,67 +7620,167 @@ class SessionDB:
                     managed_mode TEXT NOT NULL DEFAULT 'auto',
                     linked_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
-                    PRIMARY KEY (chat_id, thread_id)
-                );
-
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_session
-                ON telegram_dm_topic_bindings(session_id);
-
-                CREATE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_user
-                ON telegram_dm_topic_bindings(user_id, chat_id);
+                    PRIMARY KEY (profile_name, chat_id, thread_id)
+                )
                 """
             )
 
-            # v1 → v2: rebuild telegram_dm_topic_bindings if its session_id FK
-            # lacks ON DELETE CASCADE. SQLite can't ALTER a foreign key, so we
-            # rebuild the table. Only runs once per DB (version gate).
-            current = conn.execute(
-                "SELECT value FROM state_meta WHERE key = ?",
-                ("telegram_dm_topic_schema_version",),
-            ).fetchone()
-            current_version = int(current[0]) if current and str(current[0]).isdigit() else 0
-            if current_version < 2:
-                fk_rows = conn.execute(
-                    "PRAGMA foreign_key_list('telegram_dm_topic_bindings')"
+            mode_columns = {
+                row[1] for row in conn.execute(
+                    "PRAGMA table_info('telegram_dm_topic_mode')"
                 ).fetchall()
-                needs_rebuild = any(
-                    row[2] == "sessions" and (row[6] or "") != "CASCADE"
-                    for row in fk_rows
-                )
-                if needs_rebuild:
-                    conn.executescript(
-                        """
-                        CREATE TABLE telegram_dm_topic_bindings_new (
-                            chat_id TEXT NOT NULL,
-                            thread_id TEXT NOT NULL,
-                            user_id TEXT NOT NULL,
-                            session_key TEXT NOT NULL,
-                            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                            managed_mode TEXT NOT NULL DEFAULT 'auto',
-                            linked_at REAL NOT NULL,
-                            updated_at REAL NOT NULL,
-                            PRIMARY KEY (chat_id, thread_id)
-                        );
-                        INSERT INTO telegram_dm_topic_bindings_new
-                            SELECT chat_id, thread_id, user_id, session_key,
-                                   session_id, managed_mode, linked_at, updated_at
-                            FROM telegram_dm_topic_bindings;
-                        DROP TABLE telegram_dm_topic_bindings;
-                        ALTER TABLE telegram_dm_topic_bindings_new
-                            RENAME TO telegram_dm_topic_bindings;
-                        CREATE UNIQUE INDEX idx_telegram_dm_topic_bindings_session
-                            ON telegram_dm_topic_bindings(session_id);
-                        CREATE INDEX idx_telegram_dm_topic_bindings_user
-                            ON telegram_dm_topic_bindings(user_id, chat_id);
-                        """
+            }
+            binding_columns = {
+                row[1] for row in conn.execute(
+                    "PRAGMA table_info('telegram_dm_topic_bindings')"
+                ).fetchall()
+            }
+            fk_rows = conn.execute(
+                "PRAGMA foreign_key_list('telegram_dm_topic_bindings')"
+            ).fetchall()
+            has_cascade = any(
+                row[2] == "sessions" and (row[6] or "") == "CASCADE"
+                for row in fk_rows
+            )
+            needs_rebuild = (
+                "profile_name" not in mode_columns
+                or "profile_name" not in binding_columns
+                or not has_cascade
+            )
+            if needs_rebuild:
+                owner = self._legacy_profile_name
+                conn.execute("DROP TABLE IF EXISTS telegram_dm_topic_mode_new")
+                conn.execute("DROP TABLE IF EXISTS telegram_dm_topic_bindings_new")
+                conn.execute(
+                    """
+                    CREATE TABLE telegram_dm_topic_mode_new (
+                        profile_name TEXT NOT NULL,
+                        chat_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        activated_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        has_topics_enabled INTEGER,
+                        allows_users_to_create_topics INTEGER,
+                        capability_checked_at REAL,
+                        intro_message_id TEXT,
+                        pinned_message_id TEXT,
+                        PRIMARY KEY (profile_name, chat_id)
                     )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE telegram_dm_topic_bindings_new (
+                        profile_name TEXT NOT NULL,
+                        chat_id TEXT NOT NULL,
+                        thread_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        session_key TEXT NOT NULL,
+                        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        managed_mode TEXT NOT NULL DEFAULT 'auto',
+                        linked_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (profile_name, chat_id, thread_id)
+                    )
+                    """
+                )
+                mode_profile = (
+                    "COALESCE(NULLIF(TRIM(profile_name), ''), ?)"
+                    if "profile_name" in mode_columns
+                    else "?"
+                )
+                binding_profile = (
+                    "COALESCE(NULLIF(TRIM(profile_name), ''), ?)"
+                    if "profile_name" in binding_columns
+                    else "?"
+                )
+                conn.execute(
+                    f"""
+                    INSERT INTO telegram_dm_topic_mode_new (
+                        profile_name, chat_id, user_id, enabled, activated_at,
+                        updated_at, has_topics_enabled,
+                        allows_users_to_create_topics, capability_checked_at,
+                        intro_message_id, pinned_message_id
+                    )
+                    SELECT {mode_profile}, chat_id, user_id, enabled,
+                           activated_at, updated_at, has_topics_enabled,
+                           allows_users_to_create_topics,
+                           capability_checked_at, intro_message_id,
+                           pinned_message_id
+                    FROM telegram_dm_topic_mode
+                    """,
+                    (owner,),
+                )
+                conn.execute(
+                    f"""
+                    INSERT INTO telegram_dm_topic_bindings_new (
+                        profile_name, chat_id, thread_id, user_id, session_key,
+                        session_id, managed_mode, linked_at, updated_at
+                    )
+                    SELECT {binding_profile}, chat_id, thread_id, user_id,
+                           session_key, session_id, managed_mode, linked_at,
+                           updated_at
+                    FROM telegram_dm_topic_bindings
+                    """,
+                    (owner,),
+                )
+                conn.execute("DROP TABLE telegram_dm_topic_bindings")
+                conn.execute("DROP TABLE telegram_dm_topic_mode")
+                conn.execute(
+                    "ALTER TABLE telegram_dm_topic_mode_new "
+                    "RENAME TO telegram_dm_topic_mode"
+                )
+                conn.execute(
+                    "ALTER TABLE telegram_dm_topic_bindings_new "
+                    "RENAME TO telegram_dm_topic_bindings"
+                )
+
+            conn.execute(
+                "DROP INDEX IF EXISTS idx_telegram_dm_topic_bindings_session"
+            )
+            conn.execute(
+                "DROP INDEX IF EXISTS idx_telegram_dm_topic_bindings_user"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX idx_telegram_dm_topic_bindings_session "
+                "ON telegram_dm_topic_bindings(profile_name, session_id)"
+            )
+            conn.execute(
+                "CREATE INDEX idx_telegram_dm_topic_bindings_user "
+                "ON telegram_dm_topic_bindings("
+                "profile_name, user_id, chat_id)"
+            )
 
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                ("telegram_dm_topic_schema_version", "2"),
+                ("telegram_dm_topic_schema_version", "3"),
             )
         self._execute_write(_do)
+
+    def _telegram_session_owned_by_profile(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        profile_name: str,
+    ) -> bool:
+        """Fail closed unless a topic binding's session has coherent ownership."""
+        row = conn.execute(
+            "SELECT profile_name, session_key, origin_json "
+            "FROM sessions WHERE id = ?",
+            (str(session_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        classification = classify_session_profile_evidence(
+            dict(row),
+            self._legacy_profile_name,
+        )
+        return (
+            classification.coherent
+            and classification.profile == profile_name
+        )
 
     def enable_telegram_topic_mode(
         self,
@@ -6841,6 +7789,7 @@ class SessionDB:
         user_id: str,
         has_topics_enabled: Optional[bool] = None,
         allows_users_to_create_topics: Optional[bool] = None,
+        profile_name: str = None,
     ) -> None:
         """Enable Telegram DM topic mode for one private chat/user.
 
@@ -6849,6 +7798,7 @@ class SessionDB:
         """
         self.apply_telegram_topic_migration()
         now = time.time()
+        profile_name = self._required_profile_scope(profile_name)
 
         def _to_int(value: Optional[bool]) -> Optional[int]:
             if value is None:
@@ -6859,11 +7809,12 @@ class SessionDB:
             conn.execute(
                 """
                 INSERT INTO telegram_dm_topic_mode (
-                    chat_id, user_id, enabled, activated_at, updated_at,
+                    profile_name, chat_id, user_id, enabled,
+                    activated_at, updated_at,
                     has_topics_enabled, allows_users_to_create_topics,
                     capability_checked_at
-                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id) DO UPDATE SET
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_name, chat_id) DO UPDATE SET
                     user_id = excluded.user_id,
                     enabled = 1,
                     updated_at = excluded.updated_at,
@@ -6872,6 +7823,7 @@ class SessionDB:
                     capability_checked_at = excluded.capability_checked_at
                 """,
                 (
+                    profile_name,
                     str(chat_id),
                     str(user_id),
                     now,
@@ -6888,6 +7840,7 @@ class SessionDB:
         *,
         chat_id: str,
         clear_bindings: bool = True,
+        profile_name: str = None,
     ) -> None:
         """Disable Telegram DM topic mode for one private chat.
 
@@ -6899,33 +7852,43 @@ class SessionDB:
         Never creates the topic-mode tables from scratch; if they don't
         exist there is nothing to disable and the call is a no-op.
         """
+        profile_name = self._required_profile_scope(profile_name)
+
         def _do(conn):
             try:
                 conn.execute(
                     "UPDATE telegram_dm_topic_mode SET enabled = 0, updated_at = ? "
-                    "WHERE chat_id = ?",
-                    (time.time(), str(chat_id)),
+                    "WHERE profile_name = ? AND chat_id = ?",
+                    (time.time(), profile_name, str(chat_id)),
                 )
                 if clear_bindings:
                     conn.execute(
-                        "DELETE FROM telegram_dm_topic_bindings WHERE chat_id = ?",
-                        (str(chat_id),),
+                        "DELETE FROM telegram_dm_topic_bindings "
+                        "WHERE profile_name = ? AND chat_id = ?",
+                        (profile_name, str(chat_id)),
                     )
             except sqlite3.OperationalError:
                 # Tables don't exist yet — nothing to disable.
                 return
         self._execute_write(_do)
 
-    def is_telegram_topic_mode_enabled(self, *, chat_id: str, user_id: str) -> bool:
+    def is_telegram_topic_mode_enabled(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        profile_name: str = None,
+    ) -> bool:
         """Return whether Telegram DM topic mode is enabled for this chat/user."""
+        profile_name = self._required_profile_scope(profile_name)
         with self._lock:
             try:
                 row = self._conn.execute(
                     """
                     SELECT enabled FROM telegram_dm_topic_mode
-                    WHERE chat_id = ? AND user_id = ?
+                    WHERE profile_name = ? AND chat_id = ? AND user_id = ?
                     """,
-                    (str(chat_id), str(user_id)),
+                    (profile_name, str(chat_id), str(user_id)),
                 ).fetchone()
             except sqlite3.OperationalError:
                 return False
@@ -6939,18 +7902,26 @@ class SessionDB:
         *,
         chat_id: str,
         thread_id: str,
+        profile_name: str = None,
     ) -> Optional[Dict[str, Any]]:
         """Return the session binding for a Telegram DM topic, if present."""
+        profile_name = self._required_profile_scope(profile_name)
         with self._lock:
             try:
                 row = self._conn.execute(
                     """
                     SELECT * FROM telegram_dm_topic_bindings
-                    WHERE chat_id = ? AND thread_id = ?
+                    WHERE profile_name = ? AND chat_id = ? AND thread_id = ?
                     """,
-                    (str(chat_id), str(thread_id)),
+                    (profile_name, str(chat_id), str(thread_id)),
                 ).fetchone()
             except sqlite3.OperationalError:
+                return None
+            if row and not self._telegram_session_owned_by_profile(
+                self._conn,
+                row["session_id"],
+                profile_name,
+            ):
                 return None
         return dict(row) if row else None
 
@@ -6958,27 +7929,39 @@ class SessionDB:
         self,
         *,
         chat_id: str,
+        profile_name: str = None,
     ) -> List[Dict[str, Any]]:
         """All Telegram DM topic bindings for one chat, newest first.
 
         Read-only; returns [] if the bindings table doesn't exist yet
         (does not trigger the topic-mode migration).
         """
+        profile_name = self._required_profile_scope(profile_name)
         with self._lock:
             try:
                 rows = self._conn.execute(
                     "SELECT * FROM telegram_dm_topic_bindings "
-                    "WHERE chat_id = ? ORDER BY updated_at DESC",
-                    (str(chat_id),),
+                    "WHERE profile_name = ? AND chat_id = ? "
+                    "ORDER BY updated_at DESC",
+                    (profile_name, str(chat_id)),
                 ).fetchall()
             except sqlite3.OperationalError:
                 return []
+            rows = [
+                row for row in rows
+                if self._telegram_session_owned_by_profile(
+                    self._conn,
+                    row["session_id"],
+                    profile_name,
+                )
+            ]
         return [dict(row) for row in rows]
 
     def get_telegram_topic_binding_by_session(
         self,
         *,
         session_id: str,
+        profile_name: str = None,
     ) -> Optional[Dict[str, Any]]:
         """Return the Telegram DM topic binding for a given session_id, if present.
 
@@ -6986,16 +7969,23 @@ class SessionDB:
         efficient reverse lookup. Returns None when the session has no binding or
         the table does not exist yet.
         """
+        profile_name = self._required_profile_scope(profile_name)
         with self._lock:
             try:
                 row = self._conn.execute(
                     """
                     SELECT * FROM telegram_dm_topic_bindings
-                    WHERE session_id = ?
+                    WHERE profile_name = ? AND session_id = ?
                     """,
-                    (str(session_id),),
+                    (profile_name, str(session_id)),
                 ).fetchone()
             except sqlite3.OperationalError:
+                return None
+            if row and not self._telegram_session_owned_by_profile(
+                self._conn,
+                row["session_id"],
+                profile_name,
+            ):
                 return None
         return dict(row) if row else None
 
@@ -7004,6 +7994,7 @@ class SessionDB:
         *,
         chat_id: str,
         thread_id: str,
+        profile_name: str = None,
     ) -> int:
         """Remove the binding row for a single (chat, thread) pair.
 
@@ -7032,6 +8023,7 @@ class SessionDB:
         migrated yet — both are silent no-ops; we never raise from
         a cleanup hot path).
         """
+        profile_name = self._required_profile_scope(profile_name)
         chat_id = str(chat_id)
         thread_id = str(thread_id)
         deleted = {"count": 0}
@@ -7041,9 +8033,9 @@ class SessionDB:
                 cursor = conn.execute(
                     """
                     DELETE FROM telegram_dm_topic_bindings
-                    WHERE chat_id = ? AND thread_id = ?
+                    WHERE profile_name = ? AND chat_id = ? AND thread_id = ?
                     """,
-                    (chat_id, thread_id),
+                    (profile_name, chat_id, thread_id),
                 )
                 deleted["count"] = cursor.rowcount or 0
             except sqlite3.OperationalError:
@@ -7059,15 +8051,16 @@ class SessionDB:
                 remaining = conn.execute(
                     """
                     SELECT 1 FROM telegram_dm_topic_bindings
-                    WHERE chat_id = ? LIMIT 1
+                    WHERE profile_name = ? AND chat_id = ? LIMIT 1
                     """,
-                    (chat_id,),
+                    (profile_name, chat_id),
                 ).fetchone()
                 if remaining is None:
                     conn.execute(
                         "UPDATE telegram_dm_topic_mode "
-                        "SET enabled = 0, updated_at = ? WHERE chat_id = ?",
-                        (time.time(), chat_id),
+                        "SET enabled = 0, updated_at = ? "
+                        "WHERE profile_name = ? AND chat_id = ?",
+                        (time.time(), profile_name, chat_id),
                     )
             except sqlite3.OperationalError:
                 # telegram_dm_topic_mode absent — binding prune still stands.
@@ -7085,6 +8078,7 @@ class SessionDB:
         session_key: str,
         session_id: str,
         managed_mode: str = "auto",
+        profile_name: str = None,
     ) -> None:
         """Bind one Telegram DM topic thread to one Hermes session.
 
@@ -7094,6 +8088,7 @@ class SessionDB:
         """
         self.apply_telegram_topic_migration()
         now = time.time()
+        profile_name = self._required_profile_scope(profile_name)
         chat_id = str(chat_id)
         thread_id = str(thread_id)
         user_id = str(user_id)
@@ -7101,12 +8096,20 @@ class SessionDB:
         session_id = str(session_id)
 
         def _do(conn):
+            if not self._telegram_session_owned_by_profile(
+                conn,
+                session_id,
+                profile_name,
+            ):
+                raise ValueError(
+                    "session does not belong to the Telegram topic profile"
+                )
             existing_session = conn.execute(
                 """
                 SELECT chat_id, thread_id FROM telegram_dm_topic_bindings
-                WHERE session_id = ?
+                WHERE profile_name = ? AND session_id = ?
                 """,
-                (session_id,),
+                (profile_name, session_id),
             ).fetchone()
             if existing_session is not None:
                 linked_chat = existing_session["chat_id"] if isinstance(existing_session, sqlite3.Row) else existing_session[0]
@@ -7117,10 +8120,10 @@ class SessionDB:
             conn.execute(
                 """
                 INSERT INTO telegram_dm_topic_bindings (
-                    chat_id, thread_id, user_id, session_key, session_id,
-                    managed_mode, linked_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+                    profile_name, chat_id, thread_id, user_id, session_key,
+                    session_id, managed_mode, linked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_name, chat_id, thread_id) DO UPDATE SET
                     user_id = excluded.user_id,
                     session_key = excluded.session_key,
                     session_id = excluded.session_id,
@@ -7128,6 +8131,7 @@ class SessionDB:
                     updated_at = excluded.updated_at
                 """,
                 (
+                    profile_name,
                     chat_id,
                     thread_id,
                     user_id,
@@ -7140,7 +8144,12 @@ class SessionDB:
             )
         self._execute_write(_do)
 
-    def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
+    def is_telegram_session_linked_to_topic(
+        self,
+        *,
+        session_id: str,
+        profile_name: str = None,
+    ) -> bool:
         """Return True if a Hermes session is already bound to any Telegram DM topic.
 
         Read-only: does NOT trigger the telegram-topic migration. If the
@@ -7148,15 +8157,22 @@ class SessionDB:
         ``/topic`` in this profile), the session is by definition unbound
         and we return False.
         """
+        profile_name = self._required_profile_scope(profile_name)
         with self._lock:
+            if not self._telegram_session_owned_by_profile(
+                self._conn,
+                session_id,
+                profile_name,
+            ):
+                return False
             try:
                 row = self._conn.execute(
                     """
                     SELECT 1 FROM telegram_dm_topic_bindings
-                    WHERE session_id = ?
+                    WHERE profile_name = ? AND session_id = ?
                     LIMIT 1
                     """,
-                    (str(session_id),),
+                    (profile_name, str(session_id)),
                 ).fetchone()
             except sqlite3.OperationalError:
                 return False
@@ -7168,6 +8184,7 @@ class SessionDB:
         chat_id: str,
         user_id: str,
         limit: int = 10,
+        profile_name: str = None,
     ) -> List[Dict[str, Any]]:
         """List previous Telegram sessions for this user that are not bound to a topic.
 
@@ -7176,10 +8193,12 @@ class SessionDB:
         just returns this user's Telegram sessions — there can't be any
         bindings yet.
         """
+        profile_name = self._required_profile_scope(profile_name)
+        session_profile = self._profile_scope_sql("s.profile_name")
         with self._lock:
             try:
                 rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT s.*,
                         COALESCE(
                             (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
@@ -7195,20 +8214,21 @@ class SessionDB:
                     FROM sessions s
                     WHERE s.source = 'telegram'
                       AND s.user_id = ?
+                      AND {session_profile} = ?
                       AND NOT EXISTS (
                           SELECT 1 FROM telegram_dm_topic_bindings b
-                          WHERE b.session_id = s.id
+                          WHERE b.profile_name = ? AND b.session_id = s.id
                       )
                     ORDER BY last_active DESC, s.started_at DESC
                     LIMIT ?
                     """,
-                    (str(user_id), int(limit)),
+                    (str(user_id), profile_name, profile_name, int(limit)),
                 ).fetchall()
             except sqlite3.OperationalError:
                 # telegram_dm_topic_bindings doesn't exist yet — no bindings
                 # means every telegram session for this user is "unlinked".
                 rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT s.*,
                         COALESCE(
                             (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
@@ -7224,15 +8244,25 @@ class SessionDB:
                     FROM sessions s
                     WHERE s.source = 'telegram'
                       AND s.user_id = ?
+                      AND {session_profile} = ?
                     ORDER BY last_active DESC, s.started_at DESC
                     LIMIT ?
                     """,
-                    (str(user_id), int(limit)),
+                    (str(user_id), profile_name, int(limit)),
                 ).fetchall()
 
         sessions: List[Dict[str, Any]] = []
         for row in rows:
             session = dict(row)
+            classification = classify_session_profile_evidence(
+                session,
+                self._legacy_profile_name,
+            )
+            if (
+                not classification.coherent
+                or classification.profile != profile_name
+            ):
+                continue
             raw = str(session.pop("_preview_raw", "") or "").strip()
             session["preview"] = raw[:60] + ("..." if len(raw) > 60 else "") if raw else ""
             sessions.append(session)
@@ -7415,13 +8445,44 @@ class SessionDB:
     # The CLI writes "pending" then poll-waits for terminal state. The gateway
     # watcher transitions pending→running→{completed,failed}.
 
-    def request_handoff(self, session_id: str, platform: str) -> bool:
+    def request_handoff(
+        self,
+        session_id: str,
+        platform: str,
+        *,
+        profile_name: str = None,
+    ) -> bool:
         """Mark a session as pending handoff to the given platform.
 
         Returns True if the row was found and not already in flight; False if
         the session is already in a non-terminal handoff state.
         """
+        profile_scope = (
+            self._required_profile_scope(profile_name)
+            if profile_name is not None
+            else None
+        )
+
         def _do(conn):
+            if profile_scope is not None:
+                target = conn.execute(
+                    "SELECT id, parent_session_id, profile_name, session_key, "
+                    "origin_json FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if target is None:
+                    return False
+                classification = classify_session_profile_evidence(
+                    dict(target),
+                    self._legacy_profile_name,
+                )
+                if (
+                    not classification.coherent
+                    or classification.profile != profile_scope
+                ):
+                    raise ValueError(
+                        "Session profile boundary changed during handoff request"
+                    )
             cur = conn.execute(
                 "UPDATE sessions "
                 "SET handoff_state = 'pending', "

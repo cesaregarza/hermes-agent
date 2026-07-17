@@ -414,33 +414,63 @@ class ComputeHost:
                 pass
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
 
+    @staticmethod
+    def _validated_frame_profile(
+        server: Any,
+        frame: dict[str, Any],
+    ) -> tuple[str, str]:
+        """Return a canonical immutable (profile, home) frame boundary."""
+        raw_name = str(frame.get("profile_name") or "").strip() or None
+        raw_home = str(frame.get("profile_home") or "").strip()
+        if raw_home:
+            canonical = server._profile_name_for_home(raw_name, raw_home)
+            if canonical is None:
+                raise ValueError("Compute-host profile name/home mismatch")
+            return canonical, str(Path(raw_home).resolve())
+        canonical, expected_home = server._resolve_profile_target(raw_name)
+        if expected_home is not None:
+            raise ValueError("Compute-host named profile is missing its home")
+        return server._profile_scope_name(canonical), ""
+
     def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
         sid = str(frame.get("sid") or "")
         key = str(frame.get("session_key") or sid)
+        profile_name, profile_home = self._validated_frame_profile(server, frame)
         session = server._sessions.get(sid)
         if session is not None:
+            stored_name, stored_home = self._validated_frame_profile(
+                server,
+                {
+                    "profile_home": session.get("profile_home"),
+                    "profile_name": session.get("profile_name"),
+                },
+            )
+            if (stored_name, stored_home) != (profile_name, profile_home):
+                raise ValueError("Compute-host session profile cannot be retargeted")
             session["transport"] = self._transport
             if frame.get("cols") is not None:
                 session["cols"] = int(frame.get("cols") or 80)
             if frame.get("cwd"):
                 session["cwd"] = str(frame.get("cwd"))
-            if frame.get("profile_home"):
-                session["profile_home"] = str(frame.get("profile_home"))
             if isinstance(frame.get("attached_images"), list):
                 session["attached_images"] = list(frame.get("attached_images") or [])
             return session
 
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
-        profile_home = str(frame.get("profile_home") or "")
         session_db = None
+        agent = None
+        db_owned = False
         home_token = None
         try:
             if profile_home:
                 from hermes_constants import set_hermes_home_override
-                from hermes_state import SessionDB
 
                 home_token = set_hermes_home_override(profile_home)
-                session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                session_db = server._open_profile_session_db(
+                    profile_home,
+                    profile_name=profile_name,
+                )
+                db_owned = True
             agent = server._make_agent(
                 sid,
                 key,
@@ -451,7 +481,93 @@ class ComputeHost:
                 platform_override=frame.get("source"),
                 session_db=session_db,
             )
+            try:
+                from tui_gateway.transport import bind_transport, reset_transport
+
+                token = bind_transport(self._transport)
+                try:
+                    server._init_session(
+                        sid,
+                        key,
+                        agent,
+                        list(history),
+                        cols=int(frame.get("cols") or 80),
+                        cwd=str(frame.get("cwd") or "") or None,
+                        session_db=session_db,
+                        source=frame.get("source"),
+                        profile_home=profile_home or None,
+                        profile_name=profile_name,
+                    )
+                finally:
+                    reset_transport(token)
+            except Exception:
+                # If _init_session's side machinery is unavailable, retain a
+                # minimal host-owned record under the same validated boundary.
+                partial = server._sessions.pop(sid, None)
+                if partial is not None:
+                    stop_event = partial.get("_notif_stop")
+                    if stop_event is not None:
+                        stop_event.set()
+                    worker = partial.get("slash_worker")
+                    if worker is not None:
+                        try:
+                            worker.close()
+                        except Exception:
+                            pass
+                    try:
+                        from tools.approval import unregister_gateway_notify
+
+                        unregister_gateway_notify(key)
+                    except Exception:
+                        pass
+                server._sessions[sid] = {
+                    "agent": agent,
+                    "session_key": key,
+                    "history": list(history),
+                    "history_lock": threading.Lock(),
+                    "history_version": int(frame.get("history_version") or 0),
+                    "inflight_turn": None,
+                    "created_at": time.time(),
+                    "last_active": time.time(),
+                    "running": False,
+                    "attached_images": [],
+                    "image_counter": 0,
+                    "cwd": str(frame.get("cwd") or os.getcwd()),
+                    "cols": int(frame.get("cols") or 80),
+                    "slash_worker": None,
+                    "show_reasoning": server._load_show_reasoning(),
+                    "tool_progress_mode": server._load_tool_progress_mode(),
+                    "edit_snapshots": {},
+                    "tool_started_at": {},
+                    "model_override": frame.get("model_override"),
+                    "profile_home": profile_home or None,
+                    "profile_name": profile_name,
+                    "source": server._sanitize_client_source(frame.get("source")),
+                    "transport": self._transport,
+                }
+            session = server._sessions[sid]
+            session["transport"] = self._transport
+            session["profile_home"] = profile_home or None
+            session["profile_name"] = profile_name
+            if isinstance(frame.get("attached_images"), list):
+                session["attached_images"] = list(frame.get("attached_images") or [])
+            if frame.get("model_override") is not None:
+                session["model_override"] = frame.get("model_override")
+            db_owned = False
+            return session
+        except Exception:
+            if agent is not None:
+                try:
+                    agent.close()
+                except Exception:
+                    pass
+            raise
         finally:
+            if db_owned and session_db is not None:
+                try:
+                    session_db.close()
+                except Exception:
+                    pass
             if home_token is not None:
                 try:
                     from hermes_constants import reset_hermes_home_override
@@ -459,58 +575,6 @@ class ComputeHost:
                     reset_hermes_home_override(home_token)
                 except Exception:
                     pass
-        try:
-            from tui_gateway.transport import bind_transport, reset_transport
-
-            token = bind_transport(self._transport)
-            try:
-                server._init_session(
-                    sid,
-                    key,
-                    agent,
-                    list(history),
-                    cols=int(frame.get("cols") or 80),
-                    cwd=str(frame.get("cwd") or "") or None,
-                    session_db=session_db,
-                    source=frame.get("source"),
-                )
-            finally:
-                reset_transport(token)
-        except Exception:
-            # If _init_session's side machinery (slash worker, approval notify) is
-            # unavailable, keep a minimal host-owned session rather than failing
-            # the turn after the expensive agent build succeeded.
-            server._sessions[sid] = {
-                "agent": agent,
-                "session_key": key,
-                "history": list(history),
-                "history_lock": threading.Lock(),
-                "history_version": int(frame.get("history_version") or 0),
-                "inflight_turn": None,
-                "created_at": time.time(),
-                "last_active": time.time(),
-                "running": False,
-                "attached_images": [],
-                "image_counter": 0,
-                "cwd": str(frame.get("cwd") or os.getcwd()),
-                "cols": int(frame.get("cols") or 80),
-                "slash_worker": None,
-                "show_reasoning": server._load_show_reasoning(),
-                "tool_progress_mode": server._load_tool_progress_mode(),
-                "edit_snapshots": {},
-                "tool_started_at": {},
-                "model_override": frame.get("model_override"),
-                "source": server._sanitize_client_source(frame.get("source")),
-                "transport": self._transport,
-            }
-        session = server._sessions[sid]
-        session["transport"] = self._transport
-        session["profile_home"] = profile_home or session.get("profile_home")
-        if isinstance(frame.get("attached_images"), list):
-            session["attached_images"] = list(frame.get("attached_images") or [])
-        if frame.get("model_override") is not None:
-            session["model_override"] = frame.get("model_override")
-        return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")

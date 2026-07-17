@@ -233,6 +233,29 @@ class TestAutoTitleSession:
             auto_title_session(db, "sess-1", "hi", "hello")
             db.set_session_title.assert_called_once_with("sess-1", "New Title")
 
+    def test_profile_scope_is_forwarded_to_title_reads_and_writes(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+
+        with patch("agent.title_generator.generate_title", return_value="Scoped"):
+            auto_title_session(
+                db,
+                "sess-1",
+                "hi",
+                "hello",
+                profile_name="coder",
+            )
+
+        db.get_session_title.assert_called_once_with(
+            "sess-1",
+            profile_name="coder",
+        )
+        db.set_session_title.assert_called_once_with(
+            "sess-1",
+            "Scoped",
+            profile_name="coder",
+        )
+
     def test_invokes_title_callback_after_setting_title(self):
         db = MagicMock()
         db.get_session_title.return_value = None

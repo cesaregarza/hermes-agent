@@ -485,6 +485,78 @@ def test_build_process_event_source_derives_named_profile_from_session_key(
     assert source.profile == "coder"
 
 
+def test_build_process_event_source_derives_dm_thread_from_session_key(
+    monkeypatch, tmp_path
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+
+    source = runner._build_process_event_source(
+        {
+            "session_id": "proc_coder_topic",
+            "session_key": "agent:coder:telegram:dm:123:topic-7",
+        }
+    )
+
+    assert source is not None
+    assert source.thread_id == "topic-7"
+
+
+@pytest.mark.parametrize(
+    ("field", "conflicting_value"),
+    [
+        ("platform", "discord"),
+        ("chat_type", "thread"),
+        ("chat_id", "other-chat"),
+        ("profile", "default"),
+        ("thread_id", "other-topic"),
+    ],
+)
+def test_multiplex_process_fallback_rejects_session_key_route_conflict(
+    monkeypatch,
+    tmp_path,
+    field,
+    conflicting_value,
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.config.multiplex_profiles = True
+    runner._primary_profile_name = "default"
+    evt = {
+        "session_id": "proc-conflict",
+        "session_key": "agent:coder:telegram:dm:shared-chat:topic-7",
+        "transport_profile": "default",
+    }
+    evt[field] = conflicting_value
+
+    assert runner._build_process_event_source(evt) is None
+
+
+def test_multiplex_process_fallback_accepts_coherent_shared_transport_route(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.config.multiplex_profiles = True
+    runner._primary_profile_name = "default"
+
+    source = runner._build_process_event_source(
+        {
+            "session_id": "proc-coherent",
+            "session_key": "agent:coder:telegram:dm:shared-chat:topic-7",
+            "platform": "telegram",
+            "chat_type": "dm",
+            "chat_id": "shared-chat",
+            "thread_id": "topic-7",
+            "profile": "coder",
+            "transport_profile": "default",
+        }
+    )
+
+    assert source is not None
+    assert source.profile == "coder"
+    assert source.transport_profile == "default"
+    assert source.thread_id == "topic-7"
+
+
 def test_build_process_event_source_uses_cached_live_source_before_session_key_parse(
     monkeypatch, tmp_path
 ):
@@ -844,3 +916,4 @@ def test_parse_session_key_too_short():
 def test_parse_session_key_wrong_prefix():
     assert _parse_session_key("cron:main:telegram:dm:123") is None
     assert _parse_session_key("agent:bad.profile:telegram:dm:123") is None
+    assert _parse_session_key("agent:default:telegram:dm:123") is None

@@ -1837,6 +1837,7 @@ from gateway.session import (
     canonicalize_session_source_profiles,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    profile_from_session_key,
     _is_pii_redaction_eligible,
     _pii_safe_user_label,
 )
@@ -2655,21 +2656,16 @@ def _parse_session_key(session_key: str) -> "dict | None":
     """
     parts = session_key.split(":")
     if len(parts) >= 5 and parts[0] == "agent":
-        namespace = parts[1]
-        if namespace != "main":
-            try:
-                from hermes_cli.profiles import validate_profile_name
-
-                validate_profile_name(namespace)
-            except (ImportError, ValueError):
-                return None
+        profile = profile_from_session_key(session_key)
+        if profile is None:
+            return None
         result = {
             "platform": parts[2],
             "chat_type": parts[3],
             "chat_id": parts[4],
         }
-        if namespace != "main":
-            result["profile"] = namespace
+        if profile != "default":
+            result["profile"] = profile
         if len(parts) > 5 and parts[3] in {"dm", "thread"}:
             result["thread_id"] = parts[5]
         return result
@@ -3740,6 +3736,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raw = session_db.is_telegram_topic_mode_enabled(
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
+                profile_name=self._runtime_profile_for_source(source),
             )
         except Exception:
             logger.debug("Failed to read Telegram topic mode state", exc_info=True)
@@ -3788,12 +3785,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_id = str(source.chat_id or "")
         if not chat_id:
             return True
+        profile_key = self._runtime_profile_for_source(source)
+        reminder_key = (profile_key, chat_id)
         import time as _time
         now = _time.monotonic()
-        last = self._telegram_lobby_reminder_ts.get(chat_id, 0.0)
+        last = self._telegram_lobby_reminder_ts.get(reminder_key, 0.0)
         if now - last < self._TELEGRAM_LOBBY_REMINDER_COOLDOWN_S:
             return False
-        self._telegram_lobby_reminder_ts[chat_id] = now
+        self._telegram_lobby_reminder_ts[reminder_key] = now
         return True
 
     def _telegram_topic_root_lobby_message(self) -> str:
@@ -3841,6 +3840,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(source.user_id or ""),
             session_key=session_entry.session_key,
             session_id=session_entry.session_id,
+            profile_name=self._runtime_profile_for_source(source),
         )
 
     def _sync_telegram_topic_binding(
@@ -3908,6 +3908,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             bindings = session_db.list_telegram_topic_bindings_for_chat(
                 chat_id=str(source.chat_id),
+                profile_name=self._runtime_profile_for_source(source),
             )
         except Exception:
             logger.debug("topic-recover: read failed", exc_info=True)
@@ -11653,6 +11654,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 binding = (await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
+                    profile_name=self._runtime_profile_for_source(source),
                 )) if self._session_db else None
             except Exception:
                 logger.debug("Failed to read Telegram topic binding", exc_info=True)
@@ -13361,7 +13363,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Only applies when the message originates in a thread.  In per-user
         thread mode (``thread_sessions_per_user=True``) each participant gets
         an isolated session key of the form
-        ``agent:main:{platform}:{chat_type}:{chat_id}:{thread_id}:{user_id}``,
+        ``agent:{profile}:{platform}:{chat_type}:{chat_id}:{thread_id}:{user_id}``,
         so a run started by another user is invisible to the caller's own
         ``/stop``.  This returns the keys of any *actually running* agents
         (not the pending sentinel, not the caller's own key) whose key shares
@@ -13376,14 +13378,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return []
         platform = source.platform.value
         chat_type = getattr(source, "chat_type", None) or ""
+        key_parts = str(own_key or "").split(":")
+        key_profile = profile_from_session_key(own_key)
+        expected_route = [
+            platform,
+            chat_type,
+            str(chat_id),
+            str(thread_id),
+        ]
+        if (
+            key_profile is None
+            or len(key_parts) < 6
+            or key_parts[2:6] != expected_route
+        ):
+            # The sibling scan is a cross-session interrupt primitive. Refuse to
+            # derive its scope from an invalid key or a key for a different
+            # destination, even if the caller-provided source looks plausible.
+            return []
+        source_profile = str(getattr(source, "profile", "") or "").strip()
+        if source_profile:
+            try:
+                source_profile = (
+                    canonicalize_gateway_profile_name(
+                        source_profile,
+                        field_name="/stop source profile",
+                    )
+                    or "default"
+                )
+            except ValueError:
+                return []
+            if source_profile != key_profile:
+                return []
         # Prefix that every per-user key in this thread shares, up to and
         # including the thread_id segment.  Matching either the exact
         # shared-thread key or any key with a further (user_id) segment
         # (prefix + ":") avoids cross-matching an unrelated thread whose id
         # merely starts with this one.
-        prefix = ":".join(
-            ["agent:main", platform, chat_type, str(chat_id), str(thread_id)]
-        )
+        prefix = ":".join(key_parts[:6])
         matches = []
         for key, agent in list(self._running_agents.items()):
             if key == own_key:
@@ -14353,6 +14384,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
+                    gateway_session_key=self._session_key_for_source(source),
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
@@ -14695,6 +14727,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 binding = await session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
+                    profile_name=self._runtime_profile_for_source(source),
                 )
                 if binding and str(binding.get("session_id") or "") != str(session_id):
                     return
@@ -14809,12 +14842,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_id = str(source.chat_id or "")
         if not chat_id:
             return True
+        profile_key = self._runtime_profile_for_source(source)
+        hint_key = (profile_key, chat_id)
         import time as _time
         now = _time.monotonic()
-        last = self._telegram_capability_hint_ts.get(chat_id, 0.0)
+        last = self._telegram_capability_hint_ts.get(hint_key, 0.0)
         if now - last < self._TELEGRAM_CAPABILITY_HINT_COOLDOWN_S:
             return False
-        self._telegram_capability_hint_ts[chat_id] = now
+        self._telegram_capability_hint_ts[hint_key] = now
         return True
 
     def _telegram_topic_help_text(self) -> str:
@@ -14852,21 +14887,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             currently_enabled = await self._session_db.is_telegram_topic_mode_enabled(
                 chat_id=chat_id,
                 user_id=str(source.user_id or ""),
+                profile_name=self._runtime_profile_for_source(source),
             )
         except Exception:
             currently_enabled = False
         if not currently_enabled:
             return "Multi-session topic mode is not currently enabled for this chat."
         try:
-            await self._session_db.disable_telegram_topic_mode(chat_id=chat_id)
+            await self._session_db.disable_telegram_topic_mode(
+                chat_id=chat_id,
+                profile_name=self._runtime_profile_for_source(source),
+            )
         except Exception as exc:
             logger.exception("Failed to disable Telegram topic mode")
             return f"Failed to disable topic mode: {exc}"
         # Reset per-chat debounce state so the user doesn't see a stale
         # cooldown on the next activation.
+        cooldown_key = (self._runtime_profile_for_source(source), chat_id)
         for attr in ("_telegram_lobby_reminder_ts", "_telegram_capability_hint_ts"):
             store = getattr(self, attr, None)
             if isinstance(store, dict):
+                store.pop(cooldown_key, None)
+                # Compatibility cleanup for state populated before cooldown
+                # keys became profile-aware.
                 store.pop(chat_id, None)
         return (
             "Multi-session topic mode is now OFF for this chat.\n\n"
@@ -14890,6 +14933,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
                 limit=10,
+                profile_name=self._runtime_profile_for_source(source),
             )
         except Exception:
             logger.debug("Failed to list unlinked Telegram sessions", exc_info=True)
@@ -14937,10 +14981,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if str(session.get("user_id") or "") != str(source.user_id):
             return "That session does not belong to this Telegram user."
 
-        linked = await self._session_db.is_telegram_session_linked_to_topic(session_id=session_id)
+        profile_name = self._runtime_profile_for_source(source)
+        linked = await self._session_db.is_telegram_session_linked_to_topic(
+            session_id=session_id,
+            profile_name=profile_name,
+        )
         current_binding = await self._session_db.get_telegram_topic_binding(
             chat_id=str(source.chat_id),
             thread_id=str(source.thread_id),
+            profile_name=profile_name,
         )
         if linked:
             if not current_binding or current_binding.get("session_id") != session_id:
@@ -14955,6 +15004,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 session_id=session_id,
                 managed_mode="restored",
+                profile_name=profile_name,
             )
         except ValueError as exc:
             if "already linked" in str(exc):
@@ -15294,6 +15344,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+        if (
+            metadata is not None
+            and getattr(source, "platform", None) == Platform.TELEGRAM
+        ):
+            # A shared primary Telegram credential can carry turns routed to a
+            # secondary runtime profile. Keep that trusted runtime identity in
+            # the adapter metadata so a "thread not found" cleanup deletes only
+            # the routed profile's binding, never the credential owner's sibling.
+            metadata = dict(metadata)
+            metadata["runtime_profile"] = self._runtime_profile_for_source(source)
         return metadata
 
     def _thread_metadata_for_target(
@@ -16463,6 +16523,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         derived_chat_type = ""
         derived_chat_id = ""
         derived_profile = ""
+        derived_thread_id = ""
+        parsed_route = None
 
         if session_key:
             try:
@@ -16520,15 +16582,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _parsed = _parse_session_key(session_key)
             if _parsed:
+                parsed_route = _parsed
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
                 derived_chat_id = _parsed["chat_id"]
                 derived_profile = str(_parsed.get("profile") or "").strip()
+                derived_thread_id = str(_parsed.get("thread_id") or "").strip()
+            elif multiplex:
+                logger.warning(
+                    "Synthetic process event for multiplexed session %r has an "
+                    "invalid session-key namespace; dropping notification",
+                    session_key,
+                )
+                return None
 
-        platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
-        chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
-        chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
-        profile_name = str(evt.get("profile") or derived_profile or "").strip()
+        event_platform = str(evt.get("platform") or "").strip().lower()
+        event_chat_type = str(evt.get("chat_type") or "").strip().lower()
+        event_chat_id = str(evt.get("chat_id") or "").strip()
+        event_profile = str(evt.get("profile") or "").strip()
+        event_thread_id = str(evt.get("thread_id") or "").strip()
+        platform_name = event_platform or derived_platform.lower()
+        chat_type = event_chat_type or derived_chat_type.lower()
+        chat_id = event_chat_id or derived_chat_id
+        profile_name = event_profile or derived_profile
+        thread_id = event_thread_id or derived_thread_id
         transport_profile_name = str(evt.get("transport_profile") or "").strip()
         if not platform_name or not chat_type or not chat_id:
             logger.warning(
@@ -16572,6 +16649,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Synthetic process event has invalid profile metadata: %s", exc)
             return None
 
+        if parsed_route is not None:
+            parsed_profile = str(parsed_route.get("profile") or "default")
+            conflicts = {}
+            if event_platform and event_platform != derived_platform.lower():
+                conflicts["platform"] = event_platform
+            if event_chat_type and event_chat_type != derived_chat_type.lower():
+                conflicts["chat_type"] = event_chat_type
+            if event_chat_id and event_chat_id != derived_chat_id:
+                conflicts["chat_id"] = event_chat_id
+            if event_profile and (profile_name or "default") != parsed_profile:
+                conflicts["profile"] = profile_name or "default"
+            if (
+                derived_thread_id
+                and event_thread_id
+                and event_thread_id != derived_thread_id
+            ):
+                conflicts["thread_id"] = event_thread_id
+            if conflicts:
+                logger.warning(
+                    "Synthetic process event routing metadata conflicts with "
+                    "session key %r (%s); dropping notification",
+                    session_key,
+                    ", ".join(sorted(conflicts)),
+                )
+                return None
+
         if (
             multiplex
             and not transport_profile_name
@@ -16594,7 +16697,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform=platform,
             chat_id=chat_id,
             chat_type=chat_type,
-            thread_id=str(evt.get("thread_id") or "").strip() or None,
+            thread_id=thread_id or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
             profile=profile_name or None,
@@ -20515,6 +20618,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # run_sync is off-loop (executor); sync DB is fine.
                         _binding = self._session_db._db.get_telegram_topic_binding_by_session(
                             session_id=agent_session_id,
+                            profile_name=self._runtime_profile_for_source(source),
                         )
                         if _binding and _binding.get("thread_id"):
                             source.thread_id = str(_binding["thread_id"])

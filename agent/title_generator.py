@@ -125,6 +125,7 @@ def auto_title_session(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    profile_name: str = None,
 ) -> None:
     """Generate and set a session title if one doesn't already exist.
 
@@ -144,14 +145,19 @@ def auto_title_session(
     process restarts.
     """
     try:
+        kwargs = {
+            "failure_callback": failure_callback,
+            "main_runtime": main_runtime,
+            "title_callback": title_callback,
+        }
+        if profile_name is not None:
+            kwargs["profile_name"] = profile_name
         _auto_title_session(
             session_db,
             session_id,
             user_message,
             assistant_response,
-            failure_callback=failure_callback,
-            main_runtime=main_runtime,
-            title_callback=title_callback,
+            **kwargs,
         )
     except Exception as e:
         # WARNING (not debug) so operators see it in agent.log; the message
@@ -177,14 +183,21 @@ def _auto_title_session(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    profile_name: str = None,
 ) -> None:
     """Body of :func:`auto_title_session` — see its docstring."""
     if not session_db or not session_id:
         return
 
+    profile_kwargs = (
+        {"profile_name": profile_name}
+        if profile_name is not None
+        else {}
+    )
+
     # Check if title already exists (user may have set one via /title before first response)
     try:
-        existing = session_db.get_session_title(session_id)
+        existing = session_db.get_session_title(session_id, **profile_kwargs)
         if existing:
             return
     except Exception:
@@ -216,7 +229,7 @@ def _auto_title_session(
         return
 
     try:
-        session_db.set_session_title(session_id, title)
+        session_db.set_session_title(session_id, title, **profile_kwargs)
         logger.debug("Auto-generated session title: %s", title)
         if title_callback is not None:
             try:
@@ -236,6 +249,7 @@ def maybe_auto_title(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    profile_name: str = None,
 ) -> None:
     """Fire-and-forget title generation after the first exchange.
 
@@ -254,14 +268,17 @@ def maybe_auto_title(
     if user_msg_count > 2:
         return
 
+    worker_kwargs = {
+        "failure_callback": failure_callback,
+        "main_runtime": main_runtime,
+        "title_callback": title_callback,
+    }
+    if profile_name is not None:
+        worker_kwargs["profile_name"] = profile_name
     thread = threading.Thread(
         target=auto_title_session,
         args=(session_db, session_id, user_message, assistant_response),
-        kwargs={
-            "failure_callback": failure_callback,
-            "main_runtime": main_runtime,
-            "title_callback": title_callback,
-        },
+        kwargs=worker_kwargs,
         daemon=True,
         name="auto-title",
     )
