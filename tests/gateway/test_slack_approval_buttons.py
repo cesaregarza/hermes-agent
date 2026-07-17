@@ -355,7 +355,7 @@ class TestSlackInteractiveAuth:
         monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
         seen = []
 
-        def secondary_auth(user_id, chat_type, chat_id):
+        def secondary_auth(user_id, chat_type, chat_id, **_context):
             seen.append((user_id, chat_type, chat_id))
             # This runner callback includes the secondary PairingStore union.
             return user_id in {"U_SECONDARY", "U_PAIRED"}

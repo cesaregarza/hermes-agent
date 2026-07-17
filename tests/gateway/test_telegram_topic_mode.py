@@ -119,7 +119,7 @@ def _make_runner(session_db=None):
     # Default switch_session impl: returns a SessionEntry carrying the target
     # session_id. Mirrors SessionStore.switch_session semantics for tests that
     # exercise Telegram topic binding rebinds without a real store.
-    def _switch_session(session_key, target_session_id):
+    def _switch_session(session_key, target_session_id, **_kwargs):
         return SessionEntry(
             session_key=session_key,
             session_id=target_session_id,
@@ -156,7 +156,7 @@ def _make_runner(session_db=None):
         group_sessions_per_user=getattr(runner.config, "group_sessions_per_user", True),
         thread_sessions_per_user=getattr(runner.config, "thread_sessions_per_user", False),
     )
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = lambda _context, **_kwargs: None
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
@@ -518,7 +518,7 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
     # requested; capture the requested id for assertion.
     switched_to: dict = {}
 
-    def fake_switch(_key, new_session_id):
+    def fake_switch(_key, new_session_id, **_kwargs):
         switched_to["id"] = new_session_id
         return SessionEntry(
             session_key=topic_key,
@@ -922,7 +922,11 @@ async def test_handoff_to_telegram_dm_topic_uses_dm_lane_not_generic_thread(tmp_
 
     expected_source = _make_source(thread_id="17585")
     expected_key = build_session_key(expected_source)
-    runner.session_store.switch_session.assert_called_once_with(expected_key, "cli-session")
+    runner.session_store.switch_session.assert_called_once_with(
+        expected_key,
+        "cli-session",
+        allow_unscoped_target=True,
+    )
     assert captured["source"].chat_type == "dm"
     assert captured["source"].user_id == "208214988"
     assert captured["source"].thread_id == "17585"

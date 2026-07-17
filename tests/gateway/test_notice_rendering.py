@@ -111,6 +111,8 @@ def _make_source(platform_value="telegram", chat_id="555", user_id="u1"):
     # auto-attribute would read as a truthy "stamped profile" and trip the
     # fail-closed path in _adapter_for_source (see AGENTS.md pitfall #17).
     src.profile = None
+    src.transport_profile = None
+    src.delivered_via_upstream_relay = False
     return src
 
 
@@ -175,4 +177,3 @@ class TestDeliverNoticeLine:
         runner.adapters = {}
         # Must not raise when the platform has no registered adapter.
         await runner._deliver_platform_notice(source, "• anything")
-

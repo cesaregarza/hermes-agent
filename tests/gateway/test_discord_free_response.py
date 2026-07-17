@@ -1128,7 +1128,7 @@ class TestChannelContextUnverifiedTagging:
         ).history
         captured = {}
 
-        def check(user_id, chat_type=None, chat_id=None):
+        def check(user_id, chat_type=None, chat_id=None, **_context):
             captured["chat_type"] = chat_type
             return True
 
@@ -1485,4 +1485,3 @@ async def test_discord_non_reply_free_channel_skips_backfill(adapter, monkeypatc
     await adapter._handle_message(message)
 
     adapter._fetch_channel_context.assert_not_awaited()
-

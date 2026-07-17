@@ -4820,7 +4820,7 @@ class TestThreadContextUnverifiedTagging:
         adapter._thread_context_cache.clear()
         adapter._app.client.conversations_replies = self._make_replies(self._thread_messages())
         adapter.set_authorization_check(
-            lambda user_id, chat_type=None, chat_id=None: user_id == "U_BOB"
+            lambda user_id, chat_type=None, chat_id=None, **_context: user_id == "U_BOB"
         )
 
         with patch.object(
@@ -4844,7 +4844,7 @@ class TestThreadContextUnverifiedTagging:
         adapter._thread_context_cache.clear()
         adapter._app.client.conversations_replies = self._make_replies(self._thread_messages())
         adapter.set_authorization_check(
-            lambda user_id, chat_type=None, chat_id=None: user_id == "U_BOB"
+            lambda user_id, chat_type=None, chat_id=None, **_context: user_id == "U_BOB"
         )
 
         with patch.object(
@@ -4887,7 +4887,7 @@ class TestThreadContextUnverifiedTagging:
         )
 
         captured = {}
-        def check(user_id, chat_type=None, chat_id=None):
+        def check(user_id, chat_type=None, chat_id=None, **_context):
             captured["user_id"] = user_id
             captured["chat_type"] = chat_type
             captured["chat_id"] = chat_id

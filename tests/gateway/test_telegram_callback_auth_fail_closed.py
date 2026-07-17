@@ -122,7 +122,7 @@ class TestCallbackAuthFailClosed:
         adapter._profile_routes_enabled = False
         calls = []
 
-        def profile_auth(user_id, chat_type, chat_id):
+        def profile_auth(user_id, chat_type, chat_id, **_context):
             calls.append((user_id, chat_type, chat_id))
             # The profile callback is the same runner path that honors both
             # the secondary allowlist and secondary PairingStore approvals.

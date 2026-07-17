@@ -7,6 +7,7 @@ state (when available) is acknowledged through its authoritative SQLite API.
 """
 
 import asyncio
+import dataclasses
 import json
 import queue
 from collections import OrderedDict
@@ -34,12 +35,32 @@ def isolated_registry(tmp_path, monkeypatch):
 
 
 def _runner(adapter, *, origins=None):
+    entries = origins or {}
+
+    def routing_source_snapshot(session_key):
+        entry = entries.get(session_key)
+        origin = getattr(entry, "origin", None)
+        if not isinstance(origin, SessionSource):
+            return None
+        return dataclasses.replace(
+            origin,
+            message_id=None,
+            transport_profile=(
+                str(getattr(entry, "origin_transport_profile", "") or "").strip()
+                or None
+            ),
+            delivered_via_upstream_relay=(
+                getattr(entry, "origin_transport", None) == "relay"
+            ),
+        )
+
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner.session_store = SimpleNamespace(
         _ensure_loaded=lambda: None,
-        _entries=origins or {},
+        _entries=entries,
+        routing_source_snapshot=routing_source_snapshot,
     )
     runner._session_source_cache = {}
     runner._completion_delivery_lock = __import__("threading").Lock()
