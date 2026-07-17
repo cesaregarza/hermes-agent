@@ -1482,7 +1482,7 @@ class TestWebServerEndpoints:
         worker_home = profiles_mod.get_profile_dir("worker")
         worker_home.mkdir(parents=True)
 
-        default_db = SessionDB()
+        default_db = SessionDB(profile_name="default")
         try:
             default_db.create_session(session_id="default-only", source="cli")
             default_db.append_message("default-only", role="user", content="default")
@@ -1591,7 +1591,10 @@ class TestWebServerEndpoints:
         finally:
             default_db.close()
 
-        worker_db = SessionDB(db_path=worker_home / "state.db")
+        worker_db = SessionDB(
+            db_path=worker_home / "state.db",
+            profile_name="worker",
+        )
         try:
             worker_db.create_session(session_id="worker-usage", source="cli", model="worker/model")
             worker_db.update_token_counts(

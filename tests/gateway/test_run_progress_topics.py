@@ -315,11 +315,18 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
             "chat_id": "-1001",
             "content": '💻 Running pwd',
             "reply_to": None,
-            "metadata": {"thread_id": "17585"},
+            "metadata": {
+                "thread_id": "17585",
+                "runtime_profile": "default",
+            },
         }
     ]
     assert adapter.edits
-    assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.typing)
+    assert all(
+        call["metadata"]
+        == {"thread_id": "17585", "runtime_profile": "default"}
+        for call in adapter.typing
+    )
 
 
 @pytest.mark.asyncio
@@ -357,7 +364,11 @@ async def test_run_agent_progress_edits_keep_originating_topic_metadata(monkeypa
 
     assert result["final_response"] == "done"
     assert adapter.edits
-    assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.edits)
+    assert all(
+        call["metadata"]
+        == {"thread_id": "17585", "runtime_profile": "default"}
+        for call in adapter.edits
+    )
 
 
 @pytest.mark.asyncio
