@@ -2,9 +2,9 @@ name: Plugin completion contract
 
 on:
   pull_request:
-    branches: [codex/ces-400-mcp-session-meta]
+    branches: [downstream/mandate-runtime]
   push:
-    branches: [codex/pinned-plugin-completions]
+    branches: [codex/pinned-plugin-completions, downstream/mandate-runtime]
 
 permissions:
   contents: read
