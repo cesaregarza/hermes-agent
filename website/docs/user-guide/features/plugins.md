@@ -722,13 +722,14 @@ ctx.inject_message(
 )
 ```
 
-**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None) -> bool`
+**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None, expected_session_id: str | None = None, on_dispatch: Callable[[bool | None], None] | None = None) -> bool`
 
 In CLI mode:
 
 - If the agent is **idle** (waiting for user input), the message is queued as the next input and starts a new turn.
 - If the agent is **mid-turn** (actively running), the message interrupts the current operation — the same as a user typing a new message and pressing Enter.
 - For non-`"user"` roles, the content is prefixed with `[role]` (e.g. `[system] ...`).
+- Gateway-only `expected_session_id` and `on_dispatch` options are rejected in CLI mode.
 - Returns `True` if the message was queued successfully.
 
 In gateway mode:
@@ -742,6 +743,8 @@ In gateway mode:
 - The request enters the platform adapter's normal message path. Active sessions use the existing busy-session queue rather than starting a competing turn.
 - Returns `True` when the live gateway accepts the request for asynchronous dispatch. This does not confirm that the agent turn or platform delivery has completed.
 - Returns `False` when `session_key` is omitted, the permission is not granted, or no live gateway can accept the request. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log.
+- `expected_session_id` is gateway-only and pins the request to the session generation currently routed by `session_key`. Hermes rejects the request if that ID is empty, invalid, or no longer matches; this prevents a reset or replacement from waking the new session.
+- `on_dispatch` is gateway-only and must be callable. It runs after asynchronous adapter handling with `True` for accepted delivery, `False` for a definite rejection, or `None` when cancellation or an exception makes the result uncertain. Observer failures are isolated and do not affect delivery. The return value from `inject_message()` still reports scheduling acceptance only.
 
 This enables plugins like remote control viewers, messaging bridges, or webhook receivers to feed messages into the conversation from external sources.
 

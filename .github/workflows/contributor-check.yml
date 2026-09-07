@@ -23,9 +23,13 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          set -euo pipefail
+          # Audit the actual PR delta, including PRs against downstream branches.
+          # Keep main as the fallback for callers without a pull-request event.
+          MERGE_BASE=$(git merge-base "${PR_BASE_SHA:-origin/main}" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
