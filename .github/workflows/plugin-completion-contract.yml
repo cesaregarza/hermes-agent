@@ -1,0 +1,41 @@
+name: Plugin completion contract
+
+on:
+  pull_request:
+    branches: [codex/ces-400-mcp-session-meta]
+  push:
+    branches: [codex/pinned-plugin-completions]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-completion-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install locked CI environment
+        run: >-
+          uv sync --locked --python 3.11 --extra all --extra dev
+          --extra anthropic --extra mistral --extra fal --extra modal
+          --extra daytona --extra hindsight --extra parallel-web
+      - name: Check plugin session and dispatch contracts
+        run: |
+          source .venv/bin/activate
+          scripts/run_tests.sh tests/gateway/test_plugin_message_injection.py tests/hermes_cli/test_plugin_message_injection.py
+        env:
+          HERMES_TEST_WORKERS: "1"
+          HERMES_TEST_FILE_RETRIES: "0"
+          OPENAI_API_KEY: ""
+          OPENROUTER_API_KEY: ""
+          NOUS_API_KEY: ""

@@ -595,17 +595,31 @@ class PluginContext:
     # manager's home, never the active profile's (#65593 constraint).
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
+        expected_session_id: str | None = None,
+        on_dispatch: Callable[[bool | None], None] | None = None,
     ) -> bool:
-        """Inject a message into a CLI or gateway conversation (new turn if idle, interrupt if running).
+        """Inject a message into a CLI or gateway conversation (CLI input interrupts when running;
+        gateway input follows the existing busy-session queue).
         Gateway injection needs an existing ``session_key`` plus
         ``plugins.entries.<plugin_id>.allow_gateway_injection``; ``True`` means the gateway accepted the
-        request for async dispatch, not that delivery completed."""
+        request for async dispatch, not that delivery completed. ``expected_session_id`` and
+        ``on_dispatch`` are gateway-only: the former pins delivery to the currently routed session
+        generation, while the latter observes async adapter handling (``True`` accepted, ``False``
+        rejected, ``None`` uncertain after cancellation or an exception)."""
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
         if cli is not None:
+            if expected_session_id is not None or on_dispatch is not None:
+                return False
             queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
             queue_.put(msg)
             return True
+        if expected_session_id is not None and (
+            not isinstance(expected_session_id, str) or not expected_session_id.strip()
+        ):
+            return False
+        if on_dispatch is not None and not callable(on_dispatch):
+            return False
         if not session_key:
             logger.warning("inject_message: gateway mode requires an existing session_key")
             return False
@@ -618,12 +632,21 @@ class PluginContext:
             logger.warning("inject_message: no live gateway is available")
             return False
         try:
-            return bool(self._manager.inject_gateway_message(
-                session_key=session_key, content=msg, plugin_id=self.plugin_id,
-            ))
-        except Exception:
-            logger.warning("inject_message: gateway scheduling failed for plugin %s", self.plugin_id,
-                           exc_info=True)
+            kwargs: Dict[str, Any] = {
+                "session_key": session_key, "content": msg, "plugin_id": self.plugin_id,
+            }
+            if expected_session_id is not None:
+                kwargs["expected_session_id"] = expected_session_id
+            if on_dispatch is not None:
+                kwargs["on_dispatch"] = on_dispatch
+            return bool(self._manager.inject_gateway_message(**kwargs))
+        except (Exception, asyncio.CancelledError):
+            if on_dispatch is not None:
+                try:
+                    on_dispatch(None)
+                except (Exception, asyncio.CancelledError):
+                    pass
+            logger.warning("inject_message: gateway scheduling failed for plugin %s", self.plugin_id)
             return False
 
     def _gateway_injection_allowed(self) -> bool:
@@ -1193,7 +1216,11 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             self._gateway_message_injector = None
 
     def inject_gateway_message(self, **kwargs: Any) -> bool:
-        """Submit a plugin-triggered turn to the live gateway."""
+        """Submit a plugin-triggered turn to the live gateway.
+
+        The returned bool only reports whether the gateway scheduled the async dispatch. Optional
+        dispatch observers receive the later adapter result through the scheduler.
+        """
         registered = self._gateway_message_injector
         return registered is not None and bool(registered[1](**kwargs))
 

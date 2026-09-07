@@ -1705,17 +1705,37 @@ class GatewayInboundMixin:
         get_plugin_manager().clear_gateway_message_injector(self)
 
     def _schedule_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: str, content: str, plugin_id: str,
+        expected_session_id: Optional[str] = None, on_dispatch=None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe)."""
         from gateway.run import safe_schedule_threadsafe
+
+        def _observe(outcome: Optional[bool]) -> None:
+            if on_dispatch is None:
+                return
+            try:
+                on_dispatch(outcome)
+            except (Exception, asyncio.CancelledError):
+                # Observers are plugin-owned and must never affect delivery or gateway logs.
+                pass
+
+        if expected_session_id is not None and (
+            not isinstance(expected_session_id, str) or not expected_session_id.strip()
+        ):
+            return False
+        if on_dispatch is not None and not callable(on_dispatch):
+            return False
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
             return False
 
-        coro = self._dispatch_plugin_message_injection(
-            session_key=session_key, content=content, plugin_id=plugin_id,
-        )
+        kwargs: Dict[str, Any] = {
+            "session_key": session_key, "content": content, "plugin_id": plugin_id,
+        }
+        if expected_session_id is not None:
+            kwargs["expected_session_id"] = expected_session_id
+        coro = self._dispatch_plugin_message_injection(**kwargs)
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1739,23 +1759,31 @@ class GatewayInboundMixin:
                 return False
 
         def _log_result(completed) -> None:
+            outcome: Optional[bool]
             try:
-                if completed.result():
-                    return
-                what, exc = "was not routed", None
+                result = completed.result()
+                outcome = result if isinstance(result, bool) else None
             except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                _observe(None)
                 return
-            except Exception as err:
-                what, exc = "failed", err
+            except Exception:
+                _observe(None)
+                what = "failed"
+            else:
+                _observe(outcome)
+                if outcome is True:
+                    return
+                what = "was not routed"
             logger.warning(
-                "Plugin message injection %s: plugin=%s session=%s", what, plugin_id, session_key, exc_info=exc,
+                "Plugin message injection %s: plugin=%s session=%s", what, plugin_id, session_key,
             )
 
         future.add_done_callback(_log_result)
         return True
 
     async def _dispatch_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: str, content: str, plugin_id: str,
+        expected_session_id: Optional[str] = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         def _accepting() -> bool:
@@ -1765,6 +1793,8 @@ class GatewayInboundMixin:
             return False
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None or not _accepting():
+            return False
+        if expected_session_id is not None and entry.session_id != expected_session_id:
             return False
 
         source = dataclasses.replace(entry.origin)

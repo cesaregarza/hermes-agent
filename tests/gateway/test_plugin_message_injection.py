@@ -84,7 +84,7 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
     (hermes_home / "config.yaml").write_text(
         yaml.safe_dump({
             "plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": True}}}
-        })
+        }), encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
@@ -354,6 +354,129 @@ async def test_scheduler_submits_dispatch_on_live_gateway_loop():
         content="wake up",
         plugin_id="notify-plugin",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("expected_session_id", "adapter_error", "expected_observation", "adapter_called"),
+    [
+        ("session-42", None, True, True),
+        ("replaced-session", None, False, False),
+        ("session-42", RuntimeError("adapter failed"), None, True),
+    ],
+)
+async def test_scheduler_pins_session_and_reports_adapter_outcome(
+    expected_session_id, adapter_error, expected_observation, adapter_called
+):
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=adapter_error))
+    runner = _runner(_entry(), adapter)
+    runner._gateway_loop = asyncio.get_running_loop()
+    observed = []
+
+    assert runner._schedule_plugin_message_injection(
+        session_key="agent:main:telegram:dm:42",
+        content="wake up",
+        plugin_id="notify-plugin",
+        expected_session_id=expected_session_id,
+        on_dispatch=observed.append,
+    ) is True
+    task = next(iter(runner._background_tasks))
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert observed == [expected_observation]
+    assert adapter.handle_message.await_count == int(adapter_called)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    ["accepted", "cancelled", "observer_exception", "observer_cancelled", "injector_failure",
+     "invalid_id", "invalid_observer", "cli", "offline"],
+)
+async def test_plugin_context_scheduler_contract(case, tmp_path, monkeypatch):
+    if case == "cli":
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(name="notify-plugin", key="notify-plugin", source="user"),
+            manager,
+        )
+        manager._cli_ref = SimpleNamespace(
+            _agent_running=False, _pending_input=[], _interrupt_queue=[],
+        )
+        assert context.inject_message("wake up", expected_session_id="session-42") is False
+        assert context.inject_message("wake up", on_dispatch=lambda _outcome: None) is False
+        assert manager._cli_ref._pending_input == []
+        return
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"entries": {"notify-plugin": {"allow_gateway_injection": True}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    context = PluginContext(
+        PluginManifest(name="notify-plugin", key="notify-plugin", source="user"),
+        PluginManager(),
+    )
+    manager = context._manager
+
+    if case == "injector_failure":
+        manager.set_gateway_message_injector(object(), MagicMock(side_effect=RuntimeError("private content")))
+        observed = []
+        assert context.inject_message("wake up", session_key="key", on_dispatch=observed.append) is False
+        assert observed == [None]
+        return
+
+    if case in {"invalid_id", "invalid_observer"}:
+        injector = MagicMock(return_value=True)
+        manager.set_gateway_message_injector(object(), injector)
+        kwargs = (
+            {"expected_session_id": ""}
+            if case == "invalid_id"
+            else {"on_dispatch": object()}
+        )
+        assert context.inject_message("wake up", session_key="key", **kwargs) is False
+        injector.assert_not_called()
+        return
+
+    runner = _runner(_entry(), SimpleNamespace(handle_message=AsyncMock()))
+    runner._gateway_loop = asyncio.get_running_loop()
+    if case == "offline":
+        runner._running = False
+    manager.set_gateway_message_injector(runner, runner._schedule_plugin_message_injection)
+    observed = []
+
+    def _raising_observer(_outcome):
+        if case == "observer_cancelled":
+            raise asyncio.CancelledError()
+        raise RuntimeError("observer failed")
+
+    observer = _raising_observer if case.startswith("observer_") else observed.append
+    result = context.inject_message(
+        "wake up", session_key=_entry().session_key,
+        expected_session_id="session-42", on_dispatch=observer,
+    )
+    assert result is (case != "offline")
+    if case == "offline":
+        assert observed == []
+        return
+
+    task = next(iter(runner._background_tasks))
+    if case == "cancelled":
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+    if case == "cancelled":
+        assert observed == [None]
+        assert runner.adapters[Platform.TELEGRAM].handle_message.await_count == 0
+    else:
+        assert runner.adapters[Platform.TELEGRAM].handle_message.await_count == 1
+        event = runner.adapters[Platform.TELEGRAM].handle_message.await_args.args[0]
+        assert event.metadata["gateway_session_id"] == "session-42"
+        if case == "accepted":
+            assert observed == [True]
 
 
 @pytest.mark.asyncio
