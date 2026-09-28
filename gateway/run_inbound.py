@@ -1674,7 +1674,7 @@ class GatewayInboundMixin:
         kwargs = {}
         if observer is not None:
             kwargs["allow_auto_resume"] = False
-        elif event.internal:
+        elif getattr(event, "internal", False):
             kwargs["allow_auto_resume"] = None
         try:
             token = await self.async_session_store.mark_turn_active(session_key, **kwargs)

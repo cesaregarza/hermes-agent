@@ -1724,7 +1724,17 @@ class GatewayTurnMixin:
                 return None
             has_final = agent_result.get(
                 "has_final_reply", str(agent_result.get("final_response") or "").strip() not in {"", "(empty)"})
-            if (agent_result.get("failed") or agent_result.get("interrupted")
+            # Error exits can contain an apology with completed=True. Preserve the
+            # producer's reason instead of mistaking that text for the released result.
+            exit_reason = str(agent_result.get("turn_exit_reason") or "").split("(", 1)[0]
+            # Earlier content followed only by housekeeping tools is a real answer.
+            # Unknown/error/recovered-partial exits cannot attest a complete reply.
+            # Runners without exit-reason metadata retain the existing flag contract.
+            unsuccessful_exit = bool(exit_reason) and exit_reason not in {
+                "text_response", "fallback_prior_turn_content",
+            }
+            if (unsuccessful_exit or agent_result.get("error")
+                    or agent_result.get("failed") or agent_result.get("interrupted")
                     or agent_result.get("completed") is False or not has_final
                     or _intentional_silence or not response):
                 observer(False if not observer.tool_started else None)

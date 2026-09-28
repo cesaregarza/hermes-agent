@@ -99,6 +99,11 @@ class GatewayBusySessionMixin:
             pending_slot = getattr(adapter, "_pending_messages", None)
             if not isinstance(pending_slot, dict) or pending_slot.get(session_key):
                 return None  # slot occupied (busy) or no slot storage — promotion owns this
+            # An observed completion needs its own base task to install delivery
+            # context and validate its pinned session. Leave it in FIFO for the
+            # normal post-turn promotion; never substitute it into a user turn.
+            if event_delivery_observer(overflow[0]) is not None:
+                return None
             head = overflow.pop(0)
             # Keep the slot occupied so the drain promotes in order and a mid-chain arrival routes
             # to overflow instead of jumping the queue (same invariant as _promote_queued_event).

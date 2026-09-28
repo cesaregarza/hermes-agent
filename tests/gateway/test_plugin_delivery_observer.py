@@ -288,3 +288,184 @@ async def test_observers_survive_queueing_and_rejections(case, tmp_path):
     await asyncio.gather(task, return_exceptions=True)
     await asyncio.sleep(0)
     assert observed == [None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['observed', 'internal', 'ordinary', 'bare'])
+async def test_gateway_active_marker_wires_recovery_policy(kind, tmp_path):
+    adapter = _DeliveryAdapter()
+    runner, _ = _runner(adapter)
+    store = SessionStore(sessions_dir=tmp_path / 'sessions', config=GatewayConfig())
+    event = _event([])
+    entry = store.get_or_create_session(event.source)
+    # Start blocked to prove unrelated internal events preserve the exclusion.
+    store.mark_turn_active(entry.session_key, allow_auto_resume=False)
+    if kind != 'observed':
+        del event._plugin_delivery_observer
+    if kind == 'ordinary':
+        event.internal = False
+    if kind == 'bare':
+        event = SimpleNamespace()
+    runner.session_store = store
+    runner._async_session_store = SimpleNamespace(
+        _store=store, mark_turn_active=AsyncMock(side_effect=store.mark_turn_active))
+    assert await runner._mark_durable_active_turn(event, entry.session_key)
+    assert event._gateway_active_turn_session_key == entry.session_key
+    reloaded = SessionStore(sessions_dir=tmp_path / 'sessions', config=GatewayConfig())
+    assert reloaded.lookup_by_session_key(entry.session_key).auto_resume_blocked is (kind in {'observed', 'internal'})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('with_tail', [False, True])
+async def test_orphaned_completion_gets_own_observed_task(with_tail):
+    adapter = _DeliveryAdapter()
+    runner, entry = _runner(adapter)
+    outcomes = []
+    orphan = _event(outcomes)
+    orphan.metadata = {'gateway_session_key': entry.session_key,
+                       'gateway_session_id': entry.session_id, 'gateway_session_strict': True}
+    incoming = MessageEvent(text='ordinary question', source=_source())
+    tail = MessageEvent(text='older queued question', source=_source())
+    overflow = runner._session_state(entry.session_key).conversation.queued_events
+    overflow.extend([orphan, tail] if with_tail else [orphan])
+    task_events = []
+
+    async def handler(event):
+        task_events.append(event)
+        if event is incoming:
+            assert not is_observed_reply_turn()
+            rescued, source, internal = runner._hm_rescue_orphaned_fifo(
+                event, event.source, False, entry.session_key)
+            assert rescued is incoming and source is incoming.source and not internal
+            assert overflow[0] is orphan
+            assert outcomes == []
+            assert await runner._run_agent_drain_pending(
+                {'final_response': 'answer'}, adapter, source, entry.session_key) == (None, None)
+            # Leave the ordinary reply out of this transport assertion.
+            return None
+        if event is orphan:
+            assert is_observed_reply_turn()
+            assert await runner._hmwa_resolve_session(event, event.source) is not None
+            assert await runner._run_agent_drain_pending(
+                {'final_response': 'released result'}, adapter, event.source, entry.session_key) == (None, None)
+            return await runner._hmwa_deliver_turn_response(
+                event, event.source, entry, entry.session_key, 1,
+                {'final_response': 'released result', 'completed': True}, [], 'released result', None, False)
+        assert event is tail and not is_observed_reply_turn()
+        return None
+
+    adapter.set_message_handler(handler)
+    adapter._run_processing_hook = AsyncMock()
+    adapter._start_typing_refresh = MagicMock(return_value=None)
+    adapter._stop_typing_refresh = AsyncMock()
+    adapter._fire_post_delivery_callback = AsyncMock()
+    adapter._flush_text_debounce_now = AsyncMock(return_value=False)
+    adapter._record_delivery_obligation = AsyncMock()
+    adapter._send_with_retry = AsyncMock(side_effect=AssertionError('observed send must not retry'))
+    await adapter._process_message_background(incoming, entry.session_key)
+    while adapter._background_tasks:
+        await asyncio.gather(*list(adapter._background_tasks))
+    assert task_events == ([incoming, orphan, tail] if with_tail else [incoming, orphan])
+    assert outcomes == [True]
+    assert overflow == [] and entry.session_key not in adapter._pending_messages
+    adapter.transport.assert_awaited_once()
+    assert adapter.transport.await_args.args[1] == 'released result'
+    adapter._record_delivery_obligation.assert_not_awaited()
+
+
+# Use the existing real conversation-loop fixture: the producer and finalizer must
+# generate the error result, rather than inserting flags that bypass the bug.
+from tests.run_agent.test_92450_outer_error_retry_bound import (  # noqa: E402, F401
+    loop_agent, _make_local_frame_raiser,
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('exit_kind', ['local_processing_error', 'error_near_max_iterations'])
+@pytest.mark.parametrize('tool_started', [False, True])
+async def test_real_error_exit_cannot_confirm_released_reply(loop_agent, monkeypatch, exit_kind, tool_started):
+    from unittest.mock import patch
+
+    adapter = _DeliveryAdapter()
+    runner, entry = _runner(adapter)
+    outcomes = []
+    event = _event(outcomes)
+    event._plugin_delivery_observer.tool_started = tool_started
+    if exit_kind == 'local_processing_error':
+        raiser = _make_local_frame_raiser()
+        target = '_strip_think_blocks'
+        failure = lambda text: raiser(TypeError('invalid model response'))
+    else:
+        loop_agent.max_iterations = 3
+        target, failure = '_build_assistant_message', RuntimeError('invalid response assembly')
+    with (patch.object(loop_agent, target, side_effect=failure),
+          patch.object(loop_agent, '_persist_session'),
+          patch.object(loop_agent, '_save_trajectory'),
+          patch.object(loop_agent, '_cleanup_task_resources')):
+        produced = loop_agent.run_conversation('Summarize the released result')
+    assert produced['turn_exit_reason'].startswith(exit_kind)
+    assert produced['final_response'] and produced['completed'] is True
+
+    ctx = SimpleNamespace(source=event.source, session_key=entry.session_key,
+                          user_config={}, message=event.text, agent_holder=[loop_agent], tools_holder=[[]])
+    turn_runner = TurnRunner(runner, ctx)
+    runner._provider_routing = None
+    runner._resolve_session_agent_runtime = MagicMock(return_value=('test-model', {}))
+    runner._resolve_session_reasoning_config = MagicMock(return_value=None)
+    runner._resolve_session_service_tier = MagicMock(return_value=None)
+    runner._resolve_turn_agent_config = MagicMock(return_value=None)
+    # Stub setup/transport only. Keep run_sync's result shaping and the delivery
+    # gate real so removing exit-reason propagation makes this regression fail.
+    stubs = {'_combined_ephemeral_prompt': '', '_setup_stream_consumer': (None, None, None, False),
+             '_resolve_turn_agent': (loop_agent, False), '_wire_turn_agent_callbacks': None,
+             '_load_turn_history': ([], None, []), '_prepare_turn_message': (event.text, None),
+             '_run_conversation_with_approval': produced, '_finish_stream_consumer': None,
+             '_sync_session_after_run': (False, entry.session_id, 0)}
+    for name, value in stubs.items():
+        monkeypatch.setattr(turn_runner, name, MagicMock(return_value=value))
+
+    shaped_results = []
+
+    async def handler(current):
+        shaped = turn_runner.run_sync()
+        shaped_results.append(shaped)
+        assert shaped['turn_exit_reason'] == produced['turn_exit_reason']
+        return await runner._hmwa_deliver_turn_response(
+            current, current.source, entry, entry.session_key, 1, shaped, [],
+            shaped['final_response'], None, False)
+
+    adapter.set_message_handler(handler)
+    adapter._run_processing_hook = AsyncMock()
+    adapter._start_typing_refresh = MagicMock(return_value=None)
+    adapter._stop_typing_refresh = AsyncMock()
+    adapter._fire_post_delivery_callback = AsyncMock()
+    adapter._flush_text_debounce_now = AsyncMock(return_value=False)
+    await adapter._process_message_background(event, entry.session_key)
+    assert len(shaped_results) == 1
+    assert outcomes == [None if tool_started else False]
+    assert event._plugin_delivery_observer.reply_ready is False
+    adapter.transport.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reason', [None, 'text_response(finish_reason=stop)',
+                                   'fallback_prior_turn_content', 'interpreter_shutdown',
+                                   'partial_stream_recovery', 'empty_response_exhausted',
+                                   'guardrail_halt', 'compaction_handoff_not_actionable',
+                                   'all_retries_exhausted_no_response', 'unknown_future_exit'])
+@pytest.mark.parametrize('tool_started', [False, True])
+async def test_observed_exit_reason_requires_known_complete_answer(reason, tool_started):
+    adapter = _DeliveryAdapter()
+    runner, entry = _runner(adapter)
+    outcomes = []
+    event = _event(outcomes)
+    event._plugin_delivery_observer.tool_started = tool_started
+    agent_result = {'completed': True, 'final_response': 'some text', 'turn_exit_reason': reason}
+    result = await runner._hmwa_deliver_turn_response(
+        event, event.source, entry, entry.session_key, 1, agent_result, [], 'some text', None, False)
+    valid = reason in {None, 'text_response(finish_reason=stop)', 'fallback_prior_turn_content'}
+    assert result == ('some text' if valid else None)
+    assert event._plugin_delivery_observer.reply_ready is valid
+    # Ready to send is still not a delivery acknowledgement.
+    assert outcomes == ([] if valid else [None if tool_started else False])
+    adapter.transport.assert_not_awaited()

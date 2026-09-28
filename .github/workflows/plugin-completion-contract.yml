@@ -38,6 +38,9 @@ jobs:
             tests/gateway/test_plugin_delivery_observer.py \
             tests/gateway/test_tool_thread_handoff.py \
             tests/gateway/test_session.py \
+            tests/gateway/test_active_turn_recovery.py \
+            tests/tools/test_mcp_dynamic_discovery.py \
+            tests/tools/test_mcp_lazy_start.py \
             tests/gateway/test_restart_resume_pending.py \
             tests/gateway/test_restart_redelivery_dedup.py \
             tests/gateway/test_internal_event_never_interrupts_busy_session.py

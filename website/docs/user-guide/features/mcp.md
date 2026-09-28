@@ -977,6 +977,8 @@ draft job parameters as data, and submits there. Calls already in a thread stay
 there. The thread uses the original message and the existing Discord client;
 model arguments never choose the user, parent, or destination. This option
 requires session context forwarding and a running gateway.
+Channel IDs may be quoted strings or integers. The configuration is captured
+when MCP tools are registered; reload MCP tools after changing it.
 
 Thread creation and handoff failures block the parent submission. A durable
 claim prevents retries from creating another thread or duplicating a submitted

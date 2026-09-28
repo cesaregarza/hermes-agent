@@ -1689,6 +1689,7 @@ class TurnRunner:
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "has_final_reply": str(final_response or "").strip() not in {"", "(empty)"},
             "partial": result.get("partial", False), "completed": result.get("completed"),
+            "turn_exit_reason": result.get("turn_exit_reason"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
             "compression_exhausted": result.get("compression_exhausted", False),

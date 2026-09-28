@@ -64,18 +64,40 @@ def _moved(thread_id: str, guild_id: str) -> str:
                        'guidance': 'The request continues in its thread. Do not submit it again here.'})
 
 
-def route_tool_call(server_name: str, tool_name: str, args: dict, meta: dict | None) -> str | None:
+@dataclasses.dataclass(frozen=True)
+class HandoffConfig:
+    tools: frozenset[str] = frozenset()
+    channels: frozenset[str] = frozenset()
+    valid: bool = True
+
+
+def resolve_handoff_config(setting) -> HandoffConfig | None:
+    """Validate and freeze the registration-time config; calls never reload .env."""
+    if setting is None or setting is False:
+        return None
+    if (not isinstance(setting, dict)
+            or not isinstance(setting.get('tools'), list)
+            or not isinstance(setting.get('channels'), list)
+            or any(not isinstance(tool, str) or not tool for tool in setting['tools'])
+            or any(isinstance(channel, bool) or not isinstance(channel, (str, int))
+                   or not str(channel).isdigit() or int(channel) <= 0
+                   for channel in setting['channels'])):
+        return HandoffConfig(valid=False)
+    return HandoffConfig(frozenset(setting['tools']),
+                         frozenset(str(channel) for channel in setting['channels']))
+
+
+def route_tool_call(server_name: str, tool_name: str, args: dict, meta: dict | None,
+                    setting: HandoffConfig | None) -> str | None:
     """Return a tool response instead of executing, or None when no handoff applies."""
     from hermes_constants import get_hermes_home
-    from tools.mcp_tool_config import _load_mcp_config
     from tools.registry import tool_error
 
-    setting = _load_mcp_config().get(server_name, {}).get('gateway_thread_handoff')
-    if not setting:
+    if setting is None:
         return None
-    if not isinstance(setting, dict) or not isinstance(setting.get('tools'), list) or not isinstance(setting.get('channels'), list):
+    if not setting.valid:
         return tool_error('Invalid gateway thread handoff configuration; tool was not run.')
-    if tool_name not in setting['tools']:
+    if tool_name not in setting.tools:
         return None
     if not isinstance(meta, dict) or any(not isinstance(meta.get(_PREFIX + key), str) or not meta[_PREFIX + key]
                                         for key in ('platform', 'session_key', 'session_id', 'message_id', 'chat_id', 'user_id')):
@@ -83,7 +105,7 @@ def route_tool_call(server_name: str, tool_name: str, args: dict, meta: dict | N
     if meta[_PREFIX + 'platform'] != 'discord':
         return None
     # The current thread was already bound by the adapter; never nest threads.
-    if meta.get(_PREFIX + 'thread_id') or meta[_PREFIX + 'chat_id'] not in setting['channels']:
+    if meta.get(_PREFIX + 'thread_id') or meta[_PREFIX + 'chat_id'] not in setting.channels:
         return None
     encoded = json.dumps({'server': server_name, 'tool': tool_name, 'arguments': args}, sort_keys=True, separators=(',', ':'))
     if len(encoded.encode()) > 16384:
