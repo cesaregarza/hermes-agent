@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from gateway.plugin_delivery import event_delivery_observer, observe_delivery, observed_reply_turn
 
 logger = logging.getLogger(__name__)
 
@@ -1705,6 +1706,15 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
     turn sees the whole burst; with ``merge_text`` rapid TEXT follow-ups append instead of
     replace."""
     existing = pending_messages.get(session_key)
+    if existing and event_delivery_observer(event):
+        # Production keeps observed injections in FIFO. A standalone single-slot caller
+        # cannot accept another injection without overwriting or merging it.
+        observe_delivery(event, False)
+        return
+    if existing and event_delivery_observer(existing):
+        # A legacy caller reached the raw merge seam: revoke confirmation before mutating
+        # the observed event, while preserving the incoming user's message.
+        observe_delivery(existing, None)
     if existing:
         existing_type = getattr(existing, "message_type", None)
         existing_is_photo = existing_type == MessageType.PHOTO
@@ -3366,7 +3376,8 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
                        self.name, session_key)
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        dropped = self._pending_messages.pop(session_key, None)
+        observe_delivery(dropped, False)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
@@ -3379,6 +3390,9 @@ class BasePlatformAdapter(ABC):
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
         task = asyncio.create_task(self._process_message_background(event, session_key))
+        observer = event_delivery_observer(event)
+        if observer is not None:
+            task.add_done_callback(lambda _task: observer(None) if not observer.queued else None)
         if not self._track_session_task(session_key, task):
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
@@ -3421,7 +3435,8 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Session cancellation raised while unwinding %s", self.name,
                              session_key, exc_info=True)
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            dropped = self._pending_messages.pop(session_key, None)
+            observe_delivery(dropped, False)
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -3463,6 +3478,7 @@ class BasePlatformAdapter(ABC):
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
         if not self._message_handler:
+            observe_delivery(event, False)
             return
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
@@ -3475,6 +3491,7 @@ class BasePlatformAdapter(ABC):
         if expected_session_key and session_key != expected_session_key:
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
+            observe_delivery(event, False)
             return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
@@ -3483,7 +3500,8 @@ class BasePlatformAdapter(ABC):
             await self._handle_message_while_active(event, session_key)
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
-        self._start_session_processing(event, session_key)
+        if not self._start_session_processing(event, session_key):
+            observe_delivery(event, False)
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
@@ -3536,6 +3554,22 @@ class BasePlatformAdapter(ABC):
                     return
             except Exception as e:
                 logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+                if event_delivery_observer(event) is not None:
+                    observe_delivery(event, None)
+                    return
+        observer = event_delivery_observer(event)
+        pending_observer = event_delivery_observer(self._pending_messages.get(session_key))
+        if observer is not None or pending_observer is not None:
+            enqueue = getattr(self.gateway_runner, "_queue_or_replace_pending_event", None)
+            if callable(enqueue):
+                enqueue(session_key, event)
+                return
+            # Without the runner FIFO, observed injections cannot safely share a busy
+            # single-slot adapter. Reject locally; ordinary standalone input still queues.
+            if observer is not None:
+                observer(False)
+                return
+            observe_delivery(self._pending_messages.get(session_key), None)
         # Photo bursts/albums: queue without interrupting; they run after the current task.
         if event.message_type == MessageType.PHOTO:
             logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
@@ -3730,12 +3764,25 @@ class BasePlatformAdapter(ABC):
         delivery_adapter = self._final_delivery_adapter(event.source)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
-        _obligation_id = await self._record_delivery_obligation(
-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
-        result = await delivery_adapter._send_with_retry(
+        # The plugin owns recovery for observed replies. Ordinary ledger redelivery
+        # would resend an uncertain send independently of that owner's durable claim.
+        _obligation_id = None
+        if event_delivery_observer(event) is None:
+            _obligation_id = await self._record_delivery_obligation(
+                event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+        # Observed replies have one durable owner. A retry or formatting fallback
+        # after an uncertain send could duplicate its reply outside that owner's claim.
+        send = (delivery_adapter.send if event_delivery_observer(event) is not None
+                else delivery_adapter._send_with_retry)
+        result = await send(
             chat_id=event.source.chat_id, content=text_content,
             reply_to=_reply_anchor_for_event(event), metadata=metadata)
         record_delivery(result)
+        partial = (isinstance(getattr(result, "raw_response", None), dict)
+                   and result.raw_response.get("partial_overflow"))
+        confirmed = (getattr(result, "success", False) is True
+                     and bool(getattr(result, "message_id", None)) and not partial)
+        observe_delivery(event, True if confirmed else None)
         if _obligation_id is not None:
             await self._finalize_delivery_obligation(_obligation_id, result, event, delivery_adapter)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
@@ -3875,6 +3922,9 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        observer = event_delivery_observer(event)
+        if observer is not None:
+            observer.queued = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -3888,10 +3938,16 @@ class BasePlatformAdapter(ABC):
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
             await self._run_processing_hook("on_processing_start", event)
-            response = await self._message_handler(event)
+            with observed_reply_turn(event):
+                response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            if observer is not None and response and not observer.reply_ready:
+                # Only the agent-final producer can confirm that this reply consumed the
+                # injection. Admission/lease/config error strings are never a final result.
+                observer(False if not observer.tool_started else None)
+                response = None
             # None/empty is normal (streamed/queued). Suppress a stale response after an interrupt.
             if response and interrupt_event.is_set() and session_key in self._pending_messages:
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
@@ -3900,8 +3956,14 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
-                extracted = await self._extract_response_content(
-                    response, event, session_key, is_ephemeral_response=is_ephemeral_response)
+                if observer is not None:
+                    # Observed completion text cannot cause media/path expansion.
+                    extracted = _ExtractedResponse(
+                        text_content=str(response).strip(), images=[], media_files=[], local_files=[],
+                        force_document_attachments=False, pre_extract=response)
+                else:
+                    extracted = await self._extract_response_content(
+                        response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
@@ -3956,11 +4018,14 @@ class BasePlatformAdapter(ABC):
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
+            if observer is None:
+                _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            if observer is not None and not observer.queued:
+                observer(None)
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
@@ -3977,9 +4042,13 @@ class BasePlatformAdapter(ABC):
         follow-ups grew the C stack to SIGSEGV). Clearing (not deleting) the Event keeps the guard
         live for concurrent inbound; ownership moves so stale-lock detection works."""
         self._clear_session_guard(session_key)
-        self._track_session_task(
-            session_key,
-            asyncio.create_task(self._process_message_background(pending_event, session_key)))
+        task = asyncio.create_task(self._process_message_background(pending_event, session_key))
+        observer = event_delivery_observer(pending_event)
+        if observer is not None:
+            # The task may be cancelled before its coroutine gets its first instruction.
+            observer.queued = False
+            task.add_done_callback(lambda _task: observer(None) if not observer.queued else None)
+        self._track_session_task(session_key, task)
 
     def _clear_session_guard(self, session_key: str) -> None:
         """Clear (not delete) the session's interrupt Event so the guard stays live for inbound."""
@@ -4029,6 +4098,8 @@ class BasePlatformAdapter(ABC):
         with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
             from gateway.shutdown_flush import flush_pending_to_file
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+        for pending in self._pending_messages.values():
+            observe_delivery(pending, None)
         for state in self._text_debounce_store().values():
             state.cancel_timer()
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,

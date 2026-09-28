@@ -430,6 +430,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:
             return error
+        from gateway.tool_thread_handoff import route_tool_call
+        handoff = route_tool_call(server_name, tool_name, args, session_meta)
+        if handoff is not None:
+            return handoff
         server, error = _acquire_call_server(server_name, tool_timeout)
         if server is None:
             return error

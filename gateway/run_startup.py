@@ -401,6 +401,7 @@ class GatewayStartupMixin:
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
                     if entry.resume_pending
                     and not entry.suspended
+                    and not getattr(entry, "auto_resume_blocked", False)
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)

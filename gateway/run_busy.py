@@ -18,6 +18,7 @@ from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import SessionSource
+from gateway.plugin_delivery import event_delivery_observer, observe_delivery
 from typing import Any, Dict, Optional, Union
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -45,7 +46,11 @@ class GatewayBusySessionMixin:
         """Append a /queue event to the FIFO chain for a session."""
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
+            observe_delivery(queued_event, False)
             return
+        observer = event_delivery_observer(queued_event)
+        if observer is not None:
+            observer.queued = True
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         else:
@@ -279,6 +284,7 @@ class GatewayBusySessionMixin:
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._adapter_for_source(event.source)
         if not adapter:
+            observe_delivery(event, False)
             return
         # FIFO so each follow-up gets its own turn in arrival order (the single pending slot used to
         # be silently OVERWRITTEN). Photo bursts still merge into the head slot (album semantics).
@@ -287,7 +293,9 @@ class GatewayBusySessionMixin:
         # ``merge_text=False``, which silently OVERWROTE the single pending slot when consecutive text
         # messages arrived in ``busy_input_mode: queue``.
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        same_security_context = existing is not None and (
+        same_security_context = (existing is not None
+            and event_delivery_observer(existing) is None
+            and event_delivery_observer(event) is None) and (
             getattr(existing, "internal", False) == getattr(event, "internal", False)
             and getattr(existing, "allow_gateway_control", True)
             == getattr(event, "allow_gateway_control", True)
@@ -315,6 +323,7 @@ class GatewayBusySessionMixin:
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
+            observe_delivery(event, False)
             return
 
         self._enqueue_fifo(session_key, event, adapter)
@@ -611,8 +620,15 @@ class GatewayBusySessionMixin:
                 "user=%s (%s), platform=%s, session=%s", event.source.user_id, event.source.user_name,
                 event.source.platform.value if event.source.platform else "unknown", session_key,
             )
+            observe_delivery(event, False)
             return True  # handled (silently dropped); do not fall through
 
+        if event_delivery_observer(event) is not None:
+            if self._draining:
+                observe_delivery(event, False)
+            else:
+                self._queue_or_replace_pending_event(session_key, event)
+            return True
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:  # gateway restarting/stopping
             await self._send_busy_drain_notice(event, session_key, effective_mode)

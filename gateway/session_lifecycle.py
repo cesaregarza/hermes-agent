@@ -205,12 +205,17 @@ class SessionLifecycleMixin:
         """
         return self._update_entry(session_key, lambda e: setattr(e, "suspended", True))
 
-    def _set_turn_marker_locked(self, session_key: str, entry: SessionEntry, token, started_at) -> None:
+    def _set_turn_marker_locked(self, session_key: str, entry: SessionEntry, token, started_at,
+                                *, allow_auto_resume: Optional[bool] = None) -> None:
         """Persist the active-turn pair BEFORE publishing it in memory, so a failed write can
         neither leak an unowned token nor drop a live one. Lock held."""
         candidate = entry.to_dict()
         candidate["active_turn_token"] = token
         candidate["active_turn_started_at"] = _iso(started_at)
+        if allow_auto_resume is not None:
+            candidate["auto_resume_blocked"] = not allow_auto_resume
+        if candidate.get("auto_resume_blocked"):
+            candidate.update(resume_pending=False, resume_reason=None, last_resume_marked_at=None)
         if started_at is not None:
             # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
             # downgrade/upgrade window.
@@ -218,19 +223,27 @@ class SessionLifecycleMixin:
         self._save_entry(session_key, entry_data=candidate, lock_held=True)
         entry.active_turn_token = token
         entry.active_turn_started_at = started_at
+        entry.auto_resume_blocked = bool(candidate.get("auto_resume_blocked"))
+        if entry.auto_resume_blocked:
+            entry.resume_pending = False
+            entry.resume_reason = None
+            entry.last_resume_marked_at = None
         if started_at is not None:
             entry.updated_at = started_at
 
-    def mark_turn_active(self, session_key: str) -> Optional[str]:
+    def mark_turn_active(self, session_key: str, *,
+                         allow_auto_resume: Optional[bool] = True) -> Optional[str]:
         """Persist exact ownership of the running agent turn; returns the opaque token for
         :meth:`clear_turn_active`. Re-marking replaces the previous token so a stale asynchronous
-        unwind cannot clear a newer turn."""
+        unwind cannot clear a newer turn. ``False`` durably excludes externally owned replies
+        from recovery; ``None`` preserves the prior policy for unrelated internal turns."""
         token = uuid.uuid4().hex
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None:
                 return None
-            self._set_turn_marker_locked(session_key, entry, token, _now())
+            self._set_turn_marker_locked(session_key, entry, token, _now(),
+                                         allow_auto_resume=allow_auto_resume)
         return token
 
     def clear_turn_active(self, session_key: str, token: str) -> bool:
@@ -263,7 +276,7 @@ class SessionLifecycleMixin:
             except TypeError:
                 # Mixed aware/naive timestamps: clear rather than risk an unsafe old resume.
                 marker_is_stale = True
-            if not marker_is_stale and not entry.suspended:
+            if not marker_is_stale and not entry.suspended and not entry.auto_resume_blocked:
                 if entry.resume_pending:
                     # A drain-timeout marker is more specific; keep it.
                     if entry.last_resume_marked_at is None:
@@ -294,7 +307,7 @@ class SessionLifecycleMixin:
         """Mark a session resumable after a restart interruption (keeps the session_id/transcript,
         unlike ``suspend_session``). True if marked."""
         def _apply(entry: SessionEntry):
-            if entry.suspended:  # never override an explicit ``suspended`` (hard forced-wipe)
+            if entry.suspended or entry.auto_resume_blocked:
                 return False
             entry.resume_pending = True
             entry.resume_reason = reason
@@ -348,7 +361,7 @@ class SessionLifecycleMixin:
         cutoff = _now() - timedelta(seconds=max_age_seconds)
 
         def _mark(entry: SessionEntry) -> bool:
-            if entry.resume_pending or entry.suspended or entry.updated_at < cutoff:
+            if entry.resume_pending or entry.suspended or entry.auto_resume_blocked or entry.updated_at < cutoff:
                 return False
             entry.resume_pending = True
             entry.resume_reason = "restart_interrupted"

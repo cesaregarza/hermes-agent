@@ -20,6 +20,10 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
+from gateway.plugin_delivery import (
+    current_delivery_observer, event_delivery_observer, final_reply_display,
+    is_observed_reply_turn, observe_delivery,
+)
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
@@ -276,6 +280,7 @@ class GatewayTurnMixin:
                     "Dropping internally routed event after route recovery: expected session=%s derived=%s",
                     expected_session_key, derived_session_key,
                 )
+                observe_delivery(event, False)
                 return
 
         strict_session = bool(event_metadata.get("gateway_session_strict"))
@@ -287,6 +292,7 @@ class GatewayTurnMixin:
                     "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
                     pinned_session_id or "missing", expected_session_key or "missing",
                 )
+                observe_delivery(event, False)
                 return
         else:
             # Internal wakes observe reset policy without counting as user activity, or periodic
@@ -1711,6 +1717,20 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        observer = event_delivery_observer(event)
+        if observer is not None:
+            if agent_result.get("already_sent") or agent_result.get("partial"):
+                observer(None)
+                return None
+            has_final = agent_result.get(
+                "has_final_reply", str(agent_result.get("final_response") or "").strip() not in {"", "(empty)"})
+            if (agent_result.get("failed") or agent_result.get("interrupted")
+                    or agent_result.get("completed") is False or not has_final
+                    or _intentional_silence or not response):
+                observer(False if not observer.tool_started else None)
+                return None
+            observer.reply_ready = True
+            return response
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
@@ -1863,7 +1883,12 @@ class GatewayTurnMixin:
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
+        marked = await self._mark_durable_active_turn(event, session_entry.session_key)
+        if not marked and event_delivery_observer(event) is not None:
+            # No model work or final send can begin without the durable no-resume policy.
+            observe_delivery(event, False)
+            self._clear_session_env(_session_env_tokens)
+            return None, _session_env_tokens
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
@@ -1933,6 +1958,10 @@ class GatewayTurnMixin:
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
         if not isinstance(prepared, self._PreparedTurn):
+            observer = event_delivery_observer(event)
+            if observer is not None:
+                observer(False if not observer.tool_started else None)
+                return None
             return prepared
         history, message_text = prepared.history, prepared.message_text
 
@@ -2001,6 +2030,9 @@ class GatewayTurnMixin:
             )
 
         except Exception as e:
+            if event_delivery_observer(event) is not None:
+                observe_delivery(event, None)
+                return None
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
             # Restore session context variables to their pre-handler state
@@ -2385,6 +2417,8 @@ class GatewayTurnMixin:
     def _proxy_stream_consumer(self, source: "SessionSource", event_message_id, _thread_metadata, _run_still_current):
         """Platform stream consumer for the proxy path when streaming is enabled, else ``None``."""
         from gateway.run import _load_gateway_config, _platform_config_key
+        if is_observed_reply_turn():
+            return None
         _scfg = getattr(getattr(self, "config", None), "streaming", None)
         # #60671 — streaming TTS consumer is created on the outer event-loop thread before run_sync
         # launches.  run_sync only reads it via ``streaming_tts_consumer_holder[0]`` for delta callback
@@ -2698,7 +2732,7 @@ class GatewayTurnMixin:
         # Discord voice "verbal ack" on the FIRST tool call (discord.voice_fx.enabled): resolve the
         # guild whose voice connection is bound to this text channel (mirrors DiscordAdapter.play_tts).
         _voice_ack_guild: List[Optional[int]] = [None]
-        if source.platform == Platform.DISCORD:
+        if source.platform == Platform.DISCORD and not is_observed_reply_turn():
             _va = self.adapters.get(Platform.DISCORD)
             _vtc = getattr(_va, "_voice_text_channels", None)
             if isinstance(_vtc, dict) and hasattr(_va, "voice_mixer_active"):
@@ -2728,6 +2762,7 @@ class GatewayTurnMixin:
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
+        turn_ctx._plugin_delivery_observer = current_delivery_observer()
         turn_runner = TurnRunner(self, turn_ctx)
         # Agent tool-lifecycle callbacks live on the runner (bound methods, same signatures).
         turn_ctx.progress_callback = turn_runner.progress_callback
@@ -3136,6 +3171,8 @@ class GatewayTurnMixin:
 
     async def _run_agent_inactivity_warning(self, worker, source, _status_thread_metadata) -> None:
         """Staged one-shot warning before the inactivity timeout escalates."""
+        if is_observed_reply_turn():
+            return
         from gateway.run import _interim_metadata
         _warn_adapter = self._adapter_for_source(source)
         if not _warn_adapter:
@@ -3284,6 +3321,23 @@ class GatewayTurnMixin:
         )
         pending_event = None
         pending = None
+        # Observed replies must return to their own base task's final send. Likewise an
+        # observed FIFO head needs a fresh handler, including strict-session validation.
+        if is_observed_reply_turn():
+            if adapter and session_key:
+                slot = getattr(adapter, "_pending_messages", {})
+                overflow = self._overflow_queue(session_key)
+                if session_key not in slot and overflow:
+                    slot[session_key] = overflow.pop(0)
+            return None, None
+        if adapter and session_key:
+            slot = getattr(adapter, "_pending_messages", {})
+            overflow = self._overflow_queue(session_key)
+            candidate = slot.get(session_key) or (overflow[0] if overflow else None)
+            if event_delivery_observer(candidate) is not None:
+                if session_key not in slot:
+                    slot[session_key] = overflow.pop(0)
+                return None, None
         if result and adapter and session_key:
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
@@ -3717,6 +3771,8 @@ class GatewayTurnMixin:
 
         Interval: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL (default 180s; 0 or
         long_running_notifications=off disables)."""
+        if is_observed_reply_turn():
+            return
         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
@@ -3790,6 +3846,11 @@ class GatewayTurnMixin:
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
+            if is_observed_reply_turn():
+                # The remote runner cannot attest tool-owned egress or partial response
+                # delivery. Refuse observed replies locally before opening its transport.
+                return {"final_response": "", "messages": history, "api_calls": 0,
+                        "failed": True, "has_final_reply": False}
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
@@ -3799,6 +3860,8 @@ class GatewayTurnMixin:
         from run_agent import AIAgent
 
         disp = self._run_agent_display_settings(source)
+        if is_observed_reply_turn():
+            disp = final_reply_display(disp)
         turn_ctx, turn_runner, _cleanup_adapter = self._run_agent_build_turn_context(
             disp, AIAgent, message=message, source=source, session_key=session_key,
             run_generation=run_generation, context_prompt=context_prompt, history=history,

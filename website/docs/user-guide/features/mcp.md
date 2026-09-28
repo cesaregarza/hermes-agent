@@ -960,3 +960,34 @@ The gateway does NOT need to be running for read operations (listing conversatio
 - [CLI Commands](/reference/cli-commands)
 - [Slash Commands](/reference/slash-commands)
 - [FAQ](/reference/faq)
+
+
+### Move job submissions into Discord threads
+
+For a gateway MCP server that submits asynchronous jobs, `gateway_thread_handoff`
+can move the request into a thread when a particular tool is first selected in a
+configured parent channel. Ordinary chat stays in the parent channel.
+
+```yaml
+mcp_servers:
+  jobs:
+    # Keep the server's existing command/URL and tool configuration.
+    forward_session_context: true
+    gateway_thread_handoff:
+      tools: [submit_job]
+      channels: ["YOUR_DISCORD_CHANNEL_ID"]
+```
+
+The parent tool call returns a thread link without calling the MCP server. Hermes
+continues the authenticated user's request in a new thread turn, including the
+draft job parameters as data, and submits there. Calls already in a thread stay
+there. The thread uses the original message and the existing Discord client;
+model arguments never choose the user, parent, or destination. This option
+requires session context forwarding and a running gateway.
+
+Thread creation and handoff failures block the parent submission. A durable
+claim prevents retries from creating another thread or duplicating a submitted
+request. An ambiguous network response or interrupted handoff requires operator
+reconciliation of `gateway-tool-handoffs.sqlite3`; do not delete claims to retry.
+This is not an exactly-once guarantee across Discord and gateway crashes. The
+feature is disabled unless configured and does not change tool authorization.
