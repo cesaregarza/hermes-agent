@@ -32,7 +32,15 @@ jobs:
       - name: Check plugin session, dispatch, and final delivery contracts
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh tests/gateway/test_plugin_message_injection.py tests/hermes_cli/test_plugin_message_injection.py tests/gateway/test_plugin_delivery_observer.py tests/gateway/test_tool_thread_handoff.py
+          scripts/run_tests.sh \
+            tests/gateway/test_plugin_message_injection.py \
+            tests/hermes_cli/test_plugin_message_injection.py \
+            tests/gateway/test_plugin_delivery_observer.py \
+            tests/gateway/test_tool_thread_handoff.py \
+            tests/gateway/test_session.py \
+            tests/gateway/test_restart_resume_pending.py \
+            tests/gateway/test_restart_redelivery_dedup.py \
+            tests/gateway/test_internal_event_never_interrupts_busy_session.py
         env:
           HERMES_TEST_WORKERS: "1"
           HERMES_TEST_FILE_RETRIES: "0"

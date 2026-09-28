@@ -954,13 +954,6 @@ The gateway does NOT need to be running for read operations (listing conversatio
 - No `claude/channel` push notification protocol yet
 - Text-only sends (no media/attachment sending through `messages_send`)
 
-## Related docs
-
-- [Use MCP with Hermes](/guides/use-mcp-with-hermes)
-- [CLI Commands](/reference/cli-commands)
-- [Slash Commands](/reference/slash-commands)
-- [FAQ](/reference/faq)
-
 
 ### Move job submissions into Discord threads
 
@@ -991,3 +984,10 @@ request. An ambiguous network response or interrupted handoff requires operator
 reconciliation of `gateway-tool-handoffs.sqlite3`; do not delete claims to retry.
 This is not an exactly-once guarantee across Discord and gateway crashes. The
 feature is disabled unless configured and does not change tool authorization.
+
+## Related docs
+
+- [Use MCP with Hermes](/guides/use-mcp-with-hermes)
+- [CLI Commands](/reference/cli-commands)
+- [Slash Commands](/reference/slash-commands)
+- [FAQ](/reference/faq)
