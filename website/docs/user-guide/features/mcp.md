@@ -976,7 +976,8 @@ continues the authenticated user's request in a new thread turn, including the
 draft job parameters as data, and submits there. Calls already in a thread stay
 there. The thread uses the original message and the existing Discord client;
 model arguments never choose the user, parent, or destination. This option
-requires session context forwarding and a running gateway.
+requires session context forwarding and a running gateway on a host with POSIX
+file ownership (Linux or macOS).
 Channel IDs may be quoted strings or integers. The configuration is captured
 when MCP tools are registered; reload MCP tools after changing it.
 

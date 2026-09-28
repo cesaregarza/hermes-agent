@@ -32,12 +32,15 @@ def clear_router(runner) -> None:
 
 
 def _claim(path: Path, key: str, digest: str) -> tuple[str, str | None]:
+    getuid = getattr(os, 'getuid', None)
+    if getuid is None:
+        raise ValueError('Thread handoff requires POSIX file ownership')
     if path.resolve().is_relative_to('/mnt') or path.is_symlink():
         raise ValueError('Handoff storage must be a native regular file')
     fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     os.close(fd)
     info = path.stat()
-    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+    if info.st_uid != getuid() or info.st_mode & 0o077:
         raise ValueError('Handoff storage must be owner-only')
     with closing(sqlite3.connect(path, timeout=2)) as db:
         db.execute('CREATE TABLE IF NOT EXISTS handoffs (source_key TEXT PRIMARY KEY, digest TEXT NOT NULL, status TEXT NOT NULL, thread_id TEXT)')

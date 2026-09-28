@@ -178,3 +178,11 @@ def test_invalid_handoff_config_fails_closed(setting):
     resolved = handoff.resolve_handoff_config(setting)
     result = handoff.route_tool_call('jobs', 'submit', {}, None, resolved)
     assert 'Invalid gateway thread handoff configuration' in result
+
+
+def test_claim_requires_owner_check_before_creating_storage(tmp_path, monkeypatch):
+    monkeypatch.delattr(handoff.os, 'getuid', raising=False)
+    claim_path = tmp_path / 'claims.sqlite3'
+    with pytest.raises(ValueError, match='POSIX file ownership'):
+        handoff._claim(claim_path, 'key', 'intent')
+    assert not claim_path.exists()
