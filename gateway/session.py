@@ -516,6 +516,9 @@ class SessionEntry:
     # SIGKILL/OOM so unclean startup recovers the exact session instead of guessing.
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
+    # Observed plugin replies have an external recovery owner; never auto-resend them.
+    # Retained after unwind until a new real user turn restores ordinary recovery.
+    auto_resume_blocked: bool = False
     # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
     model_override: Optional[Dict[str, str]] = None
@@ -525,7 +528,7 @@ class SessionEntry:
     _PLAIN_FIELDS = (
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
-        "expiry_finalized", "suspended", "resume_pending", "resume_reason",
+        "expiry_finalized", "suspended", "resume_pending", "resume_reason", "auto_resume_blocked",
     )
     _RESET_FIELDS = (
         "is_fresh_reset", "was_auto_reset", "auto_reset_reason", "reset_had_activity",

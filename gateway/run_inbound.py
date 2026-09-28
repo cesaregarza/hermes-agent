@@ -487,9 +487,14 @@ class GatewayInboundMixin:
     ) -> None:
         """Merge *event* into the source adapter's pending slot (no-op without an adapter)."""
         from gateway.platforms.base import merge_pending_message_event
+        from gateway.plugin_delivery import event_delivery_observer
         adapter = self._adapter_for_source(source)
         if adapter:
-            merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+            existing = adapter._pending_messages.get(_quick_key)
+            if event_delivery_observer(event) or event_delivery_observer(existing):
+                self._queue_or_replace_pending_event(_quick_key, event)
+            else:
+                merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
 
     async def _hm_busy_slash_or_photo(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -600,6 +605,13 @@ class GatewayInboundMixin:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from gateway.plugin_delivery import event_delivery_observer, observe_delivery
+        if event_delivery_observer(event) is not None:
+            if self._draining:
+                observe_delivery(event, False)
+            else:
+                self._queue_or_replace_pending_event(_quick_key, event)
+            return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
             return _result
@@ -1177,13 +1189,18 @@ class GatewayInboundMixin:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from gateway.plugin_delivery import event_delivery_observer, observe_delivery
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
+            observe_delivery(event, False)
             return None
         event, source, is_internal = _admitted
 
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:
+            if event_delivery_observer(event) is not None:
+                observe_delivery(event, False)
+                return None
             return _paused_notice
 
         _quick_key = self._session_key_for_source(source)
@@ -1227,6 +1244,9 @@ class GatewayInboundMixin:
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
+            if event_delivery_observer(event) is not None:
+                observe_delivery(event, False)
+                return None
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
@@ -1649,8 +1669,15 @@ class GatewayInboundMixin:
 
     async def _mark_durable_active_turn(self, event: "MessageEvent", session_key: str) -> bool:
         """Persist the exact resolved routing key for this running turn."""
+        from gateway.plugin_delivery import event_delivery_observer
+        observer = event_delivery_observer(event)
+        kwargs = {}
+        if observer is not None:
+            kwargs["allow_auto_resume"] = False
+        elif getattr(event, "internal", False):
+            kwargs["allow_auto_resume"] = None
         try:
-            token = await self.async_session_store.mark_turn_active(session_key)
+            token = await self.async_session_store.mark_turn_active(session_key, **kwargs)
         except Exception as exc:
             logger.warning("Could not persist active-turn marker for %s: %s", session_key, exc)
             return False
@@ -1694,6 +1721,8 @@ class GatewayInboundMixin:
         """Publish this live gateway's plugin message scheduler."""
         from hermes_cli.plugins import get_plugin_manager
 
+        from gateway.tool_thread_handoff import install_router
+        install_router(self)
         get_plugin_manager().set_gateway_message_injector(
             self, self._schedule_plugin_message_injection
         )
@@ -1703,13 +1732,25 @@ class GatewayInboundMixin:
         from hermes_cli.plugins import get_plugin_manager
 
         get_plugin_manager().clear_gateway_message_injector(self)
+        from gateway.tool_thread_handoff import clear_router
+        clear_router(self)
 
     def _schedule_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str,
-        expected_session_id: Optional[str] = None, on_dispatch=None,
+        expected_session_id: Optional[str] = None, on_dispatch=None, on_delivery=None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe)."""
         from gateway.run import safe_schedule_threadsafe
+        from gateway.plugin_delivery import delivery_observer
+        observer = delivery_observer(on_delivery)
+
+        def _rejected() -> bool:
+            if observer is not None:
+                observer(False)
+            return False
+
+        if on_delivery is not None and observer is None:
+            return False
 
         def _observe(outcome: Optional[bool]) -> None:
             if on_dispatch is None:
@@ -1723,18 +1764,20 @@ class GatewayInboundMixin:
         if expected_session_id is not None and (
             not isinstance(expected_session_id, str) or not expected_session_id.strip()
         ):
-            return False
+            return _rejected()
         if on_dispatch is not None and not callable(on_dispatch):
-            return False
+            return _rejected()
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
-            return False
+            return _rejected()
 
         kwargs: Dict[str, Any] = {
             "session_key": session_key, "content": content, "plugin_id": plugin_id,
         }
         if expected_session_id is not None:
             kwargs["expected_session_id"] = expected_session_id
+        if observer is not None:
+            kwargs["on_delivery"] = observer
         coro = self._dispatch_plugin_message_injection(**kwargs)
         try:
             current_loop = asyncio.get_running_loop()
@@ -1747,7 +1790,7 @@ class GatewayInboundMixin:
             except Exception:
                 coro.close()
                 logger.warning("Plugin message injection scheduling failed", exc_info=True)
-                return False
+                return _rejected()
             self._background_tasks.add(future)
             future.add_done_callback(self._background_tasks.discard)
         else:
@@ -1756,7 +1799,7 @@ class GatewayInboundMixin:
                 log_level=logging.WARNING,
             )
             if future is None:
-                return False
+                return _rejected()
 
         def _log_result(completed) -> None:
             outcome: Optional[bool]
@@ -1764,12 +1807,18 @@ class GatewayInboundMixin:
                 result = completed.result()
                 outcome = result if isinstance(result, bool) else None
             except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                if observer is not None:
+                    observer(None)
                 _observe(None)
                 return
             except Exception:
+                if observer is not None:
+                    observer(None)
                 _observe(None)
                 what = "failed"
             else:
+                if observer is not None and outcome is not True:
+                    observer(False if outcome is False else None)
                 _observe(outcome)
                 if outcome is True:
                     return
@@ -1783,19 +1832,27 @@ class GatewayInboundMixin:
 
     async def _dispatch_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str,
-        expected_session_id: Optional[str] = None,
+        expected_session_id: Optional[str] = None, on_delivery=None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
+        from gateway.plugin_delivery import delivery_observer
+        observer = delivery_observer(on_delivery)
+
+        def _rejected() -> bool:
+            if observer is not None:
+                observer(False)
+            return False
+
         def _accepting() -> bool:
             return getattr(self, "_running", False) and not getattr(self, "_draining", False)
 
         if not _accepting():
-            return False
+            return _rejected()
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None or not _accepting():
-            return False
+            return _rejected()
         if expected_session_id is not None and entry.session_id != expected_session_id:
-            return False
+            return _rejected()
 
         source = dataclasses.replace(entry.origin)
         try:
@@ -1805,19 +1862,19 @@ class GatewayInboundMixin:
                 "Plugin message injection authorization check failed: plugin=%s session=%s",
                 plugin_id, session_key, exc_info=True,
             )
-            return False
+            return _rejected()
         if not authorized:
             logger.warning(
                 "Plugin message injection denied by current gateway authorization: "
                 "plugin=%s session=%s", plugin_id, session_key,
             )
-            return False
+            return _rejected()
 
         adapter = self._adapter_for_source(source)
         if adapter is None:
-            return False
+            return _rejected()
 
-        await adapter.handle_message(MessageEvent(
+        event = MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
             allow_gateway_control=False,
             metadata={
@@ -1825,7 +1882,15 @@ class GatewayInboundMixin:
                 "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
                 "gateway_session_strict": True,
             },
-        ))
+        )
+        if observer is not None:
+            event._plugin_delivery_observer = observer
+        try:
+            await adapter.handle_message(event)
+        except BaseException:
+            if observer is not None:
+                observer(None)
+            raise
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
             plugin_id, session_key, entry.session_id,

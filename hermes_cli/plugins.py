@@ -597,6 +597,7 @@ class PluginContext:
         self, content: str, role: str = "user", *, session_key: str | None = None,
         expected_session_id: str | None = None,
         on_dispatch: Callable[[bool | None], None] | None = None,
+        on_delivery: Callable[[bool | None], None] | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation (CLI input interrupts when running;
         gateway input follows the existing busy-session queue).
@@ -605,32 +606,51 @@ class PluginContext:
         request for async dispatch, not that delivery completed. ``expected_session_id`` and
         ``on_dispatch`` are gateway-only: the former pins delivery to the currently routed session
         generation, while the latter observes async adapter handling (``True`` accepted, ``False``
-        rejected, ``None`` uncertain after cancellation or an exception)."""
+        rejected, ``None`` uncertain after cancellation or an exception).
+        ``on_delivery`` is gateway-only and observes the final reply: ``True`` confirms a
+        complete final text send with a transport message ID, ``False`` confirms rejection
+        before sending, and ``None``
+        means uncertain (including streamed replies and failed sends). Observed gateway turns
+        use one final text reply with no stream/progress/media expansion; proxy-backed turns are
+        rejected before transport. Provider failure before any tool starts reports ``False``;
+        failures after tools start remain uncertain. It is called at most
+        once, including synchronous rejection. A process crash may prevent any callback;
+        callers must not interpret silence or queue acceptance as delivery."""
+        from gateway.plugin_delivery import delivery_observer
+        observer = delivery_observer(on_delivery)
+
+        def _rejected() -> bool:
+            if observer is not None:
+                observer(False)
+            return False
+
+        if on_delivery is not None and observer is None:
+            return False
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
         if cli is not None:
-            if expected_session_id is not None or on_dispatch is not None:
-                return False
+            if expected_session_id is not None or on_dispatch is not None or observer is not None:
+                return _rejected()
             queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
             queue_.put(msg)
             return True
         if expected_session_id is not None and (
             not isinstance(expected_session_id, str) or not expected_session_id.strip()
         ):
-            return False
+            return _rejected()
         if on_dispatch is not None and not callable(on_dispatch):
-            return False
+            return _rejected()
         if not session_key:
             logger.warning("inject_message: gateway mode requires an existing session_key")
-            return False
+            return _rejected()
         if not self._gateway_injection_allowed():
             logger.warning("inject_message: gateway injection denied for plugin %s; set "
                            "plugins.entries.%s.allow_gateway_injection: true to allow it",
                            self.plugin_id, self.plugin_id)
-            return False
+            return _rejected()
         if not self._manager.has_gateway_message_injector:
             logger.warning("inject_message: no live gateway is available")
-            return False
+            return _rejected()
         try:
             kwargs: Dict[str, Any] = {
                 "session_key": session_key, "content": msg, "plugin_id": self.plugin_id,
@@ -639,8 +659,15 @@ class PluginContext:
                 kwargs["expected_session_id"] = expected_session_id
             if on_dispatch is not None:
                 kwargs["on_dispatch"] = on_dispatch
-            return bool(self._manager.inject_gateway_message(**kwargs))
+            if observer is not None:
+                kwargs["on_delivery"] = observer
+            accepted = bool(self._manager.inject_gateway_message(**kwargs))
+            if not accepted:
+                return _rejected()
+            return True
         except (Exception, asyncio.CancelledError):
+            if observer is not None:
+                observer(None)
             if on_dispatch is not None:
                 try:
                     on_dispatch(None)

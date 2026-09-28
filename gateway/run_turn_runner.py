@@ -87,6 +87,11 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        observer = getattr(ctx, "_plugin_delivery_observer", None)
+        if observer is not None:
+            if event_type == "tool.started":
+                observer.tool_started = True
+            return
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
         if event_type == "subagent.complete":
@@ -690,6 +695,10 @@ class TurnRunner:
 
     def combined_tool_start_callback(self, call_id, tool_name, args):
         """Compose the voice ack + native task-card start consumers."""
+        observer = getattr(self._ctx, "_plugin_delivery_observer", None)
+        if observer is not None:
+            observer.tool_started = True
+            return
         if self._ctx._voice_ack_guild[0] is not None:
             self.voice_ack_callback(call_id, tool_name, args)
         if self._ctx._native_slack_task_cards:
@@ -722,6 +731,8 @@ class TurnRunner:
 
     def _status_live(self) -> bool:
         """Status adapter present and this run is still the current generation."""
+        if getattr(self._ctx, "_plugin_delivery_observer", None) is not None:
+            return False
         return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
@@ -1096,7 +1107,8 @@ class TurnRunner:
         # callback, so neither infers identity from tool names.
         agent.tool_start_callback = (
             (ctx.native_tool_start_callback or ctx.voice_ack_callback)
-            if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
+            if (getattr(ctx, "_plugin_delivery_observer", None) is not None
+                or ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
         )
         agent.tool_complete_callback = ctx.native_tool_complete_callback if ctx._native_slack_task_cards else None
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
@@ -1359,7 +1371,9 @@ class TurnRunner:
         if ctx.session_key:
             with suppress(Exception):
                 entry = self._runner.session_store._entries.get(ctx.session_key)
-        resume_pending = entry is not None and getattr(entry, "resume_pending", False)
+        auto_resume_blocked = entry is not None and getattr(entry, "auto_resume_blocked", False)
+        resume_pending = (entry is not None and getattr(entry, "resume_pending", False)
+                          and not auto_resume_blocked)
         resume_reason = (getattr(entry, "resume_reason", None) or "restart_timeout") if resume_pending else None
         # resume_pending freshness ALSO uses the restart watchdog's ``last_resume_marked_at`` (the true
         # interruption stamp): the transcript clock can be hours older for an active thread, and the
@@ -1372,7 +1386,8 @@ class TurnRunner:
             ctx.message, persist_override = _prepare_resume_pending_message(
                 resume_reason, ctx.message, interactive=self._resume_note_interactive(),
             )
-        elif agent_history and agent_history[-1].get("role") == "tool" and interruption_is_fresh:
+        elif (not auto_resume_blocked and agent_history
+              and agent_history[-1].get("role") == "tool" and interruption_is_fresh):
             persist_override = ctx.message
             ctx.message = (
                 "[System note: A new message has arrived. The conversation "
@@ -1631,6 +1646,9 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
+            if getattr(ctx, "_plugin_delivery_observer", None) is not None:
+                return {"final_response": "", "messages": [], "api_calls": 0, "tools": [],
+                        "failed": True}
             return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
@@ -1669,7 +1687,9 @@ class TurnRunner:
         common = {
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
+            "has_final_reply": str(final_response or "").strip() not in {"", "(empty)"},
             "partial": result.get("partial", False), "completed": result.get("completed"),
+            "turn_exit_reason": result.get("turn_exit_reason"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
             "compression_exhausted": result.get("compression_exhausted", False),

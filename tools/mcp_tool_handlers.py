@@ -419,9 +419,11 @@ def _render_call_tool_result(result, server_name: str) -> str:
         return json.dumps({"result": text_result}, ensure_ascii=False)
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *, gateway_thread_handoff=None):
     """Sync registry handler (``handler(args_dict, **kwargs) -> str``) calling an MCP tool via the background loop."""
     op = f"tools/call {tool_name}"
+    from gateway.tool_thread_handoff import resolve_handoff_config, route_tool_call
+    handoff_config = resolve_handoff_config(gateway_thread_handoff)
 
     def _handler(args: dict, **kwargs) -> str:
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
@@ -430,6 +432,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:
             return error
+        handoff = route_tool_call(server_name, tool_name, args, session_meta, handoff_config)
+        if handoff is not None:
+            return handoff
         server, error = _acquire_call_server(server_name, tool_timeout)
         if server is None:
             return error
