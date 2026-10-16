@@ -1869,7 +1869,7 @@ class GatewayTurnMixin:
         from gateway.run_session_metadata import bind_session_context_for_turn, source_with_trigger_message_id
         context = build_session_context(source_with_trigger_message_id(event, source), self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens, _redact_pii = bind_session_context_for_turn(self, context)
+        _session_env_tokens, _redact_pii = bind_session_context_for_turn(self, context, event)
         # Self-injected turns (MessageEvent(internal=True)) persist with a DB-only display_kind so
         # UIs render timeline notices, not user bubbles; role/content untouched.
         persist_user_display_kind = "internal_notification" if getattr(event, "internal", False) else None

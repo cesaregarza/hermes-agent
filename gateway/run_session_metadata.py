@@ -52,7 +52,12 @@ def _load_redact_pii_policy() -> bool:
     raise ValueError("privacy.redact_pii must be true or false")
 
 
-def bind_session_context_for_turn(runner, context: SessionContext) -> tuple[list, bool | None]:
+def bind_session_context_for_turn(runner, context: SessionContext, event=None) -> tuple[list, bool | None]:
+    """Bind the turn's session identity; roles come only from the turn's own event.
+
+    A turn with no fresh Discord message behind it (a plugin injection, a background
+    notification, any internal or synthetic event) has none, so its metadata has none.
+    """
     from gateway.run import _profile_runtime_scope
 
     try:
@@ -66,9 +71,11 @@ def bind_session_context_for_turn(runner, context: SessionContext) -> tuple[list
         # Do not log raw identifiers or config values while handling a privacy failure.
         logger.warning("Session privacy policy unavailable; omitting external MCP session metadata")
         redact_pii = None
-    from gateway.session_context import _SESSION_REDACT_PII
+    from gateway.session_context import _SESSION_PARENT_CHAT_ID, _SESSION_REDACT_PII, _SESSION_ROLE_IDS
     tokens = runner._set_session_env(context)
     _SESSION_REDACT_PII.set(redact_pii)
+    _SESSION_ROLE_IDS.set(getattr(event, "discord_role_ids", None))
+    _SESSION_PARENT_CHAT_ID.set(str(context.source.parent_chat_id or ""))
     return tokens, redact_pii
 
 
@@ -87,5 +94,5 @@ def bind_followup_event_context(runner, event, *, session_key: str, session_id: 
     source = source_with_trigger_message_id(event)
     context = SessionContext(source=source, connected_platforms=[], home_channels={},
                              session_key=session_key, session_id=session_id)
-    bind_session_context_for_turn(runner, context)
+    bind_session_context_for_turn(runner, context, event)
     return source

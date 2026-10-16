@@ -22,8 +22,11 @@ def setup_handoff(tmp_path, monkeypatch):
     source = SessionSource(platform=Platform.DISCORD, chat_id='100', chat_type='group',
                            user_id='200', guild_id='300', message_id='400')
     entry = SimpleNamespace(origin=source, session_id='session', session_key='key')
+    # A fetched message's author is a plain user; roles come from the server's member record.
+    member = SimpleNamespace(id=200, roles=[SimpleNamespace(id=300), SimpleNamespace(id=601), SimpleNamespace(id=600)])
+    guild = SimpleNamespace(id=300, get_member=Mock(return_value=None), fetch_member=AsyncMock(return_value=member))
     message = SimpleNamespace(id=401, author=SimpleNamespace(id=200, bot=False),
-                              channel=SimpleNamespace(id=100), guild=SimpleNamespace(id=300),
+                              channel=SimpleNamespace(id=100), guild=guild,
                               content='Prepare the ingredient shopping list')
     thread = SimpleNamespace(id=401, parent_id=100, name='Ingredients')
     message.create_thread = AsyncMock(return_value=thread)
@@ -67,6 +70,10 @@ async def test_real_mcp_handler_hands_off_once_before_transport(tmp_path, monkey
         transport.assert_not_called()
         event = adapter.handle_message.call_args.args[0]
         assert event.source.user_id == '200' and event.source.parent_chat_id == '100'
+        # Role ids are recomputed for the job thread's event, without @everyone (the
+        # server's id); neither the thread's source nor the stored origin holds any.
+        assert event.discord_role_ids == ('600', '601')
+        assert not hasattr(event.source, 'role_ids') and not hasattr(entry.origin, 'role_ids')
         assert event.source.thread_id == event.source.chat_id == '401'
         assert event.message_id == event.source.message_id == '401'
         assert event.internal and not event.allow_gateway_control
@@ -109,6 +116,28 @@ async def test_failed_or_uncertain_handoff_never_submits_or_replays(tmp_path, mo
         second = await asyncio.to_thread(handler, {'task': 'bounded job'})
         assert 'moved_to_thread' not in first + second
         assert message.create_thread.await_count <= 1
+        adapter.handle_message.assert_not_called()
+        transport.assert_not_called()
+    finally:
+        handoff.clear_router(runner)
+
+
+@pytest.mark.asyncio
+async def test_a_member_whose_roles_cannot_be_read_is_refused_before_anything_is_claimed(tmp_path, monkeypatch):
+    runner, entry, adapter, message, meta, transport = setup_handoff(tmp_path, monkeypatch)
+    message.guild.fetch_member.side_effect = RuntimeError('member left')
+    claim = Mock(side_effect=AssertionError('nothing may be claimed'))
+    monkeypatch.setattr(handoff, '_claim', claim)
+    handler = mcp_tool_handlers._make_tool_handler(
+        'jobs', 'submit', 10, gateway_thread_handoff={'tools': ['submit'], 'channels': ['100']})
+    try:
+        result = await asyncio.to_thread(handler, {'task': 'bounded job'})
+        # The event matched every check before the member lookup, and the lookup was made.
+        message.guild.fetch_member.assert_awaited_once_with(200)
+        assert 'Discord member roles are unavailable; tool was not run.' in result
+        claim.assert_not_called()
+        assert not (tmp_path / 'gateway-tool-handoffs.sqlite3').exists()
+        message.create_thread.assert_not_awaited()
         adapter.handle_message.assert_not_called()
         transport.assert_not_called()
     finally:

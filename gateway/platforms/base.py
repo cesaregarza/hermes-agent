@@ -1530,6 +1530,8 @@ class MessageEvent:
     # May this event resolve gateway commands / control prompts? Proactive plugin events set False
     # so untrusted payload text stays conversational. Kept last for positional compat.
     allow_gateway_control: bool = True
+    # This message's author's Discord role ids, as read from it; never retained past the event.
+    discord_role_ids: Optional[tuple[str, ...]] = None
 
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -1700,6 +1702,12 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+def _merge_discord_role_ids(into: "MessageEvent", event: "MessageEvent") -> None:
+    """A merged turn keeps its events' roles only when every event read the same ones."""
+    if into.discord_role_ids != event.discord_role_ids:
+        into.discord_role_ids = None
+
+
 def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], session_key: str,
                                 event: MessageEvent, *, merge_text: bool = False) -> None:
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
@@ -1747,11 +1755,13 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
                 if hasattr(existing, attr):
                     delattr(existing, attr)
+            _merge_discord_role_ids(existing, event)
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
+            _merge_discord_role_ids(existing, event)
             return
     pending_messages[session_key] = event
 
@@ -2348,6 +2358,7 @@ class BasePlatformAdapter(ABC):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            _merge_discord_role_ids(existing, event)
         existing._last_chunk_len = len(event.text or "")  # type: ignore[attr-defined]
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
@@ -3306,6 +3317,7 @@ class BasePlatformAdapter(ABC):
         else:
             if event.text:
                 state.event.text = _append_text(state.event.text, event.text)
+            _merge_discord_role_ids(state.event, event)
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:

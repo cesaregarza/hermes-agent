@@ -13,7 +13,9 @@ def build_session_context_meta(server_name: str) -> dict[str, str] | None:
     with _core._lock:
         if server_name not in _core._session_context_forwarding_servers:
             return None
-    from gateway.session_context import _UNSET, _VAR_MAP, _SESSION_REDACT_PII
+    from gateway.session_context import (
+        _UNSET, _VAR_MAP, _SESSION_PARENT_CHAT_ID, _SESSION_REDACT_PII, _SESSION_ROLE_IDS,
+    )
 
     values = {}
     for field in _FIELDS:
@@ -47,4 +49,20 @@ def build_session_context_meta(server_name: str) -> dict[str, str] | None:
         except Exception:
             logger.warning("MCP session redaction unavailable; omitting session metadata")
             return None
-    return {_PREFIX + field: values[field] for field in _FIELDS}
+    meta = {_PREFIX + field: values[field] for field in _FIELDS}
+    # Raw Discord ids only: under redaction the receiver cannot check them, so send no roles.
+    role_ids = _SESSION_ROLE_IDS.get()
+    if role_ids is not None and not redact_pii:
+        meta[_PREFIX + "role_ids"] = ",".join(role_ids)
+    parent_chat_id = _SESSION_PARENT_CHAT_ID.get()
+    if values["thread_id"] and parent_chat_id and not redact_pii:
+        meta[_PREFIX + "parent_chat_id"] = parent_chat_id
+    return meta
+
+
+def discord_role_ids(author, guild) -> tuple[str, ...] | None:
+    """The author's role ids in this message's own server; None in a DM. The default role
+    (@everyone) shares the server's id and every member holds it, so it is left out."""
+    if guild is None:
+        return None
+    return tuple(sorted(str(role.id) for role in getattr(author, "roles", ()) if role.id != guild.id))
