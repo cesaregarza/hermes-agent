@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, PlatformConfig
 from gateway.run import GatewayRunner
 from gateway.run_session_metadata import bind_session_context_for_turn
 from gateway.session import SessionContext, SessionSource
@@ -173,25 +173,34 @@ def test_neither_field_enters_a_subprocess_environment(runner):
     assert not any(value in ("600000000000000600", "700000000000000700") for value in env.values())
 
 
-@pytest.mark.asyncio
-async def test_no_retained_source_replays_roles_after_a_revocation_or_a_roleless_message(
-    runner, tmp_path, monkeypatch,
-):
-    """Roles come only from each turn's own message (CES-1448 review P1).
+KEPT, REVOKED = "600000000000000600", "600000000000000601"
 
-    The real store keeps the inbound source as its live origin. After a message with
-    roles, one with fewer (a revocation) and one with none, a plugin injection and a
-    background notification on the same session, both built from that origin, carry
-    no roles, and nothing the store keeps holds any.
-    """
+
+class _DiscordAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.DISCORD)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise AssertionError("network send is not expected")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id, "type": "group"}
+
+
+def _live_discord_session(runner, tmp_path, adapter):
+    """A real store's live Discord session, and a way to bind a turn and read its roles."""
     from gateway.session import SessionStore
 
     store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
     origin = SessionSource(platform=Platform.DISCORD, chat_id="chan", chat_type="group",
                            user_id="alice", guild_id="300", message_id="m0")
     entry = store.get_or_create_session(origin)
-    dispatched: list[MessageEvent] = []
-    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=dispatched.append))
     runner.session_store = store
     runner.adapters = {Platform.DISCORD: adapter}
     runner._profile_adapters = {}
@@ -210,20 +219,42 @@ async def test_no_retained_source_replays_roles_after_a_revocation_or_a_roleless
     runner._pinned_session_context_prompt = capture
 
     async def turn(event):
+        """The `role_ids` the real binder and builder send for this turn ("absent" if none)."""
         with pytest.raises(Prepared):
             await runner._hmwa_prepare_turn(event, event.source, entry, entry.session_key, entry.session_key, 1)
-        roles = seen[-1].get(PREFIX + "role_ids", "absent")
-        seen.clear()
-        return roles
+        return seen.pop().get(PREFIX + "role_ids", "absent")
 
-    def message(message_id, roles):
+    def message(message_id, roles, *, media=False):
         source = dataclasses.replace(origin, message_id=message_id)
-        return MessageEvent(text="hi", source=source, message_id=message_id, discord_role_ids=roles)
+        if media:
+            return MessageEvent(text=f"caption {message_id}", message_type=MessageType.PHOTO, source=source,
+                                message_id=message_id, media_urls=[f"{message_id}.jpg"],
+                                media_types=["image/jpeg"], discord_role_ids=roles)
+        return MessageEvent(text=f"text {message_id}", source=source, message_id=message_id,
+                            discord_role_ids=roles)
 
-    kept, revoked = "600000000000000600", "600000000000000601"
-    assert await turn(message("m1", (kept, revoked))) == f"{kept},{revoked}"
-    assert await turn(message("m2", (kept,))) == kept  # one role revoked
-    assert await turn(message("m3", ())) == ""  # a roleless follow-up
+    return SimpleNamespace(store=store, origin=origin, entry=entry, turn=turn, message=message)
+
+
+@pytest.mark.asyncio
+async def test_no_retained_source_replays_roles_after_a_revocation_or_a_roleless_message(
+    runner, tmp_path, monkeypatch,
+):
+    """Roles come only from each turn's own message (CES-1448 review P1).
+
+    The real store keeps the inbound source as its live origin. After a message with
+    roles, one with fewer (a revocation) and one with none, a plugin injection and a
+    background notification on the same session, both built from that origin, carry
+    no roles, and nothing the store keeps holds any.
+    """
+    dispatched: list[MessageEvent] = []
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=dispatched.append))
+    live = _live_discord_session(runner, tmp_path, adapter)
+    entry = live.entry
+
+    assert await live.turn(live.message("m1", (KEPT, REVOKED))) == f"{KEPT},{REVOKED}"
+    assert await live.turn(live.message("m2", (KEPT,))) == KEPT  # one role revoked
+    assert await live.turn(live.message("m3", ())) == ""  # a roleless follow-up
 
     assert await runner._dispatch_plugin_message_injection(
         session_key=entry.session_key, content="plugin says hi", plugin_id="p",
@@ -233,10 +264,56 @@ async def test_no_retained_source_replays_roles_after_a_revocation_or_a_roleless
     assert await runner._inject_watch_notification("job finished", {"session_id": "proc"}) is True
     plugin_event, background_event = dispatched
     assert plugin_event.source.message_id == background_event.source.message_id == "m0"  # the stored origin
-    assert await turn(plugin_event) == "absent"
-    assert await turn(background_event) == "absent"
+    assert await live.turn(plugin_event) == "absent"
+    assert await live.turn(background_event) == "absent"
 
-    live = store._entries[entry.session_key].origin
-    assert not hasattr(live, "role_ids") and not hasattr(live, "discord_role_ids")
+    stored = live.store._entries[entry.session_key].origin
+    assert not hasattr(stored, "role_ids") and not hasattr(stored, "discord_role_ids")
     persisted = b"".join(path.read_bytes() for path in (tmp_path / "sessions").rglob("*") if path.is_file())
-    assert kept.encode() not in persisted and revoked.encode() not in persisted
+    assert KEPT.encode() not in persisted and REVOKED.encode() not in persisted
+
+
+# The later message's roles beside the earlier one's (KEPT, REVOKED), and what the merged turn sends.
+MERGED_ROLES = {
+    "unchanged": ((KEPT, REVOKED), f"{KEPT},{REVOKED}"),
+    "one revoked": ((KEPT,), "absent"),
+    "roleless follow-up": ((), "absent"),
+    "no testimony": (None, "absent"),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", MERGED_ROLES)
+async def test_busy_media_merged_into_one_turn_keeps_roles_only_if_every_message_agrees(
+    runner, tmp_path, case,
+):
+    adapter = _DiscordAdapter()
+    live = _live_discord_session(runner, tmp_path, adapter)
+    later_roles, sent = MERGED_ROLES[case]
+    key = live.entry.session_key
+    adapter._pending_messages[key] = live.message("m1", (KEPT, REVOKED), media=True)
+
+    runner._queue_or_replace_pending_event(key, live.message("m2", later_roles, media=True))
+    drained = adapter._pending_messages.pop(key)
+
+    assert drained.media_urls == ["m1.jpg", "m2.jpg"]  # absorbed into one turn
+    assert await live.turn(drained) == sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", MERGED_ROLES)
+async def test_busy_text_debounced_into_one_turn_keeps_roles_only_if_every_message_agrees(
+    runner, tmp_path, case,
+):
+    adapter = _DiscordAdapter()
+    live = _live_discord_session(runner, tmp_path, adapter)
+    later_roles, sent = MERGED_ROLES[case]
+    key = live.entry.session_key
+
+    await adapter._queue_text_debounce(key, live.message("m1", (KEPT, REVOKED)))
+    await adapter._queue_text_debounce(key, live.message("m2", later_roles))
+    assert await adapter._flush_text_debounce_now(key) is True
+    drained = adapter._pending_messages.pop(key)
+
+    assert drained.text == "text m1\ntext m2"  # one turn
+    assert await live.turn(drained) == sent
