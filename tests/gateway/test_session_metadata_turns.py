@@ -106,3 +106,60 @@ async def test_recursive_queued_turn_rebinds_sender_and_trigger(runner, syntheti
     assert observed[0][PREFIX + "user_id"] == next_source.user_id
     assert observed[0][PREFIX + "message_id"] == ("origin" if synthetic else "second")
     assert observed[0][PREFIX + "session_id"] == "sid"
+
+
+def _discord_turn(runner, **source_fields):
+    source = SessionSource(platform=Platform.DISCORD, user_id="alice", chat_id="chan", message_id="msg",
+                           guild_id="300", **source_fields)
+    context = SessionContext(source=source, connected_platforms=[], home_channels={}, session_id="sid", session_key="key")
+    runner._set_session_env(context)
+    from gateway.session_context import _SESSION_REDACT_PII
+    _SESSION_REDACT_PII.set(False)
+    return build_session_context_meta("edge")
+
+
+def test_server_message_forwards_role_ids_and_a_dm_forwards_none(runner):
+    assert _discord_turn(runner, role_ids=("600", "601"))[PREFIX + "role_ids"] == "600,601"
+    assert _discord_turn(runner, role_ids=())[PREFIX + "role_ids"] == ""
+    assert PREFIX + "role_ids" not in _discord_turn(runner, role_ids=None)
+
+
+def test_thread_message_forwards_its_parent_channel_only(runner):
+    thread = _discord_turn(runner, chat_type="thread", thread_id="thread", parent_chat_id="parent")
+    assert thread[PREFIX + "parent_chat_id"] == "parent"
+    assert PREFIX + "parent_chat_id" not in _discord_turn(runner, parent_chat_id="parent")
+
+
+def test_redacted_turn_forwards_neither_field(runner):
+    _discord_turn(runner, role_ids=("600",), thread_id="thread", parent_chat_id="parent")
+    from gateway.session_context import _SESSION_REDACT_PII
+    _SESSION_REDACT_PII.set(True)
+    meta = build_session_context_meta("edge")
+    assert PREFIX + "role_ids" not in meta and PREFIX + "parent_chat_id" not in meta
+
+
+def test_role_ids_drop_everyone_and_are_none_in_a_dm():
+    from tools.mcp_tool_session_metadata import discord_role_ids
+
+    guild = SimpleNamespace(id=300)
+    member = SimpleNamespace(roles=[SimpleNamespace(id=300), SimpleNamespace(id=601), SimpleNamespace(id=600)])
+    assert discord_role_ids(member, guild) == ("600", "601")
+    assert discord_role_ids(SimpleNamespace(id=1), guild) == ()  # a webhook or plain user
+    assert discord_role_ids(member, None) is None
+
+
+def test_role_ids_never_enter_the_stored_origin():
+    source = SessionSource(platform=Platform.DISCORD, chat_id="chan", guild_id="300", role_ids=("600",))
+    stored = source.to_dict()
+    assert "role_ids" not in stored and "600" not in repr(stored)
+    assert SessionSource.from_dict(stored).role_ids is None
+
+
+def test_neither_field_enters_a_subprocess_environment(runner):
+    from tools.environments.local import build_subprocess_env
+
+    _discord_turn(runner, role_ids=("600000000000000600",), chat_type="thread", thread_id="thread",
+                  parent_chat_id="700000000000000700")
+    env = build_subprocess_env()
+    assert not any(name.endswith(("ROLE_IDS", "PARENT_CHAT_ID")) for name in env)
+    assert not any(value in ("600000000000000600", "700000000000000700") for value in env.values())

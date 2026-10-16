@@ -53,6 +53,10 @@ _SESSION_VARS = (
 _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 # A per-turn policy snapshot. Unknown is not permission to disclose identifiers.
 _SESSION_REDACT_PII = ContextVar("HERMES_SESSION_REDACT_PII", default=None)
+# Per-message Discord facts for MCP session metadata. Outside _VAR_MAP, so the subprocess
+# env bridge never exports them.
+_SESSION_ROLE_IDS = ContextVar("HERMES_SESSION_ROLE_IDS", default=None)
+_SESSION_PARENT_CHAT_ID = ContextVar("HERMES_SESSION_PARENT_CHAT_ID", default="")
 
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -110,6 +114,7 @@ def set_session_vars(
     message_id: str = "", profile: str = "", browser_control_principal: str = "",
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, redact_pii: bool | None = None,
+    role_ids: tuple[str, ...] | None = None, parent_chat_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -124,6 +129,8 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_REDACT_PII.set(redact_pii))
+    tokens.append(_SESSION_ROLE_IDS.set(role_ids))
+    tokens.append(_SESSION_PARENT_CHAT_ID.set(parent_chat_id))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -136,6 +143,8 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_REDACT_PII.set(None)
+    _SESSION_ROLE_IDS.set(None)
+    _SESSION_PARENT_CHAT_ID.set("")
     _runtime_cwd("clear_session_cwd")
 
 
@@ -148,6 +157,8 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_REDACT_PII.set(None)
+    _SESSION_ROLE_IDS.set(None)
+    _SESSION_PARENT_CHAT_ID.set("")
     _runtime_cwd("clear_session_cwd")
 
 

@@ -4105,7 +4105,9 @@ class GatewayRunner(
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
-            cron_session="")
+            cron_session="",
+            role_ids=context.source.role_ids,
+            parent_chat_id=str(context.source.parent_chat_id or ""))
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""

@@ -6074,6 +6074,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 or self._derive_auto_thread_name(message.content or "")
             ) if auto_threaded_channel is not None else None,
         )
+        from tools.mcp_tool_session_metadata import discord_role_ids
+        source.role_ids = discord_role_ids(message.author, guild)
         media_urls, media_types, pending_text_injection = await self._collect_attachment_media(all_attachments)
         event_text = normalized_content
         if pending_text_injection:

@@ -166,6 +166,14 @@ async def _handoff(runner, home: Path, meta: dict, draft: str) -> str:
     if (str(message.author.id) != str(source.user_id) or str(message.channel.id) != str(source.chat_id)
             or guild_id != str(source.guild_id or source.scope_id) or getattr(message.author, 'bot', False)):
         return reject('Discord source message does not match')
+    # The stored origin carries no role ids, and a fetched message has no member object, so
+    # read the author's roles from the server. Never hand off without them.
+    from tools.mcp_tool_session_metadata import discord_role_ids
+    try:
+        member = message.guild.get_member(message.author.id) or await message.guild.fetch_member(message.author.id)
+    except Exception:
+        return reject('Discord member roles are unavailable')
+    role_ids = discord_role_ids(member, message.guild)
     key = hashlib.sha256(json.dumps([session_key, session_id, source.chat_id, source.user_id, message_id]).encode()).hexdigest()
     digest = hashlib.sha256(draft.encode()).hexdigest()
     path = home / 'gateway-tool-handoffs.sqlite3'
@@ -185,7 +193,8 @@ async def _handoff(runner, home: Path, meta: dict, draft: str) -> str:
         adapter._dedup.is_duplicate(thread_id)
         thread_source = dataclasses.replace(source, chat_id=thread_id, thread_id=thread_id,
                                             parent_chat_id=str(source.chat_id), chat_type='thread',
-                                            auto_thread_created=True, auto_thread_initial_name=thread.name)
+                                            auto_thread_created=True, auto_thread_initial_name=thread.name,
+                                            role_ids=role_ids)
         if not runner._is_user_authorized(thread_source, allow_adapter_delegation=False):
             raise ValueError('Thread is not authorized')
         # Recheck after network awaits so /reset cannot redirect stale work.
