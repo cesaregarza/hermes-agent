@@ -37,6 +37,7 @@ jobs:
             tests/hermes_cli/test_plugin_message_injection.py \
             tests/gateway/test_plugin_delivery_observer.py \
             tests/gateway/test_tool_thread_handoff.py \
+            tests/gateway/test_session_metadata_turns.py \
             tests/gateway/test_session.py \
             tests/gateway/test_active_turn_recovery.py \
             tests/tools/test_mcp_dynamic_discovery.py \
