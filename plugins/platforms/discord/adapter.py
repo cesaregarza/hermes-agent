@@ -6074,8 +6074,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 or self._derive_auto_thread_name(message.content or "")
             ) if auto_threaded_channel is not None else None,
         )
-        from tools.mcp_tool_session_metadata import discord_role_ids
-        source.role_ids = discord_role_ids(message.author, guild)
         media_urls, media_types, pending_text_injection = await self._collect_attachment_media(all_attachments)
         event_text = normalized_content
         if pending_text_injection:
@@ -6120,12 +6118,13 @@ class DiscordAdapter(BasePlatformAdapter):
             reply_to_id = str(message.reference.message_id)
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None
+        from tools.mcp_tool_session_metadata import discord_role_ids
         event = MessageEvent(
             text=event_text, message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.id), media_urls=media_urls, media_types=media_types,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text,
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
-            channel_context=_channel_context,
+            channel_context=_channel_context, discord_role_ids=discord_role_ids(message.author, guild),
         )
         # Track participation so follow-ups in this thread don't need @mention.
         if thread_id:

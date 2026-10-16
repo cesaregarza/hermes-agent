@@ -96,9 +96,6 @@ class SessionSource:
     # over the authenticated relay WebSocket. ``platform`` is the UNDERLYING platform, not
     # ``relay``, so authz must key upstream trust off THIS flag.
     delivered_via_upstream_relay: bool = False
-    # Wire-INVISIBLE (never in to_dict/from_dict): the speaking member's role ids in this
-    # message's server, or None in a DM. Per message only; a stored origin never carries them.
-    role_ids: Optional[tuple[str, ...]] = None
 
     def __post_init__(self) -> None:
         # Mirror scope_id/guild_id onto each other (scope_id wins) so readers of EITHER agree.

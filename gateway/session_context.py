@@ -114,7 +114,6 @@ def set_session_vars(
     message_id: str = "", profile: str = "", browser_control_principal: str = "",
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, redact_pii: bool | None = None,
-    role_ids: tuple[str, ...] | None = None, parent_chat_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -129,8 +128,9 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_REDACT_PII.set(redact_pii))
-    tokens.append(_SESSION_ROLE_IDS.set(role_ids))
-    tokens.append(_SESSION_PARENT_CHAT_ID.set(parent_chat_id))
+    # Set per turn by bind_session_context_for_turn; a bind that does not set them has none.
+    tokens.append(_SESSION_ROLE_IDS.set(None))
+    tokens.append(_SESSION_PARENT_CHAT_ID.set(""))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
